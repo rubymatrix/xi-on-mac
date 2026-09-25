@@ -10,7 +10,7 @@
   python3 tools/build_posix.py datuitest --game <folder>  the game's UI art read from its DATs (host/datui.c):
         parse checks, and renders in build/datui/ (tests/datui_test.c)
   python3 tools/build_posix.py app --game <folder> [--sign-in pol|lsb] [--server name] [--resolution WxH]
-        [--menu-resolution WxH] [--window-mode 0-3] [--background picture]
+        [--menu-resolution WxH] [--window-mode 0-3] [--background picture] [--sign-identity name]
         build/Final Fantasy XI.app: host64 with its libraries, playonline.reg and the defaults above in
         its Info.plist (host/appdefaults.h), so it starts from Finder with no command line. The values
         go into the built app only: nothing names a server in the source.
@@ -235,6 +235,19 @@ def bundle_dylibs(exe, frameworks):
     return sorted(seen)
 
 
+# A self-signed code-signing certificate in the login keychain, made once per machine (README):
+# signed with it, every build of the app is the same app to macOS, so the keychain's "Always Allow"
+# for its saved passwords survives rebuilds. Ad hoc otherwise.
+LOCAL_IDENTITY = 'FFXI Local Code Signing'
+
+
+def signing_identity(given):
+    if given or os.environ.get('FFXI_SIGN_IDENTITY'):
+        return given or os.environ['FFXI_SIGN_IDENTITY']
+    found = subprocess.run(['security', 'find-certificate', '-c', LOCAL_IDENTITY], capture_output=True)
+    return LOCAL_IDENTITY if found.returncode == 0 else '-'
+
+
 def app(game, a):
     """host64 as build/Final Fantasy XI.app, with the first-run defaults in its Info.plist."""
     host64(game)
@@ -273,7 +286,11 @@ def app(game, a):
     with open(os.path.join(contents, 'Info.plist'), 'w') as f:
         f.write(APP_INFO_PLIST.replace('@NAME@', APP_NAME).replace('@EXTRA@', extra))
     libs = bundle_dylibs(exe, os.path.join(contents, 'Frameworks'))
-    run(['codesign', '--force', '--deep', '--sign', '-', bundle])
+    identity = signing_identity(a.sign_identity)
+    run(['codesign', '--force', '--deep', '--sign', identity, bundle])
+    if identity == '-':
+        print('note: signed ad hoc: macOS asks again for the saved password after each rebuild; '
+              'a code-signing identity in the keychain (%s) keeps its answer' % LOCAL_IDENTITY)
     print('built %s (%s bundled; defaults: %s)' % (bundle, ', '.join(libs) or 'no libraries',
                                                     ', '.join('%s=%s' % kv for kv in keys.items())))
 
@@ -368,6 +385,7 @@ def main():
     ap.add_argument('--menu-resolution')
     ap.add_argument('--window-mode', type=int, choices=[0, 1, 2, 3])
     ap.add_argument('--background')
+    ap.add_argument('--sign-identity')
     args = ap.parse_args()
     if args.target == 'gfxtest':
         return gfxtest()

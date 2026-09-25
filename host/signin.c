@@ -249,6 +249,43 @@ static void job_thread(void* arg)
     SDL_SetAtomicInt(&j->state, ok ? JOB_DONE : JOB_FAILED);
 }
 
+/* ---- the keychain, off the main thread: macOS asks the player whether this app may read or
+ * change a saved password (again after every rebuild: an ad-hoc signature changes), and the
+ * window has to keep drawing while it asks ---- */
+
+typedef struct Keyjob
+{
+    SDL_AtomicInt state; /* 0 idle, 1 reading, 2 read */
+    char key[256], password[128];
+    int found;
+} Keyjob;
+
+static Keyjob g_keyread;
+
+static void keyread_thread(void* arg)
+{
+    Keyjob* k = arg;
+    k->found = keychain_get(k->key, k->password, sizeof k->password);
+    SDL_SetAtomicInt(&k->state, 2);
+}
+
+typedef struct Keysave
+{
+    char key[256], password[128];
+    int remember;
+} Keysave;
+
+static void keysave_thread(void* arg)
+{
+    Keysave* k = arg;
+    if (k->remember)
+        keychain_set(k->key, k->password);
+    else
+        keychain_delete(k->key);
+    memset(k->password, 0, sizeof k->password);
+    free(k);
+}
+
 /* ---- the screen ---- */
 
 typedef struct Dat
@@ -857,13 +894,13 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
         c->data_port = setup->data_port;
     if (setup->view_port)
         c->view_port = setup->view_port;
+    int read_keychain = 0;
     if (setup->password)
         SDL_strlcpy(u->password, setup->password, sizeof u->password);
     else if (c->remember && c->user[0])
     {
-        char k[256];
-        keychain_key(c, k, sizeof k);
-        keychain_get(k, u->password, sizeof u->password);
+        keychain_key(c, g_keyread.key, sizeof g_keyread.key);
+        read_keychain = 1; /* once the window is up */
     }
     if (setup->otp)
         SDL_strlcpy(u->otp, setup->otp, sizeof u->otp);
@@ -980,6 +1017,13 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
     build(u);
     u->focus = !c->user[0] ? 0 : !u->password[0] ? 1 : c->method == SIGNIN_LSB ? 3 : 2;
     SDL_StartTextInput(win);
+    if (read_keychain)
+    {
+        SDL_SetAtomicInt(&g_keyread.state, 1);
+        if (!plat_thread_start(keyread_thread, &g_keyread))
+            SDL_SetAtomicInt(&g_keyread.state, 0);
+    }
+    Uint64 opened = SDL_GetTicks();
     u->focus_time = SDL_GetTicks();
     int result = 0;
     for (int done = 0; !done;)
@@ -1008,6 +1052,22 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
             build(u);
         }
 
+        /* the saved password, when macOS has let us read it: into an empty field */
+        if (SDL_GetAtomicInt(&g_keyread.state) == 2)
+        {
+            if (g_keyread.found && !u->password[0])
+            {
+                SDL_strlcpy(u->password, g_keyread.password, sizeof u->password);
+                if (u->screen == SCREEN_SIGNIN && u->focus == 1)
+                    u->focus = 2; /* on to the code (LandSandBoat) or Sign in (PlayOnline) */
+            }
+            memset(g_keyread.password, 0, sizeof g_keyread.password);
+            SDL_SetAtomicInt(&g_keyread.state, 0);
+            if (!u->status_error)
+                set_status(u, "", 0);
+        }
+        else if (SDL_GetAtomicInt(&g_keyread.state) == 1 && SDL_GetTicks() - opened > 1500 && !u->status[0])
+            set_status(u, "Waiting for macOS to allow the saved password...", 0);
         int state = SDL_GetAtomicInt(&g_job.state);
         if (state == JOB_FAILED)
         {
@@ -1017,12 +1077,16 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
         }
         else if (state == JOB_DONE)
         {
-            char k[256];
-            keychain_key(c, k, sizeof k);
-            if (c->remember)
-                keychain_set(k, u->password);
-            else
-                keychain_delete(k);
+            /* remembered (or forgotten) off this thread: macOS may ask first */
+            Keysave* ks = calloc(1, sizeof *ks);
+            if (ks)
+            {
+                keychain_key(c, ks->key, sizeof ks->key);
+                SDL_strlcpy(ks->password, u->password, sizeof ks->password);
+                ks->remember = c->remember;
+                if (!plat_thread_start(keysave_thread, ks))
+                    free(ks);
+            }
             out->server = g_job.ip;
             result = done = 1;
         }

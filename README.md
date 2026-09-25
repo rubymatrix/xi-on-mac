@@ -115,7 +115,33 @@ python3 tools/build_posix.py app --game <FINAL FANTASY XI folder> --sign-in lsb 
     --resolution 2560x1440 --menu-resolution 1280x720 --window-mode 3 --background <picture>
 ```
 
-The values go into the built app only. The button art is the screen's own
+The values go into the built app only. It is signed with the code-signing identity
+`FFXI Local Code Signing` when the login keychain has one (or `--sign-identity`), else ad hoc. Ad hoc,
+every rebuild is a new app to macOS, which then asks again before the app reads its saved password;
+signed with one certificate, "Always Allow" holds. Make the certificate once (self-signed; it needs no
+trust settings), with a `cs.cnf` of:
+
+```
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = FFXI Local Code Signing
+[ext]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature
+extendedKeyUsage = critical, codeSigning
+```
+
+then:
+
+```
+/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 3650 -config cs.cnf
+/usr/bin/openssl pkcs12 -export -inkey key.pem -in cert.pem -name "FFXI Local Code Signing" -out cs.p12 -passout pass:x
+security import cs.p12 -k ~/Library/Keychains/login.keychain-db -P x -T /usr/bin/codesign
+rm key.pem cs.p12
+``` The button art is the screen's own
 (`tools/make_ui_art.py`, `assets/ui/`); `third_party/stb/stb_image.h` (public domain) reads
 pictures.
 
