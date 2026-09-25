@@ -14,6 +14,8 @@
  *               [--user <name> [--pass <password>] [--otp <code>] [--login-token <t>]   LandSandBoat servers
  *                [--authport 54231] [--dataport 54230] [--viewport 54001]]
  *               [--dats <folder>]...   DAT overlays, as XIPivot: the first folder given wins
+ *               [--user-dir <folder>]  the game's USER folder (settings, macros) there instead of
+ *                                      in the install, for installs that cannot be written (UWP)
  *
  * --server is where the game's servers are: "ffxi00.pol.com" (the lobby) and every other
  * "*.pol.com" name resolve to it instead of through DNS. Default 127.0.0.1 (this
@@ -358,6 +360,7 @@ int main(int argc, char** argv)
     unsigned nfinals = 0;
     const char* dats[8];
     unsigned ndats = 0;
+    const char* user_dir = NULL;
     uint32_t pol_server = DEFAULT_POL_SERVER;
     LsbLogin lsb = { 0, 54231, 54230, 54001, NULL, NULL, "", NULL };
     int have_session = 0;
@@ -378,6 +381,8 @@ int main(int argc, char** argv)
             data_dir = argv[i + 1];
         else if (!strcmp(argv[i], "--dats") && ndats < 8)
             dats[ndats++] = argv[i + 1];
+        else if (!strcmp(argv[i], "--user-dir"))
+            user_dir = argv[i + 1];
         else if (!strcmp(argv[i], "--session"))
         {
             uint8_t v[16];
@@ -612,6 +617,13 @@ int main(int argc, char** argv)
         reg_set_string("HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\InstallFolder", "1000", p);
     }
     vfs_init(game);
+    if (user_dir)
+    {
+        char guest_user[760];
+        snprintf(guest_user, sizeof guest_user, "%s\\USER", game);
+        vfs_mount(guest_user, user_dir);
+        rt_log("[recomp] USER -> %s\n", user_dir);
+    }
     for (unsigned i = 0; i < ndats; ++i)
     {
         /* DAT overlays: files under their ROM*\ and sound*\ folders replace the install's */

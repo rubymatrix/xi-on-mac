@@ -27,10 +27,12 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#if !defined(FFXI_UWP) /* UWP apps have no SChannel and no console: uwp_bridge.h */
 #include <security.h>
 #include <schannel.h>
 #include <conio.h>
 #include <io.h>
+#endif
 typedef SOCKET sock_t;
 #define SOCK_BAD INVALID_SOCKET
 #define sock_close closesocket
@@ -58,6 +60,9 @@ typedef int sock_t;
 
 #include "lsb_login.h"
 #include "plat.h"
+#if defined(FFXI_UWP)
+#include "uwp_bridge.h"
+#endif
 #include "polcore_config.h"
 #include "ws2.h"
 
@@ -99,7 +104,13 @@ static sock_t tcp_connect(uint32_t server, uint16_t port, int timeout_ms, char* 
 }
 
 /* --- TLS over our own socket ----------------------------------------------------------------------- */
-#if defined(_WIN32)
+#if defined(FFXI_UWP)
+/* the app's (Windows.Networking.Sockets) */
+static int tls_exchange(uint32_t server, uint16_t port, const char* request, char* reply, size_t replyn, char* err, size_t errn)
+{
+    return uwp_tls_exchange(server, port, request, reply, replyn, err, errn);
+}
+#elif defined(_WIN32)
 /* SChannel: the handshake by hand over the socket, then one encrypted request and one reply */
 static int send_all(sock_t s, const void* p, size_t n)
 {
@@ -481,7 +492,10 @@ int net_resolve_ipv4(const char* name, uint32_t* out)
 
 int read_secret(const char* prompt, char* out, size_t n)
 {
-#if defined(_WIN32)
+#if defined(FFXI_UWP)
+    (void)prompt, (void)out, (void)n;
+    return 0; /* no terminal: the app asks */
+#elif defined(_WIN32)
     if (!_isatty(_fileno(stdin)))
         return 0;
     fputs(prompt, stderr);
