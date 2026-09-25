@@ -73,6 +73,7 @@ typedef struct Wnd
 static Wnd g_wnds[MAX_WINDOWS];
 static uint32_t g_focus;
 static int g_sdl_up;
+static float g_ui_aspect; /* --ui-aspect: width / height of the interface's box, 0 off */
 
 static Wnd* wnd(uint32_t hwnd)
 {
@@ -80,6 +81,27 @@ static Wnd* wnd(uint32_t hwnd)
         return NULL;
     uint32_t i = (hwnd - HWND_BASE) / HWND_STRIDE;
     return i < MAX_WINDOWS && g_wnds[i].used ? &g_wnds[i] : NULL;
+}
+
+/* The fraction of the client's width the interface keeps under --ui-aspect: 1 when it is off or the
+ * window is no wider than the aspect. */
+static float ui_squeeze(const Wnd* w)
+{
+    if (!(g_ui_aspect > 0) || w->w <= 0 || w->h <= 0)
+        return 1.0f;
+    float s = g_ui_aspect * (float)w->h / (float)w->w;
+    return s < 1.0f ? s : 1.0f;
+}
+
+/* A client x the cursor is at, as the x the game drew there before its draws were squeezed toward
+ * the middle (d3d8.c): the game hit-tests its interface in the coordinates it drew in. */
+static int ui_unsqueeze_x(const Wnd* w, int x)
+{
+    float s = ui_squeeze(w);
+    if (s >= 1.0f)
+        return x;
+    float c = (float)w->w * 0.5f, gx = c + ((float)x - c) / s;
+    return gx < 0 ? 0 : gx > (float)(w->w - 1) ? w->w - 1 : (int)(gx + 0.5f);
 }
 
 static Wnd* wnd_of_sdl(SDL_WindowID id)
@@ -398,7 +420,7 @@ static void pump(void)
             w = wnd_of_sdl(e.motion.windowID);
             if (w)
                 post(w->tid, w->hwnd, WM_MOUSEMOVE, mouse_keys(e.motion.state),
-                    ((uint32_t)(uint16_t)(int)e.motion.y << 16) | (uint16_t)(int)e.motion.x);
+                    ((uint32_t)(uint16_t)(int)e.motion.y << 16) | (uint16_t)ui_unsqueeze_x(w, (int)e.motion.x));
             break;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
         case SDL_EVENT_MOUSE_BUTTON_UP:
@@ -413,7 +435,7 @@ static void pump(void)
                                                                  : 0;
             if (msg)
                 post(w->tid, w->hwnd, msg, mouse_keys(SDL_GetMouseState(NULL, NULL)),
-                    ((uint32_t)(uint16_t)(int)e.button.y << 16) | (uint16_t)(int)e.button.x);
+                    ((uint32_t)(uint16_t)(int)e.button.y << 16) | (uint16_t)ui_unsqueeze_x(w, (int)e.button.x));
             break;
         }
         case SDL_EVENT_MOUSE_WHEEL:
@@ -673,6 +695,9 @@ static void sh_GetCursorPos(Guest* g)
     float x = 0, y = 0;
     if (g_sdl_up)
         SDL_GetGlobalMouseState(&x, &y);
+    Wnd* w = wnd(g_focus);
+    if (w && x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h)
+        x = (float)(w->x + ui_unsqueeze_x(w, (int)x - w->x));
     wr32(ARG(0), (uint32_t)(int32_t)x);
     wr32(ARG(0) + 4, (uint32_t)(int32_t)y);
     RET(1, 1);
@@ -1586,6 +1611,14 @@ void* user32_sdl_window(uint32_t hwnd)
 {
     Wnd* w = wnd(hwnd);
     return w ? w->sdl : NULL;
+}
+
+void user32_set_ui_aspect(float aspect) { g_ui_aspect = aspect; }
+
+float user32_ui_squeeze(uint32_t hwnd)
+{
+    Wnd* w = wnd(hwnd);
+    return w ? ui_squeeze(w) : 1.0f;
 }
 
 void user32_client_size(uint32_t hwnd, uint32_t* cw, uint32_t* ch)

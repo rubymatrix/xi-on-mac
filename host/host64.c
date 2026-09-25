@@ -19,6 +19,9 @@
  *
  * --fps-divisor: FFXI's frames are 60 / divisor per second; 1 (60 fps) here, 2 (30) as shipped.
  *
+ * --ui-aspect <w:h>: the interface keeps this shape (16:9, say) centered in a wider window, instead
+ * of being stretched across it; the mouse is mapped to match. Off by default.
+ *
  * Two ways in:
  *   - a server with PlayOnline behind it: the session value V its lobby checks
  *     (pol_accounts.session_value). For now --session; a PlayOnline sign-in client supplies it.
@@ -208,6 +211,19 @@ int main(int argc, char** argv)
                 return 2;
             }
             g_fps_divisor = (uint32_t)d;
+        }
+        else if (!strcmp(argv[i], "--ui-aspect"))
+        {
+            char* end;
+            double a = strtod(argv[i + 1], &end), b = 1.0;
+            if (*end == ':' || *end == 'x' || *end == '/')
+                b = strtod(end + 1, &end);
+            if (*end || !(a > 0) || !(b > 0) || a / b < 0.5 || a / b > 8)
+            {
+                fprintf(stderr, "--ui-aspect: a shape as w:h (16:9) or a ratio (1.778)\n");
+                return 2;
+            }
+            user32_set_ui_aspect((float)(a / b));
         }
         else if (!strcmp(argv[i], "--authport") || !strcmp(argv[i], "--dataport") || !strcmp(argv[i], "--viewport"))
         {

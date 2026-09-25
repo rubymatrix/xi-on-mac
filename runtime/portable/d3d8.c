@@ -2091,6 +2091,45 @@ static void index_range(uint32_t indices, uint32_t size, uint32_t n, uint32_t* l
     *lo = a, *hi = b;
 }
 
+/* --ui-aspect (user32_set_ui_aspect): FFXI lays its interface out in a fixed space and stretches
+ * it to the back buffer, so a window wider than that space stretches the interface. Its menus,
+ * text and cursor are pre-transformed (XYZRHW) draws to the back buffer; each is squeezed toward
+ * the middle by mapping the viewport's width onto a centered box of the aspect asked for (the
+ * XYZRHW mapping reads d->u.vp). Draws that span the whole width - the 3D scene put on the screen,
+ * fades, letterboxing - are left full. The mouse is mapped back in user32.c. */
+static void ui_squeeze(GfxDraw* d, uint32_t first, uint32_t n, uint32_t up_data, uint32_t up_stride)
+{
+    float s = user32_ui_squeeze(g_dev.hwnd);
+    if (s >= 1.0f)
+        return;
+    uint32_t base, stride, size;
+    if (up_data)
+        base = up_data, stride = up_stride, size = 0xFFFFFFFFu;
+    else
+    {
+        uint32_t st = d->vs.el[GFX_R_POSITION].stream;
+        Obj* b = obj(g_dev.cur.stream[st]);
+        if (!b || !b->mem)
+            return;
+        base = b->mem, stride = g_dev.cur.stride[st], size = b->size;
+    }
+    float x0 = d->u.vp[0], w = d->u.vp[2], lo = 1e30f, hi = -1e30f;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        uint32_t at = (first + i) * stride + (uint32_t)d->u.offset[GFX_R_POSITION];
+        if (at > size - 4)
+            break;
+        float x = u2f(rd32(base + at));
+        lo = x < lo ? x : lo;
+        hi = x > hi ? x : hi;
+    }
+    if (lo > hi || (lo <= x0 + 1.0f && hi >= x0 + w - 1.0f))
+        return;
+    float c = x0 + w * 0.5f;
+    d->u.vp[2] = w / s;
+    d->u.vp[0] = c - d->u.vp[2] * 0.5f;
+}
+
 static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices, uint32_t index_size,
     uint32_t up_data, uint32_t up_stride, uint32_t n);
 
@@ -2130,6 +2169,8 @@ static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t 
     }
     if (!set_streams(d, first, nverts, up_data, up_stride))
         return;
+    if (d->vs.rhw && g_dev.rt == g_dev.backbuffer)
+        ui_squeeze(d, first, nverts, up_data, up_stride);
     d->prim = prim, d->count = count;
     apply_targets();
     gfx_draw(d);

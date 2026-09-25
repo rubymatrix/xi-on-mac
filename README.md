@@ -116,6 +116,7 @@ build/host64 --game ... --server <name or a.b.c.d> --session <V>
 | `--reg-overlay <file.reg>` | Where the game saves settings it changes. It is loaded last, and the `--reg` files are never rewritten. |
 | `--dats <folder>` | DAT overlays, the way XIPivot does them (up to 8; the first folder given wins). See below. |
 | `--fps-divisor <n>` | The game's frame divisor: `1` is 60 fps (the default here), `2` is 30 fps as shipped. |
+| `--ui-aspect <w:h>` | Keep the interface at this shape, full height and centered, in a wider window (`16:9` on an ultrawide), instead of stretched across it. The mouse is mapped to match, so the sides outside the box can't be clicked. Off by default. |
 
 The install folder is never written. The registry's install paths are set to where the game
 actually is, and an install that has no `patch.ver` (common for private-server installs) gets one
