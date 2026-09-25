@@ -17,3 +17,6 @@ __pycache__/
 *.lib
 *.exp
 .vs/
+
+# Jython compiles the discovery scripts next to themselves
+*$py.class

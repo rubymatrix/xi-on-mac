@@ -36,8 +36,9 @@ Everything the build reads is in this repository.
 | static POL1 unpacker | `tools/pol1_unpack.py` |
 | the specifications the runtime implements: polcore slots, the polcore and D3D8 surfaces | `specs/` |
 
-The metadata comes from a Ghidra-based discovery pass over each build's unpacked DLLs. That tool is
-not in this repository; the committed metadata is what the build uses.
+The metadata comes from a Ghidra-based discovery pass over each build's unpacked DLLs:
+`discovery/` (Ghidra post-scripts and the per-build manual verdicts), run by `tools/discover.py`.
+The committed metadata is what the build uses; the pass is only needed for a new build.
 
 ## Building
 
@@ -116,6 +117,7 @@ build/host64 --game ... --server <name or a.b.c.d> --session <V>
 | `--reg-overlay <file.reg>` | Where the game saves settings it changes. It is loaded last, and the `--reg` files are never rewritten. |
 | `--dats <folder>` | DAT overlays, the way XIPivot does them (up to 8; the first folder given wins). See below. |
 | `--fps-divisor <n>` | The game's frame divisor: `1` is 60 fps (the default here), `2` is 30 fps as shipped. |
+| `--aspect <auto, off or w:h>` | The 3D scene's aspect ratio. `auto` (the default) follows the window's shape, as Ashita's aspect addon does, so a widescreen or ultrawide window sees more to the sides instead of a 4:3 view stretched across it. `off` leaves it to the game; a shape (`16:9`, `1.778`) fixes it. |
 | `--ui-aspect <w:h>` | Keep the interface at this shape, full height and centered, in a wider window (`16:9` on an ultrawide), instead of stretched across it. The mouse is mapped to match, so the sides outside the box can't be clicked. Off by default. |
 
 The install folder is never written. The registry's install paths are set to where the game
@@ -169,28 +171,48 @@ does not know:
 .../FFXiMain.dll is build <sha256>, which meta/builds.json does not know
 ```
 
-1. **Hash the new DLLs.**
+In Claude Code, the `game-version-update` skill (`.claude/skills/`) runs all of this: hand it the
+install folder. By hand:
+
+1. **Identify and unpack.**
 
    ```
-   shasum -a 256 "<FINAL FANTASY XI>/FFXiMain.dll" "<FINAL FANTASY XI>/FFXi.dll"
+   python tools/newbuild.py identify --game "<FINAL FANTASY XI>"   # hashes, label, version
+   python tools/newbuild.py unpack   --game "<FINAL FANTASY XI>"   # into generated/images/<label>/
    ```
 
-2. **Metadata.** Unpack the new DLLs (`tools/pol1_unpack.py <dll> <out>`) and run them through the
-   discovery pass (not in this repo) to produce `meta/FFXiMain.<build>.meta.json` and
-   `meta/FFXi.<build>.meta.json`. Name the build after the date of the PE timestamp. When a DLL's
-   `.text` is byte-identical to a known build, its metadata carries over; only the hash changes.
+   The label is the date of `FFXiMain.dll`'s PE timestamp. The version is decrypted from the
+   install's `patch.ver`; an install with none gets `30` + the timestamp's YYMMDD
+   (2026-09-03 → `30260903_0`), which the lobby compares with the server's `CLIENT_VER` and
+   `host64` writes into the `patch.ver` it makes. `unpack` also says whether each DLL's `.text`
+   is byte-identical to a known build's (the previous build's images must be in
+   `generated/images/`: `prepare` keeps one per build).
 
-3. **Add the build to `meta/builds.json`.** Copy the newest entry and update:
-   - `FFXiMain.dll` / `FFXi.dll`: `sha256` of the **retail** (packed) files, and their `meta` file names.
-   - `version`: the client version string. Take it from the install's `patch.ver`; for an
-     install with none, use the date of the PE timestamp as `3YYYYMMDD_0` (2026-09-03 →
-     `30260903_0`). The lobby compares it with the server's `CLIENT_VER`, and `host64` writes it
-     into the `patch.ver` it makes.
-   - `addresses`: `chars_ptr` (the global the character list hangs from, read by polcore) and
-     `present_site` (the return address of the game's `IDirect3DDevice8::Present` call, used on
-     Windows). Find the same code in the new build; it usually moves by a few bytes.
-   - `crt`: the addresses of the CRT functions the differential test compares (`strlen`, `memcpy`,
-     `_ftol`, …).
+2. **Carry the previous build over.**
+
+   ```
+   python tools/newbuild.py carry --from <previous> --to <label> [--write]
+   ```
+
+   Maps every address the previous build's entry names onto the new image: `chars_ptr` (the
+   global the character list hangs from, read by polcore), `present_site` (the return address of
+   the game's `IDirect3DDevice8::Present` call, used on Windows), the CRT functions the
+   differential test compares, and the manual verdicts in `discovery/verdicts.py`. `--write` adds
+   the build to `meta/builds.json` and `discovery/verdicts.py`. Addresses it cannot map come with
+   a hint (how their neighbours moved); check each with
+   `python tools/newbuild.py dis --label <build> --at <addr>` in both builds and fill it in.
+
+3. **Metadata.** A DLL whose `.text` is identical to the previous build's carries its metadata
+   over (`python tools/newbuild.py meta --from <previous> --to <label> --module FFXi.dll`). Otherwise:
+
+   ```
+   python tools/discover.py --label <label> --module FFXiMain.dll   # Ghidra headless; minutes
+   ```
+
+   It stops before exporting if a decode conflict, a function that looks like data, or an
+   unaudited switch remains; the report says which. Each needs a manual verdict in
+   `discovery/verdicts.py` (see the entries there and `discovery/notes/`); then rerun with
+   `--reuse`.
 
 4. **Prepare and build.**
 
@@ -214,8 +236,9 @@ does not know:
    exception handlers), including small functions the discovery pass folded into a neighbour, so
    what remains is a real gap: add the function to the metadata and rebuild.
 
-6. **Record it.** Add the build to the table under *Rules*, and commit the metadata and
-   `builds.json` together. Never commit anything from `generated/`.
+6. **Record it.** Add the build to the table under *Rules*, write its discovery notes in
+   `discovery/notes/`, and commit the metadata, `builds.json` and `discovery/verdicts.py`
+   together. Never commit anything from `generated/`.
 
 ## Layout
 
@@ -235,10 +258,13 @@ host/              ffximain.c: the 32-bit stand-in FFXiMain.dll; host64.c: the 6
 tests/             difftest.c (original vs translation), boot.c (x86), boot64.c (x64),
                    gfx_test.c (the Metal back end), d3d8_test.c (the D3D8 front end on it)
 tools/             prepare.py, buildinfo.py, pol1_unpack.py, build.py (MSVC), build_posix.py (clang),
-                   install.py, trace_report.py
+                   install.py, trace_report.py; newbuild.py and discover.py (a new client version)
+discovery/         the discovery pass: Ghidra (Jython) post-scripts, verdicts.py (the manual verdicts
+                   per build), notes/ (what each build's run found)
 meta/              builds.json, and the per-build metadata the recompiler reads
+.claude/skills/    game-version-update (-analyze, -build): a new client version end to end
 specs/             the specifications the runtime implements (polcore slots, D3D8 and polcore surfaces)
 playonline.reg     the PlayOnlineUS registry keys, a starting point for --reg
-generated/         (gitignored) unpacked image and recompiler output
+generated/         (gitignored) unpacked images (images/<build>/), discovery projects, recompiler output
 build/             (gitignored)
 ```

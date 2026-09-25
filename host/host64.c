@@ -19,6 +19,9 @@
  *
  * --fps-divisor: FFXI's frames are 60 / divisor per second; 1 (60 fps) here, 2 (30) as shipped.
  *
+ * --aspect auto|off|<w:h>: the 3D scene's aspect ratio. auto (the default) follows the window's
+ * shape, so a widescreen window shows more to the sides instead of a 4:3 view stretched across it.
+ *
  * --ui-aspect <w:h>: the interface keeps this shape (16:9, say) centered in a wider window, instead
  * of being stretched across it; the mouse is mapped to match. Off by default.
  *
@@ -108,6 +111,78 @@ static void find_fps_global(void)
     g_fps_global = 0xFFFFFFFFu;
 }
 
+/* --- the aspect ratio ---------------------------------------------------------------------------------
+ * FFXiMain's projection takes its shape from a float at +0x2F0 of its camera object, which the game
+ * sets from the configured resolution as h / (w * 0.25 * 3): 1 for 4:3, and a window of another
+ * shape stretches the scene. Ashita's aspect addon finds the setter by its code,
+ * `mov eax, [global]; test eax, eax; je; fld [esp+4]; fmul [0.25]; fmul [3.0]`, where the global
+ * points at the object; every frame puts the value back from the shape the frame is shown at. */
+static float g_aspect;          /* width / height to project for; 0 follows the window, < 0 off */
+static uint32_t g_aspect_global; /* 0 not looked for yet, 0xFFFFFFFF not found */
+
+static void find_aspect_global(void)
+{
+    static const uint8_t PAT[] = { 0xA1, 0, 0, 0, 0, 0x85, 0xC0, 0x74, 0, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0x0D,
+                                   0, 0, 0, 0, 0xD8, 0x0D };
+    static const uint8_t ANY[] = { 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0 };
+    uint32_t start = rt_image_base + rt_image_text_rva, end = start + rt_image_text_size;
+    for (uint32_t a = start; a + sizeof PAT <= end; ++a)
+    {
+        const uint8_t* p = GUEST_PTR(a);
+        size_t i = 0;
+        while (i < sizeof PAT && (ANY[i] || p[i] == PAT[i]))
+            ++i;
+        if (i == sizeof PAT)
+        {
+            g_aspect_global = rd32(a + 1);
+            rt_log("[recomp] aspect ratio: global %08x (code at %08x), %s\n", g_aspect_global, a,
+                g_aspect > 0 ? "fixed" : "following the window");
+            return;
+        }
+    }
+    rt_log("[recomp] aspect ratio: not found; the scene keeps the game's shape\n");
+    g_aspect_global = 0xFFFFFFFFu;
+}
+
+static void fix_aspect(void)
+{
+    if (g_aspect < 0)
+        return;
+    if (!g_aspect_global)
+        find_aspect_global();
+    if (g_aspect_global == 0xFFFFFFFFu)
+        return;
+    uint32_t object = rd32(g_aspect_global);
+    if (!object)
+        return;
+    float ratio = g_aspect;
+    if (!(ratio > 0))
+    {
+        uint32_t w = 0, h = 0;
+        d3d8_screen_size(&w, &h);
+        if (!w || !h)
+            return;
+        ratio = (float)w / (float)h;
+    }
+    float v = 4.0f / 3.0f / ratio; /* the game's h / (w * 0.75) */
+    uint32_t bits;
+    memcpy(&bits, &v, 4);
+    if (rd32(object + 0x2F0) != bits)
+        wr32(object + 0x2F0, bits);
+}
+
+/* w:h (16:9), wxh, w/h, or a ratio (1.778); 0 if it is none of those */
+static double parse_shape(const char* s)
+{
+    char* end;
+    double a = strtod(s, &end), b = 1.0;
+    if (*end == ':' || *end == 'x' || *end == '/')
+        b = strtod(end + 1, &end);
+    if (*end || !(a > 0) || !(b > 0) || a / b < 0.5 || a / b > 8)
+        return 0;
+    return a / b;
+}
+
 static int g_profile_shims;
 
 static void present_hook(void)
@@ -122,6 +197,7 @@ static void present_hook(void)
         if (now - last >= 2000000000ull)
             thunk_prof_report(), last = now;
     }
+    fix_aspect();
     if (!g_fps_global)
         find_fps_global();
     if (g_fps_global == 0xFFFFFFFFu)

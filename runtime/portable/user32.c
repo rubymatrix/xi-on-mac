@@ -540,9 +540,21 @@ static void sh_CreateWindowExA(Guest* g)
     w->w = (int32_t)ARG(6) == (int32_t)0x80000000 ? 640 : (int32_t)ARG(6);
     w->h = (int32_t)ARG(7) == (int32_t)0x80000000 ? 480 : (int32_t)ARG(7);
     sdl_up();
-    w->sdl = SDL_CreateWindow(ARG(2) ? ARGS(2) : "", w->w, w->h, SDL_WINDOW_HIDDEN);
+    SDL_WindowFlags flags = SDL_WINDOW_HIDDEN;
+#if defined(_WIN32)
+    /* A WS_POPUP window with no caption (the game's full-screen and borderless windowed modes) has no
+     * frame here either, and goes where the game puts it: at its size, borderless full screen. */
+    int popup = (w->style & 0x80000000u) && !(w->style & 0x00C00000u);
+    if (popup)
+        flags |= SDL_WINDOW_BORDERLESS;
+#endif
+    w->sdl = SDL_CreateWindow(ARG(2) ? ARGS(2) : "", w->w, w->h, flags);
     if (!w->sdl)
         rt_log("[recomp] SDL_CreateWindow: %s\n", SDL_GetError());
+#if defined(_WIN32)
+    else if (popup)
+        SDL_SetWindowPosition(w->sdl, w->x, w->y);
+#endif
 
     /* WM_NCCREATE / WM_CREATE with a CREATESTRUCTA, as Windows sends them */
     uint32_t cs = gheap_alloc(48, 1);

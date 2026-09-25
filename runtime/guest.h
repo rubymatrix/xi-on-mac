@@ -25,18 +25,27 @@ extern unsigned char* rt_guest_base;
 #define GUEST_PTR(a) ((unsigned char*)(uintptr_t)(GUEST_BASE + (uint32_t)(a)))
 #endif
 
-static inline uint8_t rd8(uint32_t a) { return *GUEST_PTR(a); }
-static inline uint16_t rd16(uint32_t a) { uint16_t v; memcpy(&v, GUEST_PTR(a), 2); return v; }
-static inline uint32_t rd32(uint32_t a) { uint32_t v; memcpy(&v, GUEST_PTR(a), 4); return v; }
-static inline uint64_t rd64(uint32_t a) { uint64_t v; memcpy(&v, GUEST_PTR(a), 8); return v; }
-static inline void wr8(uint32_t a, uint8_t v) { *GUEST_PTR(a) = v; }
-static inline void wr16(uint32_t a, uint16_t v) { memcpy(GUEST_PTR(a), &v, 2); }
-static inline void wr32(uint32_t a, uint32_t v) { memcpy(GUEST_PTR(a), &v, 4); }
-static inline void wr64(uint32_t a, uint64_t v) { memcpy(GUEST_PTR(a), &v, 8); }
-static inline float rdf32(uint32_t a) { float v; memcpy(&v, GUEST_PTR(a), 4); return v; }
-static inline double rdf64(uint32_t a) { double v; memcpy(&v, GUEST_PTR(a), 8); return v; }
-static inline void wrf32(uint32_t a, float v) { memcpy(GUEST_PTR(a), &v, 4); }
-static inline void wrf64(uint32_t a, double v) { memcpy(GUEST_PTR(a), &v, 8); }
+/* The helpers below are a few instructions each and run in the hottest translated code (an x87
+ * push per float load). MSVC inlines to a budget per function, and a large translated function
+ * spends it early, leaving these as calls; clang inlines them without being told. */
+#if defined(_MSC_VER)
+#define RT_INLINE static __forceinline
+#else
+#define RT_INLINE static inline
+#endif
+
+RT_INLINE uint8_t rd8(uint32_t a) { return *GUEST_PTR(a); }
+RT_INLINE uint16_t rd16(uint32_t a) { uint16_t v; memcpy(&v, GUEST_PTR(a), 2); return v; }
+RT_INLINE uint32_t rd32(uint32_t a) { uint32_t v; memcpy(&v, GUEST_PTR(a), 4); return v; }
+RT_INLINE uint64_t rd64(uint32_t a) { uint64_t v; memcpy(&v, GUEST_PTR(a), 8); return v; }
+RT_INLINE void wr8(uint32_t a, uint8_t v) { *GUEST_PTR(a) = v; }
+RT_INLINE void wr16(uint32_t a, uint16_t v) { memcpy(GUEST_PTR(a), &v, 2); }
+RT_INLINE void wr32(uint32_t a, uint32_t v) { memcpy(GUEST_PTR(a), &v, 4); }
+RT_INLINE void wr64(uint32_t a, uint64_t v) { memcpy(GUEST_PTR(a), &v, 8); }
+RT_INLINE float rdf32(uint32_t a) { float v; memcpy(&v, GUEST_PTR(a), 4); return v; }
+RT_INLINE double rdf64(uint32_t a) { double v; memcpy(&v, GUEST_PTR(a), 8); return v; }
+RT_INLINE void wrf32(uint32_t a, float v) { memcpy(GUEST_PTR(a), &v, 4); }
+RT_INLINE void wrf64(uint32_t a, double v) { memcpy(GUEST_PTR(a), &v, 8); }
 
 typedef struct Guest
 {
@@ -110,13 +119,13 @@ void rt_safepoint(void);
 
 #define ST(i) (g->st[(g->top + (i)) & 7u])
 
-static inline void fpush(Guest* g, double v)
+RT_INLINE void fpush(Guest* g, double v)
 {
     g->top = (g->top - 1) & 7u;
     g->st[g->top] = v;
 }
 
-static inline double fpop(Guest* g)
+RT_INLINE double fpop(Guest* g)
 {
     double v = g->st[g->top];
     g->top = (g->top + 1) & 7u;
@@ -124,13 +133,13 @@ static inline double fpop(Guest* g)
 }
 
 /* Precision control: PC=00 (24-bit) rounds every result to single precision. */
-static inline double fr(Guest* g, double x)
+RT_INLINE double fr(Guest* g, double x)
 {
     return ((g->fcw >> 8) & 3u) == 0 ? (double)(float)x : x;
 }
 
 /* FCOM/FUCOM/FTST/FICOM: C3 C2 C0 = 000 greater, 001 less, 100 equal, 111 unordered. */
-static inline void fcom(Guest* g, double a, double b)
+RT_INLINE void fcom(Guest* g, double a, double b)
 {
     if (a != a || b != b) { g->c3 = 1; g->c2 = 1; g->c0 = 1; }
     else if (a > b) { g->c3 = 0; g->c2 = 0; g->c0 = 0; }
@@ -139,13 +148,13 @@ static inline void fcom(Guest* g, double a, double b)
     g->c1 = 0;
 }
 
-static inline uint16_t fstsw(Guest* g)
+RT_INLINE uint16_t fstsw(Guest* g)
 {
     return (uint16_t)((g->c3 << 14) | ((g->top & 7u) << 11) | (g->c2 << 10) | (g->c1 << 9) | (g->c0 << 8));
 }
 
 /* Round per the control word's RC field (00 nearest-even, 01 down, 10 up, 11 truncate). */
-static inline double frnd(Guest* g, double x)
+RT_INLINE double frnd(Guest* g, double x)
 {
     switch ((g->fcw >> 10) & 3u)
     {
@@ -157,24 +166,24 @@ static inline double frnd(Guest* g, double x)
 }
 
 /* FIST/FISTP: out of range or NaN stores the "integer indefinite" value. */
-static inline int16_t fist16(Guest* g, double x)
+RT_INLINE int16_t fist16(Guest* g, double x)
 {
     double r = frnd(g, x);
     return (r != r || r < -32768.0 || r > 32767.0) ? (int16_t)0x8000 : (int16_t)r;
 }
-static inline int32_t fist32(Guest* g, double x)
+RT_INLINE int32_t fist32(Guest* g, double x)
 {
     double r = frnd(g, x);
     return (r != r || r < -2147483648.0 || r > 2147483647.0) ? (int32_t)0x80000000u : (int32_t)r;
 }
-static inline int64_t fist64(Guest* g, double x)
+RT_INLINE int64_t fist64(Guest* g, double x)
 {
     double r = frnd(g, x);
     return (r != r || r < -9223372036854775808.0 || r >= 9223372036854775808.0) ? (int64_t)0x8000000000000000ull : (int64_t)r;
 }
 
 /* FXAM: C3 C2 C0 = 001 NaN, 010 normal, 011 infinity, 100 zero, 110 denormal; C1 = sign. */
-static inline void fxam(Guest* g)
+RT_INLINE void fxam(Guest* g)
 {
     double x = ST(0);
     g->c1 = signbit(x) ? 1 : 0;
@@ -190,9 +199,9 @@ static inline void fxam(Guest* g)
 
 /* FNSTENV/FLDENV (28-byte protected-mode environment) and FNSAVE/FRSTOR (environment + the eight
  * registers as 80-bit, ST(0) first). Tags are not modelled; a save/restore pair round-trips. */
-static inline void wrf80(uint32_t a, double v);
-static inline double rdf80(uint32_t a);
-static inline void fenv_store(Guest* g, uint32_t a)
+RT_INLINE void wrf80(uint32_t a, double v);
+RT_INLINE double rdf80(uint32_t a);
+RT_INLINE void fenv_store(Guest* g, uint32_t a)
 {
     wr32(a + 0, 0xFFFF0000u | g->fcw);
     wr32(a + 4, 0xFFFF0000u | fstsw(g));
@@ -200,21 +209,21 @@ static inline void fenv_store(Guest* g, uint32_t a)
     for (uint32_t k = 12; k < 28; k += 4)
         wr32(a + k, 0);
 }
-static inline void fenv_load(Guest* g, uint32_t a)
+RT_INLINE void fenv_load(Guest* g, uint32_t a)
 {
     uint16_t sw = rd16(a + 4);
     g->fcw = rd16(a + 0);
     g->top = (sw >> 11) & 7u;
     g->c0 = (sw >> 8) & 1u; g->c1 = (sw >> 9) & 1u; g->c2 = (sw >> 10) & 1u; g->c3 = (sw >> 14) & 1u;
 }
-static inline void fsave(Guest* g, uint32_t a)
+RT_INLINE void fsave(Guest* g, uint32_t a)
 {
     fenv_store(g, a);
     for (uint32_t i = 0; i < 8; ++i)
         wrf80(a + 28 + 10 * i, ST(i));
     g->fcw = 0x037F; g->top = 0; g->c0 = g->c1 = g->c2 = g->c3 = 0; /* FNSAVE ends with FNINIT */
 }
-static inline void frstor(Guest* g, uint32_t a)
+RT_INLINE void frstor(Guest* g, uint32_t a)
 {
     fenv_load(g, a);
     for (uint32_t i = 0; i < 8; ++i)
@@ -222,7 +231,7 @@ static inline void frstor(Guest* g, uint32_t a)
 }
 
 /* 80-bit extended <-> double. */
-static inline double rdf80(uint32_t a)
+RT_INLINE double rdf80(uint32_t a)
 {
     uint64_t m;
     uint16_t se;
@@ -236,7 +245,7 @@ static inline double rdf80(uint32_t a)
     return s ? -v : v;
 }
 
-static inline void wrf80(uint32_t a, double v)
+RT_INLINE void wrf80(uint32_t a, double v)
 {
     uint64_t m = 0;
     uint16_t se = signbit(v) ? 0x8000 : 0;

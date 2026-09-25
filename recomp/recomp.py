@@ -73,8 +73,51 @@ class Program:
                     end = self.code_until_ret(target)
                     if end:
                         self.functions[target] = [[target, end]]
+        self.add_code_pointer_entries(spans, starts)
         self.entries = set(self.functions)
         return inner
+
+    def add_code_pointer_entries(self, spans, starts):
+        """The same for code that takes a function's address as an immediate - a callback stored
+        into a structure, an exception handler pushed - when the function lies outside every range
+        (FFXiMain 2026-09-03: 0x100a30b4 stores 0x100a3130, called through [esi+0x54] when the
+        settings menu opens). Those addresses are in .text's own relocations. Only immediates
+        count: an address used as a displacement is a table read (switch tables, byte maps), and
+        tables decode as code."""
+        import bisect
+        import struct
+        text_lo, text_hi = self.meta['text']
+        tables = {s['table'] for s in self.meta['switches']}
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        md.detail = True
+
+        def span_of(a):
+            i = bisect.bisect_right(starts, a) - 1
+            return spans[i] if i >= 0 and spans[i][0] <= a < spans[i][1] else None
+
+        decoded = {}
+        for site in sorted(self.relocs):
+            host = span_of(site)
+            if not host:
+                continue  # a table in a gap, not an instruction
+            target = struct.unpack_from('<I', self.image, site - self.base)[0]
+            if not text_lo <= target < text_hi or target in self.functions or target in tables or span_of(target):
+                continue
+            entry = host[2]
+            if entry not in decoded:
+                ins = sorted((i for lo, hi in self.functions[entry] for i in md.disasm(self.read(lo, hi - lo), lo)),
+                             key=lambda i: i.address)
+                decoded[entry] = ([i.address for i in ins], ins)
+            addrs, ins = decoded[entry]
+            k = bisect.bisect_right(addrs, site) - 1
+            if k < 0:
+                continue
+            i = ins[k]
+            if not i.imm_offset or i.address + i.imm_offset != site:
+                continue  # a displacement: data
+            end = self.code_until_ret(target)
+            if end:
+                self.functions[target] = [[target, end]]
 
     def add_branch_entries(self):
         """The same for direct branches: a call to an address that is not an entry, or a jump

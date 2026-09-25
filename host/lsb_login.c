@@ -23,8 +23,12 @@
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
+#define SECURITY_WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
+#include <security.h>
+#include <schannel.h>
 #include <conio.h>
 #include <io.h>
 typedef SOCKET sock_t;
@@ -43,11 +47,13 @@ typedef int sock_t;
 #define sock_close close
 #endif
 
+#if !defined(_WIN32) /* Windows has its own TLS: SChannel */
 #include <mbedtls/ssl.h>
 #include <psa/crypto.h>
 #if MBEDTLS_VERSION_MAJOR < 4
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
+#endif
 #endif
 
 #include "lsb_login.h"
@@ -93,6 +99,165 @@ static sock_t tcp_connect(uint32_t server, uint16_t port, int timeout_ms, char* 
 }
 
 /* --- TLS over our own socket ----------------------------------------------------------------------- */
+#if defined(_WIN32)
+/* SChannel: the handshake by hand over the socket, then one encrypted request and one reply */
+static int send_all(sock_t s, const void* p, size_t n)
+{
+    for (size_t done = 0; done < n;)
+    {
+        int k = send(s, (const char*)p + done, (int)(n - done), 0);
+        if (k <= 0)
+            return 0;
+        done += (size_t)k;
+    }
+    return 1;
+}
+
+static int tls_exchange(uint32_t server, uint16_t port, const char* request, char* reply, size_t replyn, char* err, size_t errn)
+{
+    sock_t s = tcp_connect(server, port, TIMEOUT_MS, err, errn);
+    if (s == SOCK_BAD)
+        return 0;
+    int ok = 0, have_cred = 0, have_ctx = 0;
+    CredHandle cred;
+    CtxtHandle ctx;
+    SCHANNEL_CRED sc;
+    memset(&sc, 0, sizeof sc);
+    sc.dwVersion = SCHANNEL_CRED_VERSION;
+    /* as xiloader: private servers present self-signed certificates */
+    sc.dwFlags = SCH_CRED_MANUAL_CRED_VALIDATION | SCH_CRED_NO_DEFAULT_CREDS | SCH_USE_STRONG_CRYPTO;
+    if (AcquireCredentialsHandleA(NULL, (SEC_CHAR*)UNISP_NAME_A, SECPKG_CRED_OUTBOUND, NULL, &sc, NULL, NULL, &cred, NULL) != SEC_E_OK)
+    {
+        snprintf(err, errn, "TLS setup failed");
+        goto out;
+    }
+    have_cred = 1;
+    static char in[32768];
+    size_t got = 0;
+    for (;;)
+    {
+        SecBuffer ib[2] = { { (unsigned long)got, SECBUFFER_TOKEN, in }, { 0, SECBUFFER_EMPTY, NULL } };
+        SecBuffer ob[1] = { { 0, SECBUFFER_TOKEN, NULL } };
+        SecBufferDesc id = { SECBUFFER_VERSION, 2, ib }, od = { SECBUFFER_VERSION, 1, ob };
+        unsigned long flags = ISC_REQ_USE_SUPPLIED_CREDS | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_CONFIDENTIALITY |
+            ISC_REQ_REPLAY_DETECT | ISC_REQ_SEQUENCE_DETECT | ISC_REQ_STREAM;
+        SECURITY_STATUS st = InitializeSecurityContextA(&cred, have_ctx ? &ctx : NULL, have_ctx ? NULL : (SEC_CHAR*)"ffxi", flags, 0, 0,
+            have_ctx ? &id : NULL, 0, have_ctx ? NULL : &ctx, &od, &flags, NULL);
+        have_ctx = 1;
+        if (ib[1].BufferType == SECBUFFER_EXTRA)
+        {
+            memmove(in, in + (got - ib[1].cbBuffer), ib[1].cbBuffer);
+            got = ib[1].cbBuffer;
+        }
+        else if (st != SEC_E_INCOMPLETE_MESSAGE)
+            got = 0;
+        if (ob[0].pvBuffer)
+        {
+            int sent = !ob[0].cbBuffer || send_all(s, ob[0].pvBuffer, ob[0].cbBuffer);
+            FreeContextBuffer(ob[0].pvBuffer);
+            if (!sent)
+                st = SEC_E_INTERNAL_ERROR;
+        }
+        if (st == SEC_E_OK)
+            break;
+        if (st != SEC_I_CONTINUE_NEEDED && st != SEC_E_INCOMPLETE_MESSAGE)
+        {
+            snprintf(err, errn, "TLS handshake with the login server failed (0x%08lx)", (unsigned long)st);
+            goto out;
+        }
+        int n = got < sizeof in ? recv(s, in + got, (int)(sizeof in - got), 0) : 0;
+        if (n <= 0)
+        {
+            snprintf(err, errn, "TLS handshake with the login server failed (connection closed)");
+            goto out;
+        }
+        got += (size_t)n;
+    }
+    SecPkgContext_StreamSizes sz;
+    if (QueryContextAttributesA(&ctx, SECPKG_ATTR_STREAM_SIZES, &sz) != SEC_E_OK)
+    {
+        snprintf(err, errn, "TLS setup failed");
+        goto out;
+    }
+    /* the request, one record at a time */
+    size_t n = strlen(request);
+    char* rec = (char*)malloc(sz.cbHeader + sz.cbMaximumMessage + sz.cbTrailer);
+    for (size_t done = 0; done < n;)
+    {
+        size_t part = n - done < sz.cbMaximumMessage ? n - done : sz.cbMaximumMessage;
+        memcpy(rec + sz.cbHeader, request + done, part);
+        SecBuffer b[4] = { { sz.cbHeader, SECBUFFER_STREAM_HEADER, rec }, { (unsigned long)part, SECBUFFER_DATA, rec + sz.cbHeader },
+            { sz.cbTrailer, SECBUFFER_STREAM_TRAILER, rec + sz.cbHeader + part }, { 0, SECBUFFER_EMPTY, NULL } };
+        SecBufferDesc d = { SECBUFFER_VERSION, 4, b };
+        if (EncryptMessage(&ctx, 0, &d, 0) != SEC_E_OK || !send_all(s, rec, b[0].cbBuffer + b[1].cbBuffer + b[2].cbBuffer))
+        {
+            SecureZeroMemory(rec, sz.cbHeader + sz.cbMaximumMessage + sz.cbTrailer);
+            free(rec);
+            snprintf(err, errn, "could not send the login request");
+            goto out;
+        }
+        done += part;
+    }
+    SecureZeroMemory(rec, sz.cbHeader + sz.cbMaximumMessage + sz.cbTrailer);
+    free(rec);
+    /* the reply: the first record with data in it */
+    for (;;)
+    {
+        if (got)
+        {
+            SecBuffer b[4] = { { (unsigned long)got, SECBUFFER_DATA, in }, { 0, SECBUFFER_EMPTY, NULL }, { 0, SECBUFFER_EMPTY, NULL },
+                { 0, SECBUFFER_EMPTY, NULL } };
+            SecBufferDesc d = { SECBUFFER_VERSION, 4, b };
+            SECURITY_STATUS st = DecryptMessage(&ctx, &d, 0, NULL);
+            if (st == SEC_E_OK)
+            {
+                SecBuffer *data = NULL, *extra = NULL;
+                for (int i = 1; i < 4; ++i)
+                    if (b[i].BufferType == SECBUFFER_DATA)
+                        data = &b[i];
+                    else if (b[i].BufferType == SECBUFFER_EXTRA)
+                        extra = &b[i];
+                size_t k = 0;
+                if (data)
+                {
+                    k = data->cbBuffer < replyn - 1 ? data->cbBuffer : replyn - 1;
+                    memcpy(reply, data->pvBuffer, k);
+                }
+                if (extra)
+                    memmove(in, in + (got - extra->cbBuffer), extra->cbBuffer), got = extra->cbBuffer;
+                else
+                    got = 0;
+                if (k)
+                {
+                    reply[k] = 0;
+                    ok = 1;
+                    break;
+                }
+                continue; /* a record with nothing for us (a session ticket) */
+            }
+            if (st != SEC_E_INCOMPLETE_MESSAGE)
+            {
+                snprintf(err, errn, "the login server did not reply");
+                break;
+            }
+        }
+        int k = got < sizeof in ? recv(s, in + got, (int)(sizeof in - got), 0) : 0;
+        if (k <= 0)
+        {
+            snprintf(err, errn, "the login server did not reply");
+            break;
+        }
+        got += (size_t)k;
+    }
+out:
+    if (have_ctx)
+        DeleteSecurityContext(&ctx);
+    if (have_cred)
+        FreeCredentialsHandle(&cred);
+    sock_close(s);
+    return ok;
+}
+#else
 static int bio_send(void* ctx, const unsigned char* buf, size_t len)
 {
     long n = (long)send(*(sock_t*)ctx, (const char*)buf, (int)len, 0);
@@ -184,6 +349,7 @@ out:
     sock_close(s);
     return ok;
 }
+#endif
 
 /* --- the little JSON xi_connect speaks ------------------------------------------------------------- */
 static void json_string(char* out, size_t n, const char* s)

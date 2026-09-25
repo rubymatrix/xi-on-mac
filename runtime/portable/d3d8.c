@@ -873,6 +873,13 @@ static void (*g_present_hook)(void);
 
 void d3d8_set_present_hook(void (*fn)(void)) { g_present_hook = fn; }
 
+void d3d8_screen_size(uint32_t* w, uint32_t* h)
+{
+    *w = g_dev.pp[0], *h = g_dev.pp[1];
+    if (g_dev.hwnd)
+        user32_client_size(g_dev.hwnd, w, h);
+}
+
 static void IDirect3DDevice8_Present(Guest* g)
 {
     if (g_present_hook)

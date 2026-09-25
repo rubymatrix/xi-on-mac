@@ -5,6 +5,10 @@
                                    tests/boot.exe, and run the boot test (x86, R2)
   python tools/build.py boot64     the same translation built for a 64-bit host with the portable
                                    runtime (runtime/portable), and tests/boot64.exe run (x64, R3.1)
+  python tools/build.py host64     the 64-bit game host (x64): FFXiMain and FFXi.dll translated, the
+                                   portable runtime, SDL3 and the Direct3D 12 back end
+  python tools/build.py gfxtest    the Direct3D 12 back end and the D3D8 front end, offscreen, without
+                                   the game (tests/gfx_test.c, tests/d3d8_test.c); needs no prepare
 
 Needs generated/FFXiMain.unpacked.dll and generated/build.json (python tools/prepare.py), which
 pick the retail build; its addresses go to generated/build.h. Incremental: the recompiler only
@@ -150,10 +154,22 @@ def boot64(env):
 FFXI_META = BUILD and BUILD['ffxi_meta']
 FFXI_IMAGE = os.path.join(ROOT, 'generated', 'FFXi.unpacked.dll')  # written by tools/prepare.py
 FFXI_RETAIL = os.path.join(ROOT, 'generated', 'FFXi.retail.dll')
-SDL3 = r'C:\Dev\SDL3\SDL3-3.4.16'
-# mbedtls 3.x or 4.x built for x64 (the LandSandBoat sign-in's TLS, host\lsb_login.c)
-MBEDTLS = r'C:\Dev\mbedtls'
-MBEDTLS_LIBS = ['mbedtls.lib', 'mbedx509.lib', 'mbedcrypto.lib']
+SDL3 = os.environ.get('SDL3_DIR', r'C:\Dev\SDL3\SDL3-3.4.16')  # the SDL3 VC development package, unpacked
+# the graphics back end on Windows: Direct3D 12, its shaders generated as HLSL and compiled at run time
+GFX_SOURCES = ['runtime\\portable\\gfx_hlsl.c', 'runtime\\portable\\gfx_hlsl_shaders.c', 'runtime\\portable\\gfx_d3d12.c']
+GFX_LIBS = ['d3d12.lib', 'dxgi.lib', 'd3dcompiler.lib', 'dxguid.lib']
+HOST_SOURCES = ['runtime\\portable\\user32.c', 'runtime\\portable\\d3d8.c', 'runtime\\portable\\dsound.c',
+                'runtime\\portable\\input.c', 'runtime\\portable\\dinput.c', 'runtime\\portable\\ws2.c', 'host\\host64.c',
+                'host\\lsb_login.c'] + GFX_SOURCES
+# the LandSandBoat sign-in's TLS is SChannel here (secur32.lib); mbedtls on POSIX hosts
+HOST_LIBS = ['synchronization.lib', 'ws2_32.lib', 'advapi32.lib', 'bcrypt.lib', 'secur32.lib'] + GFX_LIBS
+
+
+def sdl3():
+    """SDL3's include flags and import library."""
+    if not os.path.exists(os.path.join(SDL3, 'include', 'SDL3', 'SDL.h')):
+        raise SystemExit('SDL3 not found at %s: unpack SDL3-devel-<version>-VC.zip there, or set SDL3_DIR' % SDL3)
+    return ['/I', os.path.join(SDL3, 'include')], os.path.join(SDL3, 'lib', 'x64', 'SDL3.lib')
 
 
 def host64(env):
@@ -165,20 +181,39 @@ def host64(env):
     gen_ffxi = ['generated\\ffxi\\' + f for f in sorted(os.listdir(os.path.join(ROOT, 'generated', 'ffxi'))) if f.endswith('.c')]
     objs = compile_stale(env, gen, 'build\\all64', ['/I', 'generated\\all'], CFLAGS64)
     objs += compile_stale(env, gen_ffxi, 'build\\ffxi64', ['/I', 'generated\\ffxi'], CFLAGS64)
-    objs += compile_stale(env, PORTABLE + ['runtime\\portable\\user32.c', 'runtime\\portable\\d3d8.c', 'runtime\\portable\\dsound.c', 'runtime\\portable\\input.c', 'runtime\\portable\\dinput.c', 'runtime\\portable\\ws2.c', 'runtime\\portable\\gfx_null.c', 'host\\host64.c', 'host\\lsb_login.c'], 'build\\host64', ['/I', os.path.join(SDL3, 'include'), '/I', os.path.join(MBEDTLS, 'include')], CFLAGS64)
-    run(['link', '/nologo', '/OUT:build\\host64.exe', '/MACHINE:X64', 'synchronization.lib', 'ws2_32.lib',
-         os.path.join(SDL3, 'lib', 'x64', 'SDL3.lib'), 'advapi32.lib', 'bcrypt.lib']
-        + [os.path.join(MBEDTLS, 'lib', l) for l in MBEDTLS_LIBS] + objs, env)
+    sdl_inc, sdl_lib = sdl3()
+    objs += compile_stale(env, PORTABLE + HOST_SOURCES, 'build\\host64', sdl_inc, CFLAGS64)
+    run(['link', '/nologo', '/OUT:build\\host64.exe', '/MACHINE:X64', sdl_lib] + HOST_LIBS + objs, env)
     shutil.copy(os.path.join(SDL3, 'lib', 'x64', 'SDL3.dll'), os.path.join(ROOT, 'build'))
+    print('built build\\host64.exe; run: build\\host64.exe --game "%s" ...' % BUILD['game'])
+
+
+def gfxtest(env):
+    """The back end alone (gfx_test), then the D3D8 front end on it through its COM thunks (d3d8_test)."""
+    sdl_inc, sdl_lib = sdl3()
+    objs = compile_stale(env, GFX_SOURCES + ['tests\\gfx_test.c'], 'build\\gfxtest', sdl_inc, CFLAGS64)
+    run(['link', '/nologo', '/OUT:build\\gfx_test.exe', '/MACHINE:X64', sdl_lib] + GFX_LIBS + objs, env)
+    shutil.copy(os.path.join(SDL3, 'lib', 'x64', 'SDL3.dll'), os.path.join(ROOT, 'build'))
+    run(['build\\gfx_test.exe'], env)
+    objs = compile_stale(env, PORTABLE + GFX_SOURCES + ['runtime\\portable\\user32.c', 'runtime\\portable\\input.c',
+                                                        'runtime\\portable\\d3d8.c', 'tests\\d3d8_test.c'],
+                         'build\\d3d8test', sdl_inc, CFLAGS64)
+    run(['link', '/nologo', '/OUT:build\\d3d8_test.exe', '/MACHINE:X64', sdl_lib, 'synchronization.lib', 'advapi32.lib']
+        + GFX_LIBS + objs, env)
+    run(['build\\d3d8_test.exe'], env)
 
 
 def main():
     what = sys.argv[1] if len(sys.argv) > 1 else 'difftest'
-    if BUILD is None:
-        buildinfo.current()  # exits: run tools/prepare.py first
-    env = msvc_env('x64' if what in ('boot64', 'host64') else 'x86')
-    write_build_h()
-    {'difftest': difftest, 'host': host, 'boot64': boot64, 'host64': host64}[what](env)
+    targets = {'difftest': difftest, 'host': host, 'boot64': boot64, 'host64': host64, 'gfxtest': gfxtest}
+    if what not in targets:
+        raise SystemExit('targets: ' + ', '.join(targets))
+    env = msvc_env('x64' if what in ('boot64', 'host64', 'gfxtest') else 'x86')
+    if what != 'gfxtest':  # the others translate the game: they need the build prepare.py chose
+        if BUILD is None:
+            buildinfo.current()  # exits: run tools/prepare.py first
+        write_build_h()
+    targets[what](env)
 
 
 if __name__ == '__main__':
