@@ -558,6 +558,11 @@ void reg_init(const char* const* files, unsigned nfiles, const char* overlay)
     thunk_register(REG);
 }
 
+void reg_load_final(const char* path)
+{
+    load(path);
+}
+
 int reg_get_string(const char* path, const char* name, char* out, size_t n)
 {
     RegKey* k = key_from_header(path, 0);

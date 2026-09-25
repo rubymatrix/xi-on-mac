@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FFXI Launcher</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <nav>
+    <button class="tab active" data-tab="play">Play</button>
+    <button class="tab" data-tab="game">Game settings</button>
+    <button class="tab" data-tab="launcher">Launcher</button>
+  </nav>
+
+  <main>
+    <!-- Accounts and connections -->
+    <section id="play" class="page active">
+      <aside>
+        <ul id="accounts"></ul>
+        <button id="add-account" class="secondary">+ Add account</button>
+      </aside>
+      <div class="detail">
+        <div id="no-account" class="empty">Add an account to play.</div>
+        <form id="account" hidden>
+          <label>Name <input name="name" placeholder="My character"></label>
+          <label>Connection
+            <select name="kind">
+              <option value="lsb">LandSandBoat server</option>
+              <option value="pol">PlayOnline server</option>
+            </select>
+          </label>
+          <label><span data-kind="pol">PlayOnline ID</span><span data-kind="lsb">Account name</span>
+            <input name="login" autocomplete="username" spellcheck="false">
+          </label>
+          <label>Server <input name="server" placeholder="127.0.0.1" spellcheck="false"></label>
+          <details>
+            <summary>Advanced</summary>
+            <label data-kind="pol">PlayOnline sign-in server <input name="pol_server" placeholder="same as Server" spellcheck="false"></label>
+            <div class="row" data-kind="lsb">
+              <label>Sign-in port <input name="auth_port" type="number" min="0" max="65535" placeholder="54231"></label>
+              <label>Data port <input name="data_port" type="number" min="0" max="65535" placeholder="54230"></label>
+              <label>Lobby port <input name="view_port" type="number" min="0" max="65535" placeholder="54001"></label>
+            </div>
+          </details>
+          <label>Password <input name="password" type="password" autocomplete="current-password" placeholder=""></label>
+          <label data-kind="lsb">One-time code <input name="otp" inputmode="numeric" autocomplete="one-time-code" placeholder="only if the account has two-factor sign-in"></label>
+          <label class="check"><input name="save_password" type="checkbox"> Remember the password (in the system keychain)</label>
+          <div class="actions">
+            <button type="button" id="delete-account" class="danger secondary">Delete</button>
+            <span class="grow"></span>
+            <button type="button" id="stop" class="secondary" hidden>Stop</button>
+            <button type="submit" id="play-button">Play</button>
+          </div>
+        </form>
+        <div id="status"></div>
+        <pre id="log"></pre>
+      </div>
+    </section>
+
+    <!-- The game's own settings (what FINAL FANTASY XI's config tool sets) -->
+    <section id="game" class="page">
+      <form id="game-settings" class="settings">
+        <h2>Display</h2>
+        <label>Window mode
+          <select name="window_mode" data-num>
+            <option value="0">Full screen</option>
+            <option value="1">Window</option>
+            <option value="2">Borderless window</option>
+            <option value="3">Borderless full screen</option>
+          </select>
+        </label>
+        <div class="row">
+          <label>Resolution <input name="window_width" type="number" min="640" max="7680" data-num></label>
+          <span class="x">×</span>
+          <label>&nbsp;<input name="window_height" type="number" min="480" max="4320" data-num></label>
+        </div>
+        <div class="row">
+          <label>Menu resolution <input name="menu_width" type="number" min="0" max="7680" data-num></label>
+          <span class="x">×</span>
+          <label>&nbsp;<input name="menu_height" type="number" min="0" max="4320" data-num></label>
+        </div>
+        <p class="hint">0 × 0 draws the menus at the window's resolution.</p>
+        <div class="row">
+          <label>Background resolution <input name="background_width" type="number" min="512" max="8192" data-num></label>
+          <span class="x">×</span>
+          <label>&nbsp;<input name="background_height" type="number" min="512" max="8192" data-num></label>
+        </div>
+        <label>Frame rate
+          <select name="fps_divisor" data-num>
+            <option value="1">60 fps</option>
+            <option value="2">30 fps (as shipped)</option>
+          </select>
+        </label>
+
+        <h2>Graphics</h2>
+        <label>Mip mapping
+          <select name="mip_mapping" data-num>
+            <option value="0">Off</option><option value="1">1</option><option value="2">2</option>
+            <option value="3">3</option><option value="4">4</option><option value="5">5</option>
+            <option value="6">6 (best)</option>
+          </select>
+        </label>
+        <label>Texture compression
+          <select name="texture_compression" data-num>
+            <option value="0">High</option><option value="1">Low</option><option value="2">Uncompressed</option>
+          </select>
+        </label>
+        <label>Map compression
+          <select name="map_compression" data-num>
+            <option value="0">Compressed</option><option value="1">Uncompressed</option>
+          </select>
+        </label>
+        <label>Fonts
+          <select name="font" data-num>
+            <option value="0">Compressed</option><option value="1">Uncompressed</option><option value="2">High quality</option>
+          </select>
+        </label>
+        <label>Environment animation
+          <select name="environment_animation" data-num>
+            <option value="0">Off</option><option value="1">Normal</option><option value="2">Smooth</option>
+          </select>
+        </label>
+        <label class="check"><input name="bump_mapping" type="checkbox"> Bump mapping</label>
+        <label class="check"><input name="graphics_stabilization" type="checkbox"> Graphics stabilization</label>
+        <label class="check"><input name="gpu_probe" type="checkbox"> Exact occlusion tests (hides the lens flare behind walls; slower)</label>
+
+        <h2>Sound</h2>
+        <label class="check"><input name="sound" type="checkbox"> Sound</label>
+        <label class="check"><input name="sound_in_background" type="checkbox"> Keep playing sound in the background</label>
+        <label>Simultaneous sounds <input name="max_sounds" type="number" min="12" max="20" data-num></label>
+
+        <h2>Other</h2>
+        <label class="check"><input name="hardware_mouse" type="checkbox"> Hardware mouse cursor</label>
+        <label class="check"><input name="opening_movie" type="checkbox"> Play the opening movie</label>
+        <label class="check"><input name="simplified_ccs" type="checkbox"> Simplified character creation visuals</label>
+
+        <div class="actions">
+          <button type="button" id="game-defaults" class="secondary">Defaults</button>
+          <span class="grow"></span>
+          <span class="saved" hidden>Saved</span>
+        </div>
+      </form>
+    </section>
+
+    <!-- Where things are -->
+    <section id="launcher" class="page">
+      <form id="launcher-settings" class="settings">
+        <h2>Game</h2>
+        <label>FINAL FANTASY XI folder
+          <span class="pick"><input name="game_path" spellcheck="false"><button type="button" class="secondary" data-pick="folder" data-for="game_path">Choose…</button></span>
+        </label>
+        <p class="hint">The folder with FFXiMain.dll, with PlayOnlineViewer beside it.</p>
+        <label>DAT overlays
+          <textarea name="dats" rows="3" spellcheck="false" placeholder="one folder per line; the first wins"></textarea>
+        </label>
+        <button type="button" class="secondary" data-pick="folder" data-append="dats">Add folder…</button>
+
+        <h2>Advanced</h2>
+        <label>Game host (host64)
+          <span class="pick"><input name="host_program" spellcheck="false"><button type="button" class="secondary" data-pick="file" data-for="host_program">Choose…</button></span>
+        </label>
+        <label>Base registry file
+          <span class="pick"><input name="base_registry" spellcheck="false"><button type="button" class="secondary" data-pick="file" data-for="base_registry">Choose…</button></span>
+        </label>
+        <p class="hint" id="paths"></p>
+        <div class="actions"><span class="grow"></span><span class="saved" hidden>Saved</span></div>
+      </form>
+    </section>
+  </main>
+  <script src="main.js"></script>
+</body>
+</html>

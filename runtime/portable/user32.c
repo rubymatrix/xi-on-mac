@@ -10,6 +10,7 @@
  * other guest threads go through a per-thread queue. */
 #include <SDL3/SDL.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "gthread.h"
@@ -68,6 +69,7 @@ typedef struct Wnd
     int used;
     uint32_t hwnd, wndproc, tid, style;
     int x, y, w, h, visible;
+    int fullscreen; /* a full-screen D3D device is on it */
     SDL_Window* sdl;
 } Wnd;
 static Wnd g_wnds[MAX_WINDOWS];
@@ -112,10 +114,19 @@ static Wnd* wnd_of_sdl(SDL_WindowID id)
     return NULL;
 }
 
+static SDL_Window* g_adopt;
+
+void user32_adopt_window(void* sdl_window)
+{
+    g_adopt = sdl_window;
+}
+
 static void sdl_up(void)
 {
     if (g_sdl_up)
         return;
+    /* full screen in place, as on Windows: not a macOS Space sliding in */
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD))
         rt_log("[recomp] SDL_Init: %s\n", SDL_GetError());
     g_sdl_up = 1;
@@ -444,11 +455,14 @@ static void pump(void)
                 post(w->tid, w->hwnd, WM_MOUSEWHEEL, ((uint32_t)(uint16_t)(int16_t)(e.wheel.y * 120) << 16),
                     ((uint32_t)(uint16_t)(int)e.wheel.mouse_y << 16) | (uint16_t)(int)e.wheel.mouse_x);
             break;
+        case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-            w = wnd_of_sdl(e.window.windowID);
-            if (w)
-                post(w->tid, w->hwnd, WM_CLOSE, 0, 0);
-            break;
+            /* Cmd+Q, the Dock's Quit, Ctrl+C, the window's close button: the player leaving. FFXI
+             * only leaves from its own menus (its window procedure ignores WM_CLOSE), so the host
+             * ends the run here; nothing is lost - the registry is saved as the game changes it. */
+            rt_log("[recomp] quit\n");
+            fflush(NULL);
+            _Exit(0);
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
         case SDL_EVENT_WINDOW_FOCUS_LOST:
         {
@@ -509,6 +523,37 @@ static void sh_UnregisterClassA(Guest* g)
 static void sh_AdjustWindowRectEx(Guest* g) { RET(1, 4); }
 static void sh_AdjustWindowRect(Guest* g) { RET(1, 3); }
 
+/* The window's frame from its style, as Windows would draw it (macOS; Windows does its own when the
+ * window is made): a WS_POPUP without a caption (FFXI's borderless modes) has none, and one covering
+ * the desktop is full screen - the desktop's own mode, no mode change (SDL's fullscreen with no
+ * display mode), not a macOS Space. */
+static void apply_frame(Wnd* w)
+{
+#if defined(_WIN32)
+    (void)w; /* Windows: the window is made borderless when created, and placed where the game puts it */
+    return;
+#else
+    if (!w->sdl)
+        return;
+    int popup = (w->style & 0x80000000u) && (w->style & 0x00C00000u) != 0x00C00000u; /* WS_POPUP, no WS_CAPTION */
+    SDL_SetWindowBordered(w->sdl, !popup);
+    uint32_t dw, dh, hz;
+    user32_desktop_mode(&dw, &dh, &hz);
+    int cover = popup && (uint32_t)w->w >= dw && (uint32_t)w->h >= dh;
+    SDL_SetWindowFullscreenMode(w->sdl, NULL);
+    SDL_SetWindowFullscreen(w->sdl, cover || w->fullscreen);
+#endif
+}
+
+void user32_set_fullscreen(uint32_t hwnd, int on)
+{
+    Wnd* w = wnd(hwnd);
+    if (!w)
+        return;
+    w->fullscreen = on != 0;
+    apply_frame(w);
+}
+
 /* CreateWindowExA(ex, class, title, style, x, y, w, h, parent, menu, instance, param) */
 static void sh_CreateWindowExA(Guest* g)
 {
@@ -540,15 +585,27 @@ static void sh_CreateWindowExA(Guest* g)
     w->w = (int32_t)ARG(6) == (int32_t)0x80000000 ? 640 : (int32_t)ARG(6);
     w->h = (int32_t)ARG(7) == (int32_t)0x80000000 ? 480 : (int32_t)ARG(7);
     sdl_up();
-    SDL_WindowFlags flags = SDL_WINDOW_HIDDEN;
-#if defined(_WIN32)
     /* A WS_POPUP window with no caption (the game's full-screen and borderless windowed modes) has no
      * frame here either, and goes where the game puts it: at its size, borderless full screen. */
     int popup = (w->style & 0x80000000u) && !(w->style & 0x00C00000u);
-    if (popup)
-        flags |= SDL_WINDOW_BORDERLESS;
+    (void)popup;
+    if (g_adopt && !ARG(8)) /* no parent: the game's main window */
+    {
+        w->sdl = g_adopt;
+        g_adopt = NULL;
+        SDL_SetWindowTitle(w->sdl, ARG(2) ? ARGS(2) : "");
+        SDL_SetWindowSize(w->sdl, w->w, w->h);
+    }
+    else
+    {
+        SDL_WindowFlags flags = SDL_WINDOW_HIDDEN;
+#if defined(_WIN32)
+        if (popup)
+            flags |= SDL_WINDOW_BORDERLESS;
 #endif
-    w->sdl = SDL_CreateWindow(ARG(2) ? ARGS(2) : "", w->w, w->h, flags);
+        w->sdl = SDL_CreateWindow(ARG(2) ? ARGS(2) : "", w->w, w->h, flags);
+    }
+    apply_frame(w);
     if (!w->sdl)
         rt_log("[recomp] SDL_CreateWindow: %s\n", SDL_GetError());
 #if defined(_WIN32)
@@ -1273,6 +1330,7 @@ static void sh_MoveWindow(Guest* g)
     {
         SDL_SetWindowPosition(w->sdl, w->x, w->y);
         SDL_SetWindowSize(w->sdl, w->w, w->h);
+        apply_frame(w);
     }
     call_wndproc(w, WM_MOVE, 0, ((uint32_t)(uint16_t)w->y << 16) | (uint16_t)w->x);
     call_wndproc(w, WM_SIZE, 0, ((uint32_t)(uint16_t)w->h << 16) | (uint16_t)w->w);

@@ -1,0 +1,22 @@
+[package]
+name = "ffxi-launcher"
+version = "0.1.0"
+description = "Signs in and runs the recompiled FINAL FANTASY XI (host64)"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+cc = "1"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

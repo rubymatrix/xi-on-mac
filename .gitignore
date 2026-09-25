@@ -20,3 +20,6 @@ __pycache__/
 
 # Jython compiles the discovery scripts next to themselves
 *$py.class
+# The launcher (Tauri): generated schemas, and cargo output outside build/
+launcher/src-tauri/gen/
+launcher/src-tauri/target/

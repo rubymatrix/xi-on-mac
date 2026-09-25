@@ -1,9 +1,21 @@
 # FFXI on Mac
 
+> [!WARNING]
+> **This does not work with retail FINAL FANTASY XI or Square Enix's PlayOnline service, and is
+> not meant to.** It is for private servers only: LandSandBoat servers and private servers that
+> run their own PlayOnline emulation. Its PlayOnline sign-in speaks to such emulated servers; it
+> is not a client for Square Enix's PlayOnline network, it cannot sign in to or play on the
+> official FINAL FANTASY XI worlds, and it must not be pointed at them. Using unofficial clients on
+> Square Enix's service breaks its Terms of Service. This project is not affiliated with, endorsed
+> by, or supported by Square Enix. FINAL FANTASY XI and PlayOnline are trademarks of Square Enix;
+> you need your own legitimately obtained copy of the game's files.
+
 Static recompilation of FINAL FANTASY XI's `FFXiMain.dll` (and `FFXi.dll`) from 32-bit x86 to C,
 so the game runs natively on arm64 macOS without Wine or Rosetta. This repo holds the recompiler,
-its runtime, the platform layer (Win32, Direct3D 8 on Metal, audio, input, sockets) and `host64`,
-the launcher that signs in and runs the game.
+its runtime, the platform layer (Win32, Direct3D 8 on Metal, audio, input, sockets), `host64`,
+the game host, with its own sign-in screen drawn in the game's UI art, and the older launcher, a
+desktop app for macOS and Windows that keeps your accounts and settings, signs in and starts
+`host64`.
 
 ## Rules
 
@@ -61,6 +73,13 @@ build/gfx_test --window                  # the same, then two seconds of frames 
 Run `prepare` again whenever the install changes (a new game version); `host64` and `boot64`
 re-translate and rebuild what changed.
 
+The launcher needs Rust and the Tauri CLI (`cargo install tauri-cli`). Build `host64` first; the
+launcher target puts it inside the app:
+
+```
+python3 tools/build_posix.py launcher    # build/FFXI Launcher.app, build/pol-signin, PlayOnline tests
+```
+
 ### Windows
 
 ```
@@ -71,7 +90,61 @@ python tools\build.py boot64     # x64: the portable runtime + boot test
 python tools\install.py install  # put the stand-in in the game folder (restore: undo)
 python tools\trace_report.py <FFXiMain.trace.txt> [--seq <FFXiMain.seq.txt>]   # resolve a boundary trace
 python tools\build.py host64     # x64: the game host (SDL3 at C:\Dev\SDL3)
+python tools\build.py launcher   # x64: build\ffxi-launcher.exe beside host64.exe (Rust, cargo install tauri-cli)
 ```
+
+## The sign-in screen and `Final Fantasy XI.app`
+
+Started without a way in on its command line (no `--session`, no `--user` with a password),
+`host64` shows its own sign-in screen before the game, in the game's own UI art read from the
+install (window themes, font, title art; `host/datui.c`), in the window the game then takes over.
+It signs in to a **LandSandBoat server** (username, password, one-time code) or a **private
+PlayOnline server** (PlayOnline ID, password), switched in its **Settings** with the server,
+whether to remember the password (macOS Keychain) and the window theme. It keeps its files in
+`~/Library/Application Support/FFXIRecompile/FFXI` (or `--data-dir`): `signin.cfg`,
+`settings.reg` (the display settings, written once with defaults), `saved.reg` (the game's own
+saves), `host64.log` when started from Finder, and an optional `background.png`/`.jpg` behind the
+screen. Cmd+Q, the Dock's Quit and Ctrl+C quit at any point.
+
+`python3 tools/build_posix.py app` makes `build/Final Fantasy XI.app`: `host64` with its libraries
+and `playonline.reg`, and first-run defaults in its `Info.plist` so it starts from Finder with no
+command line (`host/appdefaults.h`):
+
+```
+python3 tools/build_posix.py app --game <FINAL FANTASY XI folder> --sign-in lsb --server <name> \
+    --resolution 2560x1440 --menu-resolution 1280x720 --window-mode 3 --background <picture>
+```
+
+The values go into the built app only. The button art is the screen's own
+(`tools/make_ui_art.py`, `assets/ui/`); `third_party/stb/stb_image.h` (public domain) reads
+pictures.
+
+## The launcher
+
+`launcher/` is the same app on macOS and Windows (Tauri: Rust, with the UI in `launcher/ui`). It
+does what the PlayOnline Viewer and FINAL FANTASY XI's config tool do:
+
+- **Accounts.** Each one is either a **LandSandBoat server** (the account name; `host64` signs in
+  itself, xiloader's protocol) or a **PlayOnline server** (the PlayOnline ID; the launcher signs in
+  over the retail PlayOnline protocol, `launcher/pol/`, hands `host64` the session value with
+  `--session`, and keeps the PlayOnline session up while the game runs). Passwords are kept in the
+  system keychain (macOS Keychain, Windows Credential Manager), never in the settings file.
+- **Game settings.** Window mode and resolution, menu and background resolution, the graphics
+  options, sound, frame rate. They are written as `settings.reg` and given to `host64` with
+  `--reg-final`, loaded after the game's own saves (`saved.reg`, `--reg-overlay`), so the launcher's
+  values win.
+- **Paths.** The `FINAL FANTASY XI` folder, DAT overlays, and optionally which `host64` and base
+  registry file to use. By default `host64` is the one inside the app (macOS) or beside the
+  launcher (Windows), and the base registry is the bundled `playonline.reg`.
+
+Its settings file is `launcher.json` in the app's config folder
+(`~/Library/Application Support/com.rubymatrix.xi-launcher` on macOS, `%APPDATA%\com.rubymatrix.xi-launcher`
+on Windows), next to `settings.reg` and `saved.reg`. The game's output is shown in the window and
+written to `host64.log` in the app's log folder. For a LandSandBoat account the password reaches
+`host64` in `FFXI_PASSWORD`, not on its command line.
+
+`build/pol-signin <PlayOnline ID> [password] [--host h]` signs in without the game and prints the
+session value, for testing a server.
 
 ## Running: `host64`
 
@@ -114,7 +187,9 @@ build/host64 --game ... --server <name or a.b.c.d> --session <V>
 | `--authport`, `--dataport`, `--viewport` | LandSandBoat's ports, as xiloader: 54231 (sign-in, TLS), 54230 (data), 54001 (lobby view). |
 | `--session <V>` | A server with PlayOnline behind it: the session value its lobby checks, as 16 characters or 32 hex digits. |
 | `--reg <file.reg>` | A registry export to load (up to 8; later files win). The game reads its settings (resolution, window mode, sound) from `HKLM\SOFTWARE\PlayOnlineUS`. `playonline.reg` in this repo is a starting point. |
-| `--reg-overlay <file.reg>` | Where the game saves settings it changes. It is loaded last, and the `--reg` files are never rewritten. |
+| `--reg-overlay <file.reg>` | Where the game saves settings it changes. It is loaded after the `--reg` files, and those are never rewritten. |
+| `--data-dir <folder>` | Where `host64` writes its own files (the `patch.ver` it makes for an install without one). Default: beside `host64`. |
+| `--reg-final <file.reg>` | Loaded after the overlay, so its values win over what the game saved (up to 8). The launcher's game settings. |
 | `--dats <folder>` | DAT overlays, the way XIPivot does them (up to 8; the first folder given wins). See below. |
 | `--fps-divisor <n>` | The game's frame divisor: `1` is 60 fps (the default here), `2` is 30 fps as shipped. |
 | `--aspect <auto, off or w:h>` | The 3D scene's aspect ratio. `auto` (the default) follows the window's shape, as Ashita's aspect addon does, so a widescreen or ultrawide window sees more to the sides instead of a 4:3 view stretched across it. `off` leaves it to the game; a shape (`16:9`, `1.778`) fixes it. |
@@ -122,7 +197,7 @@ build/host64 --game ... --server <name or a.b.c.d> --session <V>
 
 The install folder is never written. The registry's install paths are set to where the game
 actually is, and an install that has no `patch.ver` (common for private-server installs) gets one
-for its build's version, kept next to `host64`.
+for its build's version, kept next to `host64` (or in `--data-dir`).
 
 ### DAT overlays (`--dats`)
 
@@ -255,8 +330,11 @@ runtime/portable/  64-bit hosts: plat.h (+ plat_win.c, plat_posix.c), gwin (gues
                    gfx_metal.m (Metal) + gfx_msl*.c (D3D8 state and shaders -> MSL), gfx_null.c (elsewhere)
 host/              ffximain.c: the 32-bit stand-in FFXiMain.dll; host64.c: the 64-bit game host;
                    lsb_login.c: the LandSandBoat sign-in
+launcher/          the launcher (Tauri): src-tauri/ (Rust: accounts, settings, starting host64),
+                   ui/ (HTML/JS), pol/ (PlayOnline sign-in in portable C, and pol_signin.c)
 tests/             difftest.c (original vs translation), boot.c (x86), boot64.c (x64),
-                   gfx_test.c (the Metal back end), d3d8_test.c (the D3D8 front end on it)
+                   gfx_test.c (the Metal back end), d3d8_test.c (the D3D8 front end on it),
+                   polcrypt_test.c (the launcher's PlayOnline primitives)
 tools/             prepare.py, buildinfo.py, pol1_unpack.py, build.py (MSVC), build_posix.py (clang),
                    install.py, trace_report.py; newbuild.py and discover.py (a new client version)
 discovery/         the discovery pass: Ghidra (Jython) post-scripts, verdicts.py (the manual verdicts

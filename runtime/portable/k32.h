@@ -14,6 +14,8 @@ void k32_misc_init(void); /* k32_misc.c */
 /* The registry (reg.c): .reg files in `reg export` format, loaded in order, then the overlay the
  * game's own changes are saved to (may be NULL: changes stay in memory). */
 void reg_init(const char* const* files, unsigned nfiles, const char* overlay);
+/* A .reg loaded after the overlay, so its values win over what the game saved (a launcher's settings). */
+void reg_load_final(const char* path);
 /* ole32 / OLEAUT32 (ole.c): COM plumbing, CoCreateInstance of the translated modules' classes. */
 void ole_init(void);
 /* A COM class a translated module serves (DllGetClassObject of the module mapped at module_base). */

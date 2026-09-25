@@ -1653,7 +1653,12 @@ void gfx_resize(uint32_t w, uint32_t h)
 int gfx_init(void* window, int vsync)
 {
     if (g_dev)
+    {
+        /* up already (host64's sign-in screen, on this same window): the game's present interval */
+        if (g_layer)
+            g_layer.displaySyncEnabled = vsync ? YES : NO;
         return 1;
+    }
     @autoreleasepool
     {
         g_dev = MTLCreateSystemDefaultDevice();

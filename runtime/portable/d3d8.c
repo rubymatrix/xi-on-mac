@@ -420,6 +420,9 @@ typedef struct Dev
 } Dev;
 
 static Dev g_dev; /* the game makes one device */
+/* A 16x16 occlusion probe tests a quad at the sky's depth (z 0x3f7ffffe, 1 - 2^-23: the game's
+ * probe for the sun and its lens flare) since the last probe was read; see lock_rect. */
+static int g_probe_sky;
 static uint32_t g_d3d;
 
 static int xf_index(uint32_t ts)
@@ -762,6 +765,7 @@ static void IDirect3D8_CreateDevice(Guest* g)
         d->pp[2] = FMT_X8R8G8B8;
     /* windowed devices ignore the presentation interval and wait for the display; so do we unless
      * a full-screen device asks for IMMEDIATE */
+    user32_set_fullscreen(d->hwnd, !d->pp[7]);
     gfx_init(user32_sdl_window(d->hwnd), d->pp[7] || d->pp[12] != 0x80000000u);
     obj_addref(d->d3d);
     d->guest = obj_new(O_DEVICE);
@@ -841,6 +845,7 @@ static void IDirect3DDevice8_Reset(Guest* g)
         user32_client_size(d->hwnd, &d->pp[0], &d->pp[1]);
     if (!d->pp[2])
         d->pp[2] = FMT_X8R8G8B8;
+    user32_set_fullscreen(d->hwnd, !d->pp[7]);
     Obj* bb = obj(d->backbuffer);
     bb->format = d->pp[2], bb->width = d->pp[0], bb->height = d->pp[1], bb->size = fmt_size(bb->format, bb->width, bb->height);
     if (bb->mem)
@@ -1455,6 +1460,8 @@ static void IDirect3DDevice8_DrawIndexedPrimitive(Guest* g)
  * The ...UP draws leave stream 0 (and the indices) unset, as D3D8 does. */
 static void IDirect3DDevice8_DrawPrimitiveUP(Guest* g)
 {
+    if (!(g_dev.cur.vs & 1) && (g_dev.cur.vs & 0xE) == 4 && ARG(3) && rd32(ARG(3) + 8) == 0x3f7ffffeu)
+        g_probe_sky = 1; /* transformed vertices at the sky's depth */
     draw(ARG(1), ARG(2), 0, 0, 0, ARG(3), ARG(4));
     bind(&g_dev.cur.stream[0], 0);
     g_dev.cur.stride[0] = 0;
@@ -2302,8 +2309,16 @@ static void lock_rect(Obj* s, uint32_t locked, uint32_t rect, uint32_t flags)
              * fully visible) reads fully visible, with no wait for the GPU. Reading it for real
              * stalls the CPU on the whole scene every frame (7-8 ms at a 4096x4096 background),
              * and a late answer makes characters flicker; answering visible draws what the probe
-             * would have hidden, which the depth test hides anyway. FFXI_PROBE=gpu reads it. */
-            if (visible && (flags & LOCK_READONLY) && s->width == 16 && s->height == 16)
+             * would have hidden, which the depth test hides anyway. FFXI_PROBE=gpu reads it.
+             * Not so the sky probe: the sun's lens flare draws without a depth test, so it is the
+             * probe that hides it behind walls. That one reads a frame late, for free; the flare
+             * writes no depth, so the late answer does not feed back into the next. */
+            int probe = (flags & LOCK_READONLY) && s->width == 16 && s->height == 16, sky = probe && g_probe_sky;
+            if (probe)
+                g_probe_sky = 0;
+            if (visible && sky)
+                gfx_tex_read_async(g, face, level, GUEST_PTR(bits), pitch);
+            else if (visible && probe)
                 memset(GUEST_PTR(bits), 0xFF, (size_t)pitch * s->height);
             else if (async && (flags & LOCK_READONLY) && s->width * s->height <= 128 * 128)
                 gfx_tex_read_async(g, face, level, GUEST_PTR(bits), pitch);

@@ -9,6 +9,8 @@
                                    portable runtime, SDL3 and the Direct3D 12 back end
   python tools/build.py gfxtest    the Direct3D 12 back end and the D3D8 front end, offscreen, without
                                    the game (tests/gfx_test.c, tests/d3d8_test.c); needs no prepare
+  python tools/build.py launcher   the launcher (launcher/, Tauri): the PlayOnline tests,
+                                   build/pol-signin.exe and build/ffxi-launcher.exe (beside host64.exe)
 
 Needs generated/FFXiMain.unpacked.dll and generated/build.json (python tools/prepare.py), which
 pick the retail build; its addresses go to generated/build.h. Incremental: the recompiler only
@@ -160,7 +162,11 @@ GFX_SOURCES = ['runtime\\portable\\gfx_hlsl.c', 'runtime\\portable\\gfx_hlsl_sha
 GFX_LIBS = ['d3d12.lib', 'dxgi.lib', 'd3dcompiler.lib', 'dxguid.lib']
 HOST_SOURCES = ['runtime\\portable\\user32.c', 'runtime\\portable\\d3d8.c', 'runtime\\portable\\dsound.c',
                 'runtime\\portable\\input.c', 'runtime\\portable\\dinput.c', 'runtime\\portable\\ws2.c', 'host\\host64.c',
-                'host\\lsb_login.c'] + GFX_SOURCES
+                'host\\lsb_login.c', 'host\\datui.c', 'host\\uidraw.c', 'host\\signin.c', 'host\\ui_art.c',
+                'host\\keychain.c', 'host\\appdefaults.c', 'launcher\\pol\\polcrypt.c', 'launcher\\pol\\polnet.c',
+                'launcher\\pol\\polsession.c'] + GFX_SOURCES
+# the sign-in screen's: the PlayOnline client, stb_image
+HOST_INCLUDES = ['/I', 'launcher\\pol', '/I', 'third_party\\stb']
 # the LandSandBoat sign-in's TLS is SChannel here (secur32.lib); mbedtls on POSIX hosts
 HOST_LIBS = ['synchronization.lib', 'ws2_32.lib', 'advapi32.lib', 'bcrypt.lib', 'secur32.lib'] + GFX_LIBS
 
@@ -182,7 +188,7 @@ def host64(env):
     objs = compile_stale(env, gen, 'build\\all64', ['/I', 'generated\\all'], CFLAGS64)
     objs += compile_stale(env, gen_ffxi, 'build\\ffxi64', ['/I', 'generated\\ffxi'], CFLAGS64)
     sdl_inc, sdl_lib = sdl3()
-    objs += compile_stale(env, PORTABLE + HOST_SOURCES, 'build\\host64', sdl_inc, CFLAGS64)
+    objs += compile_stale(env, PORTABLE + HOST_SOURCES, 'build\\host64', sdl_inc + HOST_INCLUDES, CFLAGS64)
     run(['link', '/nologo', '/OUT:build\\host64.exe', '/MACHINE:X64', sdl_lib] + HOST_LIBS + objs, env)
     shutil.copy(os.path.join(SDL3, 'lib', 'x64', 'SDL3.dll'), os.path.join(ROOT, 'build'))
     print('built build\\host64.exe; run: build\\host64.exe --game "%s" ...' % BUILD['game'])
@@ -203,11 +209,32 @@ def gfxtest(env):
     run(['build\\d3d8_test.exe'], env)
 
 
+POL_SOURCES = ['launcher\\pol\\polcrypt.c', 'launcher\\pol\\polnet.c', 'launcher\\pol\\polsession.c']
+
+
+def launcher(env):
+    """The launcher: its PlayOnline C (tested here, and as build/pol-signin.exe), then the Tauri app
+    beside host64.exe, where it looks for it. Needs Rust and the Tauri CLI (`cargo install tauri-cli`)."""
+    os.makedirs(os.path.join(ROOT, 'build', 'pol'), exist_ok=True)
+    cl = ['cl', '/nologo', '/O2', '/MT', '/W3', '/std:c11', '/D_CRT_SECURE_NO_WARNINGS', '/I', 'launcher\\pol',
+          '/Fo:build\\pol\\']
+    run(cl + ['/Fe:build\\polcrypt_test.exe', 'tests\\polcrypt_test.c'] + POL_SOURCES + ['ws2_32.lib'], env)
+    run(['build\\polcrypt_test.exe'], env)
+    run(cl + ['/Fe:build\\pol-signin.exe', 'launcher\\pol\\pol_signin.c'] + POL_SOURCES + ['ws2_32.lib'], env)
+    env = dict(env, CARGO_TARGET_DIR=os.path.join(ROOT, 'build', 'launcher-target'))
+    subprocess.check_call('cargo tauri build --no-bundle', cwd=os.path.join(ROOT, 'launcher', 'src-tauri'), env=env,
+                          shell=True)
+    shutil.copy(os.path.join(env['CARGO_TARGET_DIR'], 'release', 'ffxi-launcher.exe'), os.path.join(ROOT, 'build'))
+    print('built build\\ffxi-launcher.exe')
+
+
 def main():
     what = sys.argv[1] if len(sys.argv) > 1 else 'difftest'
+    if what == 'launcher':
+        return launcher(msvc_env('x64'))
     targets = {'difftest': difftest, 'host': host, 'boot64': boot64, 'host64': host64, 'gfxtest': gfxtest}
     if what not in targets:
-        raise SystemExit('targets: ' + ', '.join(targets))
+        raise SystemExit('targets: ' + ', '.join(list(targets) + ['launcher']))
     env = msvc_env('x64' if what in ('boot64', 'host64', 'gfxtest') else 'x86')
     if what != 'gfxtest':  # the others translate the game: they need the build prepare.py chose
         if BUILD is None:

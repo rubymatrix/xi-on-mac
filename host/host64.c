@@ -7,6 +7,8 @@
  * our own polcore (runtime/portable/polcore.c) in place of PlayOnline's.
  *
  * usage: host64 --game <FINAL FANTASY XI folder> [--reg <file.reg>]... [--reg-overlay <file.reg>]
+ *               [--reg-final <file.reg>]...   loaded after the overlay: a launcher's settings
+ *               [--data-dir <folder>]   where host64 writes its own files (default: beside it)
  *               [--server <name or a.b.c.d>]
  *               [--session <V: 16 characters, or 32 hex digits>]                   PlayOnline servers
  *               [--user <name> [--pass <password>] [--otp <code>] [--login-token <t>]   LandSandBoat servers
@@ -27,11 +29,17 @@
  *
  * Two ways in:
  *   - a server with PlayOnline behind it: the session value V its lobby checks
- *     (pol_accounts.session_value). For now --session; a PlayOnline sign-in client supplies it.
+ *     (pol_accounts.session_value). --session gives it; else the sign-in screen gets it.
  *   - a LandSandBoat server with none (xiloader's path, host/lsb_login.c): --user signs in on the
- *     server's auth port first. The password comes from --pass, else FFXI_PASSWORD, else a
- *     prompt; --otp is the two-factor code, if the account has one. --login-token is a launch token
- *     from the server's own launcher, in place of the password and code. */
+ *     server's auth port first. The password comes from --pass, else FFXI_PASSWORD, else the
+ *     sign-in screen; --otp is the two-factor code, if the account has one. --login-token is a
+ *     launch token from the server's own launcher, in place of the password and code.
+ *
+ * With neither, the sign-in screen (host/signin.c) comes first, in the game's own UI art: either
+ * method, picked in its Settings, and the server; it remembers them in <data dir>/signin.cfg
+ * (--data-dir, else the user's app data), the password in the keychain, and writes display
+ * defaults to <data dir>/settings.reg, loaded when no --reg-final is given. Its window becomes the
+ * game's. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +51,8 @@
 #include "polcore.h"
 #include "polcore_config.h"
 #include "lsb_login.h"
+#include "signin.h"
+#include "appdefaults.h"
 #include "thunk.h"
 #include "user32.h"
 #include "d3d8.h"
@@ -227,21 +237,70 @@ static int parse_session(const char* s, uint8_t v[16])
     return 1;
 }
 
+/* playonline.reg, the base registry the launcher passes (--reg): beside host64, in an app bundle's
+ * Resources, or at the top of the source tree host64 was built in (build/host64). */
+static int bundled_registry(const char* argv0, char* out, size_t n)
+{
+    const char *end = argv0, *p;
+    for (p = argv0; *p; ++p)
+        if (*p == '/' || *p == '\\')
+            end = p + 1;
+    static const char* const WHERE[] = { "playonline.reg", "../Resources/playonline.reg", "../playonline.reg" };
+    for (size_t i = 0; i < sizeof WHERE / sizeof *WHERE; ++i)
+    {
+        PlatStat st;
+        snprintf(out, n, "%.*s%s", (int)(end - argv0), argv0, WHERE[i]);
+        if (plat_stat(out, &st))
+            return 1;
+    }
+    return 0;
+}
+
 static void report_overlay(const char* name, unsigned files)
 {
     rt_log("[recomp] dats: %s, %u files\n", name, files);
 }
 
+#ifdef __APPLE__
+#include <SDL3/SDL.h>
+#include <unistd.h>
+#endif
+
 int main(int argc, char** argv)
 {
+#ifdef __APPLE__
+    /* started from Finder or the Dock (an app bundle, no terminal): the log goes to host64.log
+     * beside the sign-in screen's files */
+    if (app_bundled() && !isatty(2))
+    {
+        char* pref = SDL_GetPrefPath("FFXIRecompile", "FFXI");
+        if (pref)
+        {
+            char log[1100];
+            snprintf(log, sizeof log, "%shost64.log", pref);
+            if (freopen(log, "w", stderr))
+                setvbuf(stderr, NULL, _IOLBF, 0);
+            freopen(log, "a", stdout);
+            setvbuf(stdout, NULL, _IOLBF, 0);
+            SDL_free(pref);
+        }
+    }
+#endif
+    static char app_game[1024], app_server[256], app_bg[1100], app_val[64];
     const char* game = NULL;
     const char* regs[8];
     unsigned nregs = 0;
     const char* overlay = NULL;
+    const char* data_dir = NULL;
+    const char* finals[8];
+    unsigned nfinals = 0;
     const char* dats[8];
     unsigned ndats = 0;
     uint32_t pol_server = DEFAULT_POL_SERVER;
     LsbLogin lsb = { 0, 54231, 54230, 54001, NULL, NULL, "", NULL };
+    int have_session = 0;
+    static char base_reg[1100];
+    const char* server_name = NULL; /* --server as given, for the sign-in screen */
     for (int i = 1; i + 1 < argc; i += 2)
     {
         if (!strcmp(argv[i], "--game"))
@@ -250,6 +309,10 @@ int main(int argc, char** argv)
             regs[nregs++] = argv[i + 1];
         else if (!strcmp(argv[i], "--reg-overlay"))
             overlay = argv[i + 1];
+        else if (!strcmp(argv[i], "--reg-final") && nfinals < 8)
+            finals[nfinals++] = argv[i + 1];
+        else if (!strcmp(argv[i], "--data-dir"))
+            data_dir = argv[i + 1];
         else if (!strcmp(argv[i], "--dats") && ndats < 8)
             dats[ndats++] = argv[i + 1];
         else if (!strcmp(argv[i], "--session"))
@@ -261,9 +324,11 @@ int main(int argc, char** argv)
                 return 2;
             }
             polcore_set_session(v);
+            have_session = 1;
         }
         else if (!strcmp(argv[i], "--server") || !strcmp(argv[i], "--pol-server") || !strcmp(argv[i], "--lobby"))
         {
+            server_name = argv[i + 1];
             if (!net_resolve_ipv4(argv[i + 1], &pol_server))
             {
                 fprintf(stderr, "%s: cannot resolve %s\n", argv[i], argv[i + 1]);
@@ -312,19 +377,73 @@ int main(int argc, char** argv)
             *(argv[i][2] == 'a' ? &lsb.auth_port : argv[i][2] == 'd' ? &lsb.data_port : &lsb.view_port) = (uint16_t)port;
         }
     }
+    if (!game && app_default("FFXIGameFolder", app_game, sizeof app_game))
+        game = app_game;
     if (!game)
     {
-        fprintf(stderr, "usage: host64 --game <FINAL FANTASY XI folder> [--reg f.reg]... [--reg-overlay f.reg] "
+        fprintf(stderr, "usage: host64 --game <FINAL FANTASY XI folder> [--reg f.reg]... [--reg-overlay f.reg] [--reg-final f.reg]... [--data-dir folder] "
                         "[--server name] [--session V | --user name [--pass p] [--otp code] [--authport n] "
                         "[--dataport n] [--viewport n]] [--dats folder]...\n");
         return 2;
+    }
+    if (!lsb.password)
+        lsb.password = getenv("FFXI_PASSWORD");
+    if (!have_session && !(lsb.user && (lsb.password || lsb.login_token)))
+    {
+        /* Nothing on the command line signs in: the sign-in screen, in the game's own art. Its
+         * window becomes the game's; a PlayOnline sign-in sets the session value itself. */
+        SigninSetup su = { game, data_dir, lsb.user ? SIGNIN_LSB : 0, server_name, lsb.user,
+                           lsb.password, lsb.otp, lsb.auth_port != 54231 ? lsb.auth_port : 0,
+                           lsb.data_port != 54230 ? lsb.data_port : 0, lsb.view_port != 54001 ? lsb.view_port : 0 };
+        /* an app bundle's first-run defaults (appdefaults.h) */
+        su.default_mode = -1;
+        if (app_default("FFXISignInMethod", app_val, sizeof app_val))
+            su.default_method = !strcmp(app_val, "pol") ? SIGNIN_POL : SIGNIN_LSB;
+        if (app_default("FFXIServer", app_server, sizeof app_server))
+            su.default_server = app_server;
+        if (app_default("FFXIWindowMode", app_val, sizeof app_val))
+            su.default_mode = atoi(app_val);
+        if (app_default("FFXIResolution", app_val, sizeof app_val))
+            sscanf(app_val, "%dx%d", &su.default_w, &su.default_h);
+        if (app_default("FFXIMenuResolution", app_val, sizeof app_val))
+            sscanf(app_val, "%dx%d", &su.default_menu_w, &su.default_menu_h);
+        if (app_default("FFXIBackground", app_val, sizeof app_val) && app_resource(app_val, app_bg, sizeof app_bg))
+            su.default_background = app_bg;
+        SigninResult sr;
+        int r = signin_run(&su, &sr);
+        if (r == 0)
+            return 0;
+        if (r > 0)
+        {
+            pol_server = sr.server;
+            user32_adopt_window(sr.window);
+            if (!nfinals)
+                finals[nfinals++] = strdup(sr.settings_reg);
+            /* run as the launcher does: its folder for host64's files and the game's saved
+             * settings, the bundled PlayOnline registry under them */
+            if (!data_dir)
+                data_dir = strdup(sr.data_dir);
+            if (!overlay)
+            {
+                char o[1100];
+                snprintf(o, sizeof o, "%s%ssaved.reg", data_dir,
+                    data_dir[0] && data_dir[strlen(data_dir) - 1] == '/' ? "" : "/");
+                overlay = strdup(o);
+            }
+            if (!nregs && bundled_registry(argv[0], base_reg, sizeof base_reg))
+                regs[nregs++] = base_reg;
+            lsb.user = NULL; /* signed in */
+        }
+        else if (!lsb.user)
+        {
+            fprintf(stderr, "no sign-in screen here: --session V, or --user name for a LandSandBoat server\n");
+            return 2;
+        }
     }
     if (lsb.user)
     {
         /* a LandSandBoat server: sign in before anything is loaded, so a refusal costs nothing */
         char pw[256], err[512];
-        if (!lsb.password)
-            lsb.password = getenv("FFXI_PASSWORD");
         if (!lsb.password && lsb.login_token)
             lsb.password = ""; /* the token replaces it */
         if (!lsb.password)
@@ -388,6 +507,8 @@ int main(int argc, char** argv)
     rt_log("[recomp] *.pol.com -> %u.%u.%u.%u\n", pol_server >> 24, (pol_server >> 16) & 255, (pol_server >> 8) & 255,
         pol_server & 255);
     reg_init(regs, nregs, overlay);
+    for (unsigned i = 0; i < nfinals; ++i)
+        reg_load_final(finals[i]);
     {
         /* The install folders are where the game is now, whatever the imported registry says (it
          * comes from another machine or folder); the game checks them (FFXI-9001). Retail writes
@@ -411,19 +532,24 @@ int main(int argc, char** argv)
     {
         /* The game reads patch.ver from its folder and will not start without it; the lobby sees
          * the version inside. Installs launched without the PlayOnline Viewer (private servers'
-         * xiloader) ship none: then one is made for this build's version, next to the host, and
-         * mounted over the game's path. The install itself is never written. */
+         * xiloader) ship none: then one is made for this build's version, in --data-dir (else next
+         * to the host), and mounted over the game's path. The install itself is never written. */
         char pv[760];
         PlatStat st;
         snprintf(pv, sizeof pv, "%s%cpatch.ver", host_game, plat_path_sep);
         if (!plat_stat(pv, &st))
         {
             uint8_t file[0x120];
-            const char *dir_end = argv[0], *p;
-            for (p = argv[0]; *p; ++p)
-                if (*p == '/' || *p == plat_path_sep)
-                    dir_end = p + 1;
-            snprintf(pv, sizeof pv, "%.*spatch.%s.ver", (int)(dir_end - argv[0]), argv[0], FFXI_VERSION);
+            if (data_dir)
+                snprintf(pv, sizeof pv, "%s%cpatch.%s.ver", data_dir, plat_path_sep, FFXI_VERSION);
+            else
+            {
+                const char *dir_end = argv[0], *p;
+                for (p = argv[0]; *p; ++p)
+                    if (*p == '/' || *p == plat_path_sep)
+                        dir_end = p + 1;
+                snprintf(pv, sizeof pv, "%.*spatch.%s.ver", (int)(dir_end - argv[0]), argv[0], FFXI_VERSION);
+            }
             PlatFile* f = polcore_make_patch_ver(FFXI_VERSION, file) ? plat_file_open(pv, PLAT_WRITE | PLAT_CREATE | PLAT_TRUNCATE) : NULL;
             if (!f || plat_file_write(f, file, sizeof file) != sizeof file)
             {
