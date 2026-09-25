@@ -60,6 +60,9 @@
 #include "lsb_login.h"
 #include "signin.h"
 #include "appdefaults.h"
+#if defined(_WIN32)
+#include "sampler.h"
+#endif
 #include "thunk.h"
 #include "user32.h"
 #include "d3d8.h"
@@ -735,6 +738,12 @@ int main(int argc, char** argv)
 
     /* IFFXiEntry::GameStart(pPol, &pFFXiMessage): the game runs inside this call */
     rt_log("[recomp] GameStart\n");
+#if defined(_WIN32)
+    /* FFXI_SAMPLE=<file>: where this thread's time goes, sampled (tools/sample_report.py) */
+    if (getenv("FFXI_SAMPLE") && getenv("FFXI_SAMPLE")[0])
+        rt_log("[recomp] sampling the game thread to %s: %s\n", getenv("FFXI_SAMPLE"),
+            sampler_start(getenv("FFXI_SAMPLE")) ? "on" : "cannot write it");
+#endif
     uint32_t start[2] = { polcore_object(), out };
     hr = com_call(entry, 3, 2, start);
     const char* message = NULL;

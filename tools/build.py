@@ -172,7 +172,7 @@ HOST_BASE = ['runtime\\portable\\user32.c', 'runtime\\portable\\d3d8.c', 'runtim
              'runtime\\portable\\input.c', 'runtime\\portable\\dinput.c', 'runtime\\portable\\ws2.c', 'host\\host64.c',
              'host\\lsb_login.c', 'host\\datui.c', 'host\\uidraw.c', 'host\\signin.c', 'host\\ui_art.c',
              'host\\keychain.c', 'host\\appdefaults.c', 'launcher\\pol\\polcrypt.c', 'launcher\\pol\\polnet.c',
-             'launcher\\pol\\polsession.c']
+             'launcher\\pol\\polsession.c', 'runtime\\portable\\sampler_win.c']
 HOST_SOURCES = HOST_BASE + GFX_SOURCES
 # the sign-in screen's: the PlayOnline client, stb_image
 HOST_INCLUDES = ['/I', 'launcher\\pol', '/I', 'third_party\\stb']
