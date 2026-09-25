@@ -11,6 +11,7 @@
  *               [--session <V: 16 characters, or 32 hex digits>]                   PlayOnline servers
  *               [--user <name> [--pass <password>] [--otp <code>] [--login-token <t>]   LandSandBoat servers
  *                [--authport 54231] [--dataport 54230] [--viewport 54001]]
+ *               [--dats <folder>]...   DAT overlays, as XIPivot: the first folder given wins
  *
  * --server is where the game's servers are: "ffxi00.pol.com" (the lobby) and every other
  * "*.pol.com" name resolve to it instead of through DNS. Default 127.0.0.1 (this
@@ -147,12 +148,19 @@ static int parse_session(const char* s, uint8_t v[16])
     return 1;
 }
 
+static void report_overlay(const char* name, unsigned files)
+{
+    rt_log("[recomp] dats: %s, %u files\n", name, files);
+}
+
 int main(int argc, char** argv)
 {
     const char* game = NULL;
     const char* regs[8];
     unsigned nregs = 0;
     const char* overlay = NULL;
+    const char* dats[8];
+    unsigned ndats = 0;
     uint32_t pol_server = DEFAULT_POL_SERVER;
     LsbLogin lsb = { 0, 54231, 54230, 54001, NULL, NULL, "", NULL };
     for (int i = 1; i + 1 < argc; i += 2)
@@ -163,6 +171,8 @@ int main(int argc, char** argv)
             regs[nregs++] = argv[i + 1];
         else if (!strcmp(argv[i], "--reg-overlay"))
             overlay = argv[i + 1];
+        else if (!strcmp(argv[i], "--dats") && ndats < 8)
+            dats[ndats++] = argv[i + 1];
         else if (!strcmp(argv[i], "--session"))
         {
             uint8_t v[16];
@@ -214,7 +224,7 @@ int main(int argc, char** argv)
     {
         fprintf(stderr, "usage: host64 --game <FINAL FANTASY XI folder> [--reg f.reg]... [--reg-overlay f.reg] "
                         "[--server name] [--session V | --user name [--pass p] [--otp code] [--authport n] "
-                        "[--dataport n] [--viewport n]]\n");
+                        "[--dataport n] [--viewport n]] [--dats folder]...\n");
         return 2;
     }
     if (lsb.user)
@@ -300,6 +310,12 @@ int main(int argc, char** argv)
         reg_set_string("HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\InstallFolder", "1000", p);
     }
     vfs_init(game);
+    for (unsigned i = 0; i < ndats; ++i)
+    {
+        /* DAT overlays: files under their ROM*\ and sound*\ folders replace the install's */
+        if (!vfs_add_overlay(dats[i], report_overlay))
+            rt_log("[recomp] dats: no ROM or sound files in %s\n", dats[i]);
+    }
     {
         /* The game reads patch.ver from its folder and will not start without it; the lobby sees
          * the version inside. Installs launched without the PlayOnline Viewer (private servers'

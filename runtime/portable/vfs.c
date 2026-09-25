@@ -1,5 +1,7 @@
 /* Guest paths to host paths. See vfs.h. */
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "plat.h"
@@ -132,11 +134,234 @@ static int to_utf8(const char* in, char* out, size_t n)
     return 1;
 }
 
+/* --- DAT overlays --------------------------------------------------------------------------------- */
+
+/* One file an overlay supplies: its key (lower case, from the ROM or sound folder on, '\'
+ * separators: "rom2\12\34.dat") and its host path. Open addressing over a power-of-two table. */
+typedef struct
+{
+    char* key;
+    char* host;
+} Overlay;
+static Overlay* g_ov;
+static unsigned g_ov_cap, g_ov_n;
+static int g_ov_trace = -1;
+
+static uint32_t ov_hash(const char* s)
+{
+    uint32_t h = 2166136261u;
+    for (; *s; ++s)
+        h = (h ^ (uint8_t)*s) * 16777619u;
+    return h;
+}
+
+static Overlay* ov_slot(const char* key)
+{
+    for (uint32_t i = ov_hash(key) & (g_ov_cap - 1);; i = (i + 1) & (g_ov_cap - 1))
+        if (!g_ov[i].key || !strcmp(g_ov[i].key, key))
+            return &g_ov[i];
+}
+
+static char* dup(const char* s)
+{
+    size_t l = strlen(s) + 1;
+    char* d = (char*)malloc(l);
+    memcpy(d, s, l);
+    return d;
+}
+
+/* Adds key -> host unless an earlier overlay has the key. 1 if added. */
+static int ov_add(const char* key, const char* host)
+{
+    if (2 * (g_ov_n + 1) > g_ov_cap)
+    {
+        Overlay* old = g_ov;
+        unsigned old_cap = g_ov_cap;
+        g_ov_cap = g_ov_cap ? g_ov_cap * 2 : 4096;
+        g_ov = (Overlay*)calloc(g_ov_cap, sizeof *g_ov);
+        for (unsigned i = 0; i < old_cap; ++i)
+            if (old[i].key)
+                *ov_slot(old[i].key) = old[i];
+        free(old);
+    }
+    Overlay* s = ov_slot(key);
+    if (s->key)
+        return 0;
+    s->key = dup(key);
+    s->host = dup(host);
+    g_ov_n++;
+    return 1;
+}
+
+/* "rom", "rom2", "sound", "sound3", in any case: the folders the game's DAT paths go through. */
+static int prefix_ci(const char* name, size_t len, const char* word)
+{
+    size_t k = strlen(word);
+    if (len < k)
+        return 0;
+    for (size_t i = 0; i < k; ++i)
+        if (lower((unsigned char)name[i]) != word[i])
+            return 0;
+    return 1;
+}
+
+static int dat_root(const char* name, size_t len)
+{
+    size_t k = prefix_ci(name, len, "rom") ? 3 : prefix_ci(name, len, "sound") ? 5 : 0;
+    if (!k)
+        return 0;
+    for (size_t i = k; i < len; ++i)
+        if (name[i] < '0' || name[i] > '9')
+            return 0;
+    return 1;
+}
+
+/* Every file under host (a ROM or sound folder or below), keyed by key + its relative path. */
+static unsigned ov_scan(const char* host, const char* key, int depth)
+{
+    PlatDir* d = plat_dir_open(host);
+    if (!d)
+        return 0;
+    unsigned added = 0;
+    for (const char* e; (e = plat_dir_next(d));)
+    {
+        char name[256], sub_host[1400], sub_key[512];
+        PlatStat st;
+        snprintf(name, sizeof name, "%s", e);
+        if (name[0] == '.')
+            continue;
+        snprintf(sub_host, sizeof sub_host, "%s%c%s", host, plat_path_sep, name);
+        snprintf(sub_key, sizeof sub_key, "%s\\%s", key, name);
+        for (char* p = sub_key; *p; ++p)
+            *p = (char)lower((unsigned char)*p);
+        if (!plat_stat(sub_host, &st))
+            continue;
+        if (st.is_dir)
+            added += depth < 6 ? ov_scan(sub_host, sub_key, depth + 1) : 0;
+        else
+            added += (unsigned)ov_add(sub_key, sub_host);
+    }
+    plat_dir_close(d);
+    return added;
+}
+
+/* The ROM or sound children of one overlay folder. -1 if it has none (then it is a folder of overlays). */
+static long ov_add_one(const char* host_dir)
+{
+    PlatDir* d = plat_dir_open(host_dir);
+    if (!d)
+        return -1;
+    long added = -1;
+    for (const char* e; (e = plat_dir_next(d));)
+    {
+        char name[256], sub[1400];
+        PlatStat st;
+        snprintf(name, sizeof name, "%s", e);
+        snprintf(sub, sizeof sub, "%s%c%s", host_dir, plat_path_sep, name);
+        if (!dat_root(name, strlen(name)) || !plat_stat(sub, &st) || !st.is_dir)
+            continue;
+        char key[256];
+        snprintf(key, sizeof key, "%s", name);
+        for (char* p = key; *p; ++p)
+            *p = (char)lower((unsigned char)*p);
+        added = (added < 0 ? 0 : added) + (long)ov_scan(sub, key, 0);
+    }
+    plat_dir_close(d);
+    return added;
+}
+
+static int by_name(const void* a, const void* b)
+{
+    return strcmp(*(char* const*)a, *(char* const*)b);
+}
+
+unsigned vfs_add_overlay(const char* host_dir, void (*report)(const char* name, unsigned files))
+{
+    long direct = ov_add_one(host_dir);
+    if (direct >= 0)
+    {
+        if (report)
+            report(host_dir, (unsigned)direct);
+        return (unsigned)direct;
+    }
+    /* a folder of overlays (XIPivot's layout: DATs\era-dats, DATs\<mod>, ...): each in name order */
+    PlatDir* d = plat_dir_open(host_dir);
+    if (!d)
+        return 0;
+    char** names = NULL;
+    unsigned n = 0, cap = 0, total = 0;
+    for (const char* e; (e = plat_dir_next(d));)
+    {
+        if (e[0] == '.')
+            continue;
+        if (n == cap)
+            names = (char**)realloc(names, (cap = cap ? cap * 2 : 16) * sizeof *names);
+        names[n++] = dup(e);
+    }
+    plat_dir_close(d);
+    qsort(names, n, sizeof *names, by_name);
+    for (unsigned i = 0; i < n; ++i)
+    {
+        char sub[1400];
+        snprintf(sub, sizeof sub, "%s%c%s", host_dir, plat_path_sep, names[i]);
+        long added = ov_add_one(sub);
+        if (added >= 0)
+        {
+            total += (unsigned)added;
+            if (report)
+                report(names[i], (unsigned)added);
+        }
+        free(names[i]);
+    }
+    free(names);
+    return total;
+}
+
+/* The key of an absolute guest path: from its first ROM or sound component on, lower case. */
+static int ov_key(const char* full, char* key, size_t n)
+{
+    for (const char* p = full; (p = strchr(p, '\\'));)
+    {
+        const char* c = ++p;
+        const char* e = c;
+        while (*e && *e != '\\')
+            e++;
+        if (*e == '\\' && dat_root(c, (size_t)(e - c)))
+        {
+            size_t l = strlen(c);
+            if (l + 1 > n)
+                return 0;
+            for (size_t i = 0; i <= l; ++i)
+                key[i] = (char)lower((unsigned char)c[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int vfs_overlay_path(const char* guest, char* host, size_t n)
+{
+    char full[1024], key[512];
+    if (!g_ov_n || !vfs_full_path(guest, full, sizeof full) || !ov_key(full, key, sizeof key))
+        return 0;
+    Overlay* s = ov_slot(key);
+    if (g_ov_trace < 0)
+        g_ov_trace = getenv("FFXI_DATS_TRACE") && getenv("FFXI_DATS_TRACE")[0] == '1';
+    if (!s->key || strlen(s->host) + 1 > n)
+        return 0;
+    if (g_ov_trace)
+        fprintf(stderr, "[dats] %s -> %s\n", full, s->host);
+    strcpy(host, s->host);
+    return 1;
+}
+
 int vfs_host_path(const char* guest, char* host, size_t n)
 {
     char full[1024], mapped[1400];
     if (!vfs_full_path(guest, full, sizeof full))
         return 0;
+    if (vfs_overlay_path(full, host, n))
+        return 1;
     int best = -1;
     size_t best_len = 0;
     for (unsigned i = 0; i < g_nmounts; ++i)

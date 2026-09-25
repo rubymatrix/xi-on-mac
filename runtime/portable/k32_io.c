@@ -498,6 +498,20 @@ static void sh_FindFirstFileA(Guest* g)
     char* slash = strrchr(full, '\\');
     char pattern[300];
     snprintf(pattern, sizeof pattern, "%s", slash + 1);
+    char ov_host[1400];
+    if (!strchr(pattern, '*') && !strchr(pattern, '?') && vfs_overlay_path(full, ov_host, sizeof ov_host))
+    {
+        /* one file a DAT overlay supplies (its folder may not exist in the install: ROM255\) */
+        Find* f = (Find*)calloc(1, sizeof *f);
+        char* sep = strrchr(ov_host, plat_path_sep);
+        *sep = 0;
+        snprintf(f->dir_host, sizeof f->dir_host, "%s", ov_host);
+        f->names = (char**)malloc(sizeof *f->names);
+        f->names[f->n++] = strdup(sep + 1);
+        if (find_fill(f, ARG(1)))
+            RET(k_new(K_FIND, f, find_close), 2);
+        find_close(f);
+    }
     if (slash == full + 2)
         slash[1] = 0; /* the root keeps its backslash */
     else
