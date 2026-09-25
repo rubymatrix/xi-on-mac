@@ -52,6 +52,9 @@ int SDL_snprintf(char* text, size_t maxlen, const char* fmt, ...)
     return n;
 }
 bool SDL_SetHint(const char* name, const char* value) { (void)name, (void)value; return true; }
+/* no hints are set here (the ones asked for are macOS's) */
+const char* SDL_GetHint(const char* name) { (void)name; return NULL; }
+bool SDL_GetHintBoolean(const char* name, bool default_value) { (void)name; return default_value; }
 bool SDL_Init(SDL_InitFlags flags) { (void)flags; return true; }
 bool SDL_InitSubSystem(SDL_InitFlags flags) { (void)flags; return true; }
 bool SDL_SetClipboardText(const char* text) { (void)text; return false; }
@@ -131,6 +134,7 @@ bool SDL_GetWindowSizeInPixels(SDL_Window* w, int* width, int* height)
     return true;
 }
 bool SDL_ShowWindow(SDL_Window* w) { (void)w; return true; }
+bool SDL_SetWindowTitle(SDL_Window* w, const char* title) { (void)w, (void)title; return true; } /* the app's */
 bool SDL_HideWindow(SDL_Window* w) { (void)w; return true; }
 bool SDL_RaiseWindow(SDL_Window* w) { (void)w; return true; }
 bool SDL_StartTextInput(SDL_Window* w) { (void)w; return true; }

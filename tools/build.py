@@ -176,6 +176,9 @@ HOST_BASE = ['runtime\\portable\\user32.c', 'runtime\\portable\\d3d8.c', 'runtim
 HOST_SOURCES = HOST_BASE + GFX_SOURCES
 # the sign-in screen's: the PlayOnline client, stb_image
 HOST_INCLUDES = ['/I', 'launcher\\pol', '/I', 'third_party\\stb']
+# the sign-in screen itself (host/signin.c) and what only it uses
+SIGNIN_SCREEN = ['host\\signin.c', 'host\\datui.c', 'host\\uidraw.c', 'host\\ui_art.c', 'launcher\\pol\\polcrypt.c',
+                 'launcher\\pol\\polnet.c', 'launcher\\pol\\polsession.c']
 # the LandSandBoat sign-in's TLS is SChannel here (secur32.lib); mbedtls on POSIX hosts
 HOST_LIBS = ['synchronization.lib', 'ws2_32.lib', 'advapi32.lib', 'bcrypt.lib', 'secur32.lib'] + GFX_LIBS
 
@@ -187,11 +190,16 @@ def sdl3():
     return ['/I', os.path.join(SDL3, 'include')], os.path.join(SDL3, 'lib', 'x64', 'SDL3.lib')
 
 
-def game_objects(env):
-    """FFXiMain and FFXi.dll translated and compiled: the objects every 64-bit host links."""
+def translate():
+    """FFXiMain and FFXi.dll translated to C (only the files whose text changed are rewritten)."""
     recomp('generated/all', ['--all'])
     run([sys.executable, 'recomp/recomp.py', '--meta', FFXI_META, '--image', FFXI_IMAGE, '--retail',
          FFXI_RETAIL, '--module', 'ffxi', '--out', 'generated/ffxi', '--all'])
+
+
+def game_objects(env):
+    """FFXiMain and FFXi.dll translated and compiled: the objects every 64-bit host links."""
+    translate()
     gen = ['generated\\all\\' + f for f in sorted(os.listdir(os.path.join(ROOT, 'generated', 'all'))) if f.endswith('.c')]
     gen_ffxi = ['generated\\ffxi\\' + f for f in sorted(os.listdir(os.path.join(ROOT, 'generated', 'ffxi'))) if f.endswith('.c')]
     objs = compile_stale(env, gen, 'build\\all64', ['/I', 'generated\\all'], CFLAGS64)
@@ -230,14 +238,15 @@ UWP_CFLAGS = [f for f in CFLAGS64 if f != '/MT'] + ['/MD', '/DFFXI_UWP']
 
 def uwp_lib(env):
     """build/uwp/ffxi_uwp.lib: host64 for the UWP app, drawing with Direct3D 12 into its SwapChainPanel."""
+    translate()
     gen = ['generated\\all\\' + f for f in sorted(os.listdir(os.path.join(ROOT, 'generated', 'all'))) if f.endswith('.c')]
     gen_ffxi = ['generated\\ffxi\\' + f for f in sorted(os.listdir(os.path.join(ROOT, 'generated', 'ffxi'))) if f.endswith('.c')]
-    game_objects(env)  # translates, if the translation is stale
     objs = compile_stale(env, gen, 'build\\uwp\\all', ['/I', 'generated\\all'], UWP_CFLAGS)
     objs += compile_stale(env, gen_ffxi, 'build\\uwp\\ffxi', ['/I', 'generated\\ffxi'], UWP_CFLAGS)
     sdl_inc = ['/I', os.path.join(SDL3, 'include')]
-    objs += compile_stale(env, PORTABLE + HOST_SOURCES + ['runtime\\portable\\sdl_uwp.c'],
-                          'build\\uwp\\host', sdl_inc + ['/Dmain=host_main'], UWP_CFLAGS)
+    # the app signs in itself (its own login screen): no sign-in screen, nor its PlayOnline client
+    host = [s for s in HOST_SOURCES if s not in SIGNIN_SCREEN] + ['host\\signin_none.c', 'runtime\\portable\\sdl_uwp.c']
+    objs += compile_stale(env, PORTABLE + host, 'build\\uwp\\host', sdl_inc + ['/Dmain=host_main'], UWP_CFLAGS)
     run(['lib', '/nologo', '/OUT:build\\uwp\\ffxi_uwp.lib'] + objs, env)
     print('built build\\uwp\\ffxi_uwp.lib')
 
