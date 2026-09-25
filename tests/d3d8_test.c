@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "d3d8.h"
+#include "gfx.h"
 #include "gthread.h"
 #include "gwin.h"
 #include "runtime.h"
@@ -300,6 +301,7 @@ int main(void)
     }
     gt_init();
     rt_set_native_handler(thunk_dispatch);
+    gfx_set_sync_pipelines(1);
     d3d8_init();
     d3d8_setup();
     g_out = galloc(16);

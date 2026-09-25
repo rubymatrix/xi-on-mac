@@ -239,6 +239,8 @@ void gfx_draw(const GfxDraw* d);
 void gfx_present(GfxTex* backbuffer);
 /* Waits for the GPU (tests). */
 void gfx_finish(void);
+/* Tests: build each pipeline in place, before its first draw, and keep no pipeline cache file. */
+void gfx_set_sync_pipelines(int on);
 /* Shaders or pipelines that failed to build so far (tests). */
 uint32_t gfx_failures(void);
 

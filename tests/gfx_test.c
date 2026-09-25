@@ -420,6 +420,7 @@ int main(int argc, char** argv)
             return 1;
         }
     }
+    gfx_set_sync_pipelines(1);
     if (!gfx_init(win, 1))
     {
         printf("no graphics back end\n");

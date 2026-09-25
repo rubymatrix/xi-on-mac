@@ -59,3 +59,4 @@ uint64_t gfx_now_ns(void) { return 0; }
 void gfx_prof_front(uint64_t ns) { (void)ns; }
 void gfx_prof_skip(int reason) { (void)reason; }
 void gfx_prof_shim(uint64_t ns) { (void)ns; }
+void gfx_set_sync_pipelines(int on) { (void)on; }

@@ -21,6 +21,7 @@
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -266,7 +267,7 @@ static void prof_frame(uint64_t present_start)
         (double)atomic_exchange(&g_gpu_ns, 0) * ms,
         (double)g_prof.draws / f, (double)g_prof.bytes / f / 1024.0, (unsigned long long)g_prof.pipelines);
     static const char* const WHY[GFX_NSKIPS] = { "no shader", "stream>=4", "no position", "no buffer data", "range past buffer",
-        "no indices", "no pipeline", "no target" };
+        "no indices", "pipeline not ready", "no target" };
     int any = 0;
     for (int i = 0; i < GFX_NSKIPS; ++i)
         if (g_prof.skips[i])
@@ -901,25 +902,208 @@ static id<MTLLibrary> compile(const char* src)
     [o release];
     [s release];
     if (!lib)
-        g_failures++, fprintf(stderr, "[recomp] gfx: MSL compile failed: %s\n%s\n", err ? [[err localizedDescription] UTF8String] : "?", src);
+        __atomic_fetch_add(&g_failures, 1, __ATOMIC_RELAXED), fprintf(stderr, "[recomp] gfx: MSL compile failed: %s\n%s\n", err ? [[err localizedDescription] UTF8String] : "?", src);
     return lib;
 }
 
-static id<MTLLibrary> library(const GfxDraw* d)
+/* --- pipelines, built off the game's thread ---------------------------------------------------------------
+ * A pipeline for a key seen for the first time is built on a background queue; the draws that need
+ * it are skipped until it is ready (a new effect may miss its first frames; the game never waits for
+ * the Metal compiler). Every key built is recorded in the pipeline cache file, and at start-up the
+ * recorded keys are built again in the background, so a second session has them before it needs
+ * them. gfx_set_sync_pipelines(1) (the tests) builds in place and records nothing. */
+#define PIPE_FAILED ((void*)1)
+#define PIPE_MAGIC 0x314B5053u /* "SPK1" */
+
+typedef struct PipeEntry
 {
-    LibKey k;
-    memset(&k, 0, sizeof k);
-    k.vs = d->vs, k.fs = d->fs;
-    id lib = map_get(&g_libs, &k, sizeof k);
-    if (lib)
-        return lib == (id)[NSNull null] ? nil : lib;
-    char* src = gfx_msl_generate(&d->vs, &d->fs, d->vs_tokens, d->ps_tokens);
-    lib = src ? compile(src) : nil;
+    void* _Atomic state; /* NULL while building, PIPE_FAILED, or the pipeline (retained) */
+} PipeEntry;
+
+typedef struct PipeJob
+{
+    PipeKey k;
+    uint32_t *vs, *ps; /* copies of the shader tokens behind k.lib.vs.prog / fs.prog */
+    uint32_t nvs, nps;
+    PipeEntry* e;
+    int record;
+} PipeJob;
+
+static int g_sync_pipelines;
+static char g_pipe_cache[1024];
+static dispatch_queue_t g_pipe_queue, g_pipe_file_queue;
+static _Atomic uint32_t g_pipes_building;
+
+void gfx_set_sync_pipelines(int on) { g_sync_pipelines = on; }
+
+static uint32_t* copy_tok(const uint32_t* t, uint32_t* n)
+{
+    *n = 0;
+    if (!t)
+        return NULL;
+    uint32_t k = 0;
+    while (k < 65536 && t[k] != 0x0000FFFFu)
+        k++;
+    k++;
+    uint32_t* c = (uint32_t*)malloc(4u * k);
+    memcpy(c, t, 4u * k);
+    *n = k;
+    return c;
+}
+
+/* the pipeline for a key (retained), or nil */
+static id<MTLRenderPipelineState> build_pipeline(const PipeKey* k, const uint32_t* vs, const uint32_t* ps)
+{
+    char* src = gfx_msl_generate(&k->lib.vs, &k->lib.fs, vs, ps);
     if (!src)
-        g_failures++;
+    {
+        __atomic_fetch_add(&g_failures, 1, __ATOMIC_RELAXED);
+        return nil;
+    }
+    id<MTLLibrary> lib = compile(src);
     free(src);
-    map_put(&g_libs, &k, sizeof k, lib ? lib : [[NSNull null] retain]);
-    return lib;
+    if (!lib)
+        return nil;
+    id p = nil;
+    @autoreleasepool
+    {
+        MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+        id<MTLFunction> vf = [lib newFunctionWithName:@"vs_main"], ff = [lib newFunctionWithName:@"fs_main"];
+        pd.vertexFunction = vf;
+        pd.fragmentFunction = ff;
+        pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassUnspecified;
+        MTLRenderPipelineColorAttachmentDescriptor* c = pd.colorAttachments[0];
+        c.pixelFormat = (MTLPixelFormat)k->color;
+        uint32_t wm = k->pipe.write_mask;
+        c.writeMask = ((wm & 1) ? MTLColorWriteMaskRed : 0) | ((wm & 2) ? MTLColorWriteMaskGreen : 0) |
+            ((wm & 4) ? MTLColorWriteMaskBlue : 0) | ((wm & 8) ? MTLColorWriteMaskAlpha : 0);
+        if (k->pipe.blend)
+        {
+            uint32_t sf = k->pipe.src, df = k->pipe.dst;
+            if (sf == 12) /* BOTHSRCALPHA */
+                sf = 5, df = 6;
+            else if (sf == 13) /* BOTHINVSRCALPHA */
+                sf = 6, df = 5;
+            c.blendingEnabled = YES;
+            c.sourceRGBBlendFactor = c.sourceAlphaBlendFactor = blend_factor(sf, k->x8);
+            c.destinationRGBBlendFactor = c.destinationAlphaBlendFactor = blend_factor(df, k->x8);
+            c.rgbBlendOperation = c.alphaBlendOperation = blend_op(k->pipe.op);
+        }
+        pd.depthAttachmentPixelFormat = (MTLPixelFormat)k->depth;
+        pd.stencilAttachmentPixelFormat = (MTLPixelFormat)k->stencil;
+        NSError* err = nil;
+        p = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!p)
+        {
+            __atomic_fetch_add(&g_failures, 1, __ATOMIC_RELAXED);
+            fprintf(stderr, "[recomp] gfx: pipeline failed: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
+        }
+        [vf release];
+        [ff release];
+        [pd release];
+    }
+    [lib release];
+    return p;
+}
+
+/* one record of the cache file: magic, the key, then each shader's tokens (count first) */
+static void record_job(const PipeJob* j)
+{
+    if (!g_pipe_cache[0])
+        return;
+    size_t n = 4 + 4 + sizeof(PipeKey) + 4 + 4u * j->nvs + 4 + 4u * j->nps;
+    uint8_t* rec = (uint8_t*)malloc(n);
+    uint8_t* w = rec;
+    uint32_t v = PIPE_MAGIC;
+    memcpy(w, &v, 4), w += 4;
+    v = (uint32_t)sizeof(PipeKey);
+    memcpy(w, &v, 4), w += 4;
+    memcpy(w, &j->k, sizeof(PipeKey)), w += sizeof(PipeKey);
+    memcpy(w, &j->nvs, 4), w += 4;
+    if (j->nvs)
+        memcpy(w, j->vs, 4u * j->nvs), w += 4u * j->nvs;
+    memcpy(w, &j->nps, 4), w += 4;
+    if (j->nps)
+        memcpy(w, j->ps, 4u * j->nps);
+    dispatch_async(g_pipe_file_queue, ^{
+        FILE* f = fopen(g_pipe_cache, "ab");
+        if (f)
+        {
+            fwrite(rec, 1, n, f);
+            fclose(f);
+        }
+        free(rec);
+    });
+}
+
+static void run_job(PipeJob* j)
+{
+    id p = build_pipeline(&j->k, j->vs, j->ps);
+    atomic_store(&j->e->state, p ? (void*)p : PIPE_FAILED);
+    if (p && j->record)
+        record_job(j);
+    free(j->vs);
+    free(j->ps);
+    free(j);
+    atomic_fetch_sub(&g_pipes_building, 1);
+}
+
+static void queue_job(const PipeKey* k, const uint32_t* vs, uint32_t nvs, const uint32_t* ps, uint32_t nps, int record)
+{
+    if (map_get(&g_pipes, k, sizeof *k))
+        return;
+    PipeEntry* e = (PipeEntry*)calloc(1, sizeof *e);
+    map_put(&g_pipes, k, sizeof *k, (id)e);
+    PipeJob* j = (PipeJob*)calloc(1, sizeof *j);
+    j->k = *k, j->e = e, j->record = record;
+    if (nvs)
+        j->vs = (uint32_t*)malloc(4u * nvs), memcpy(j->vs, vs, 4u * nvs), j->nvs = nvs;
+    if (nps)
+        j->ps = (uint32_t*)malloc(4u * nps), memcpy(j->ps, ps, 4u * nps), j->nps = nps;
+    g_prof.pipelines++;
+    atomic_fetch_add(&g_pipes_building, 1);
+    if (g_sync_pipelines)
+        run_job(j);
+    else
+        dispatch_async(g_pipe_queue, ^{ run_job(j); });
+}
+
+/* at start-up: the keys earlier sessions built, built again in the background */
+static void prewarm_pipelines(void)
+{
+    const char* dir = getenv("FFXI_CACHE_DIR");
+    char path[900];
+    if (dir && *dir)
+        snprintf(path, sizeof path, "%s", dir);
+    else if (getenv("HOME"))
+        snprintf(path, sizeof path, "%s/Library/Caches/FFXI", getenv("HOME"));
+    else
+        return;
+    mkdir(path, 0755);
+    snprintf(g_pipe_cache, sizeof g_pipe_cache, "%s/pipelines.v1", path);
+    FILE* f = fopen(g_pipe_cache, "rb");
+    if (!f)
+        return;
+    uint32_t n = 0, hdr[2];
+    while (fread(hdr, 4, 2, f) == 2 && hdr[0] == PIPE_MAGIC && hdr[1] == sizeof(PipeKey))
+    {
+        PipeKey k;
+        uint32_t nvs = 0, nps = 0, *vs = NULL, *ps = NULL;
+        int ok = fread(&k, sizeof k, 1, f) == 1 && fread(&nvs, 4, 1, f) == 1 && nvs <= 65536;
+        if (ok && nvs)
+            vs = (uint32_t*)malloc(4u * nvs), ok = fread(vs, 4, nvs, f) == nvs;
+        ok = ok && fread(&nps, 4, 1, f) == 1 && nps <= 65536;
+        if (ok && nps)
+            ps = (uint32_t*)malloc(4u * nps), ok = fread(ps, 4, nps, f) == nps;
+        if (ok)
+            queue_job(&k, vs, nvs, ps, nps, 0), n++;
+        free(vs);
+        free(ps);
+        if (!ok)
+            break;
+    }
+    fclose(f);
+    fprintf(stderr, "[recomp] gfx: building %u pipelines from %s in the background\n", n, g_pipe_cache);
 }
 
 static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
@@ -932,47 +1116,19 @@ static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
     k.depth = depth ? (uint32_t)depth.pixelFormat : 0;
     k.stencil = depth && g_ds->has_stencil ? k.depth : 0;
     k.x8 = (uint8_t)g_rt->x8;
-    id p = map_get(&g_pipes, &k, sizeof k);
-    if (p)
-        return p == (id)[NSNull null] ? nil : p;
-    id<MTLLibrary> lib = library(d);
-    if (lib)
+    PipeEntry* e = (PipeEntry*)map_get(&g_pipes, &k, sizeof k);
+    if (!e)
     {
-        MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
-        id<MTLFunction> vf = [lib newFunctionWithName:@"vs_main"], ff = [lib newFunctionWithName:@"fs_main"];
-        pd.vertexFunction = vf;
-        pd.fragmentFunction = ff;
-        pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassUnspecified;
-        MTLRenderPipelineColorAttachmentDescriptor* c = pd.colorAttachments[0];
-        c.pixelFormat = (MTLPixelFormat)k.color;
-        uint32_t wm = d->pipe.write_mask;
-        c.writeMask = ((wm & 1) ? MTLColorWriteMaskRed : 0) | ((wm & 2) ? MTLColorWriteMaskGreen : 0) |
-            ((wm & 4) ? MTLColorWriteMaskBlue : 0) | ((wm & 8) ? MTLColorWriteMaskAlpha : 0);
-        if (d->pipe.blend)
-        {
-            uint32_t s = d->pipe.src, t = d->pipe.dst;
-            if (s == 12) /* BOTHSRCALPHA */
-                s = 5, t = 6;
-            else if (s == 13) /* BOTHINVSRCALPHA */
-                s = 6, t = 5;
-            c.blendingEnabled = YES;
-            c.sourceRGBBlendFactor = c.sourceAlphaBlendFactor = blend_factor(s, k.x8);
-            c.destinationRGBBlendFactor = c.destinationAlphaBlendFactor = blend_factor(t, k.x8);
-            c.rgbBlendOperation = c.alphaBlendOperation = blend_op(d->pipe.op);
-        }
-        pd.depthAttachmentPixelFormat = (MTLPixelFormat)k.depth;
-        pd.stencilAttachmentPixelFormat = (MTLPixelFormat)k.stencil;
-        NSError* err = nil;
-        g_prof.pipelines++;
-        p = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
-        if (!p)
-            g_failures++, fprintf(stderr, "[recomp] gfx: pipeline failed: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
-        [vf release];
-        [ff release];
-        [pd release];
+        uint32_t nvs = 0, nps = 0;
+        uint32_t* vs = d->vs.prog ? copy_tok(d->vs_tokens, &nvs) : NULL;
+        uint32_t* ps = d->fs.prog ? copy_tok(d->ps_tokens, &nps) : NULL;
+        queue_job(&k, vs, nvs, ps, nps, !g_sync_pipelines);
+        free(vs);
+        free(ps);
+        e = (PipeEntry*)map_get(&g_pipes, &k, sizeof k);
     }
-    map_put(&g_pipes, &k, sizeof k, p ? p : [[NSNull null] retain]);
-    return p;
+    void* st = atomic_load(&e->state);
+    return st && st != PIPE_FAILED ? (id)st : nil;
 }
 
 static MTLCompareFunction compare(uint32_t f)
@@ -1144,7 +1300,7 @@ static void draw_encode(const GfxDraw* d)
         id<MTLRenderPipelineState> p = pipeline(d);
         if (!p)
         {
-            gfx_prof_skip(GFX_SKIP_PIPELINE);
+            gfx_prof_skip(GFX_SKIP_PIPELINE); /* still building (or failed) */
             return;
         }
         [g_enc setRenderPipelineState:p];
@@ -1510,6 +1666,10 @@ int gfx_init(void* window, int vsync)
         g_frames_sem = dispatch_semaphore_create(FRAMES);
         g_dummy = [g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
         g_util = compile(CLEAR_MSL);
+        g_pipe_queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+        g_pipe_file_queue = dispatch_queue_create("ffxi.pipeline-cache", DISPATCH_QUEUE_SERIAL);
+        if (!g_sync_pipelines)
+            prewarm_pipelines();
         MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
         id<MTLFunction> vf = [g_util newFunctionWithName:@"present_vs"], ff = [g_util newFunctionWithName:@"present_fs"];
         pd.vertexFunction = vf;
