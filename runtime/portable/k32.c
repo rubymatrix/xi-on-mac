@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dinput.h"
 #include "gthread.h"
 #include "gwin.h"
 #include "k32.h"
@@ -133,6 +134,8 @@ static int reported_missing(const char* name)
 static void sh_LoadLibraryA(Guest* g)
 {
     uint32_t h = module_handle(ARGS(0));
+    if (h && !stricmp_(base_name(ARGS(0)), "xinputdll.dll"))
+        dinput_xinput_loaded(); /* the game's XInput mode: pads go through XInput only */
     if (!h)
     {
         if (!reported_missing(ARGS(0)))
