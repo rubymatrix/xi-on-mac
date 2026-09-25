@@ -1700,6 +1700,24 @@ static void sh_Direct3DCreate8(Guest* g)
 /* DebugSetMute(BOOL): D3DX silences the debug runtime; cdecl (the caller pops its argument) */
 static void sh_DebugSetMute(Guest* g) { RETC(0); }
 
+/* ValidateVertexShader(code, declaration, caps, return_errors, char** errors) and
+ * ValidatePixelShader(code, caps, return_errors, char** errors), stdcall: the statically linked
+ * D3DX assembler checks what it assembled (fetched by GetProcAddress, 0x102ed02c in build
+ * 2026-09-03). The game's shaders are fixed vs.1.1/ps.1.1 code retail d3d8 accepts: accept, no text. */
+static void sh_ValidateVertexShader(Guest* g)
+{
+    if (ARG(4))
+        wr32(ARG(4), 0);
+    RET(D3D_OK, 5);
+}
+
+static void sh_ValidatePixelShader(Guest* g)
+{
+    if (ARG(3))
+        wr32(ARG(3), 0);
+    RET(D3D_OK, 4);
+}
+
 #define D(i, m) { "d3d8.dll", #i "::" #m, i##_##m }
 #define U(i, m, f) { "d3d8.dll", #i "::" #m, f }
 #define UNKNOWN(i) U(i, QueryInterface, Unknown_QueryInterface), U(i, AddRef, Unknown_AddRef), U(i, Release, Unknown_Release)
@@ -1710,6 +1728,8 @@ static void sh_DebugSetMute(Guest* g) { RETC(0); }
 static const ShimDef D3D8[] = {
     { "d3d8.dll", "Direct3DCreate8", sh_Direct3DCreate8 },
     { "d3d8.dll", "DebugSetMute", sh_DebugSetMute },
+    { "d3d8.dll", "ValidateVertexShader", sh_ValidateVertexShader },
+    { "d3d8.dll", "ValidatePixelShader", sh_ValidatePixelShader },
     UNKNOWN(IDirect3D8),
     D(IDirect3D8, GetAdapterCount),
     D(IDirect3D8, GetAdapterIdentifier),

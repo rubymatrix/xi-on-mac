@@ -570,6 +570,11 @@ int reg_get_string(const char* path, const char* name, char* out, size_t n)
     return 1;
 }
 
+void reg_set_string(const char* path, const char* name, const char* s)
+{
+    set_value(key_from_header(path, 1), name, REG_SZ, s, (uint32_t)strlen(s) + 1);
+}
+
 int reg_get_dword(const char* path, const char* name, uint32_t* out)
 {
     RegKey* k = key_from_header(path, 0);

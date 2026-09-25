@@ -23,3 +23,5 @@ void ole_register_class(const uint8_t clsid[16], uint32_t module_base);
 int reg_get_dword(const char* path, const char* name, uint32_t* out);
 /* A string value, the same way (NUL-terminated, truncated to n). */
 int reg_get_string(const char* path, const char* name, char* out, size_t n);
+/* Set (or create) a string value, for the host (not written out until the game saves a change). */
+void reg_set_string(const char* path, const char* name, const char* s);
