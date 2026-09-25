@@ -1,0 +1,19 @@
+# Never commit anything derived from Square Enix binaries (README, "Rules").
+generated/
+build/
+out/
+*.dll
+*.exe
+*.dat
+*.DAT
+*.unpacked.*
+
+# Tooling noise
+__pycache__/
+*.pyc
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+.vs/

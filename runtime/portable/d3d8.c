@@ -1,0 +1,1908 @@
+/* Direct3D 8 for 64-bit hosts (R3.1): the interface FFXiMain draws through, implemented by us.
+ *
+ * The translated game still speaks D3D8 - Direct3DCreate8, then COM calls on IDirect3DDevice8 and
+ * its resources - so this file is the D3D8 front end the Metal renderer (R3.2) sits under.
+ * It owns what the game can observe:
+ *
+ *   - the COM objects (guest memory: a vtable pointer and our object index; every method is a
+ *     thunk named "d3d8.dll!IDirect3DDevice8::SetRenderState" and so on, so a method the game
+ *     reaches that is not written yet traps with its name),
+ *   - resource memory the game locks (textures, surfaces, vertex and index buffers live in the
+ *     guest window, allocated on first lock),
+ *   - device state with D3D8 semantics - defaults, readback (the game calls GetTransform and
+ *     GetViewport millions of times), state-block recording, capture and apply, the references
+ *     bound resources hold, the stream/index reset after the ...UP draws.
+ *
+ * Nothing is drawn yet: Present, Clear and the Draw* calls are where the Metal back end goes.
+ * The method set is the one the game was measured to use (reverse-engineering/recomp/
+ * FFXiMain.2026-08-22.d3d8-surface.txt); vtable order is the D3D8 ABI, as the R1 proxy
+ * (d3d8proxy.cpp) lists it. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "d3d8.h"
+#include "gthread.h"
+#include "gwin.h"
+#include "thunk.h"
+#include "user32.h"
+
+#define D3D_OK 0u
+#define D3DERR_INVALIDCALL 0x8876086Cu
+#define D3DERR_NOTAVAILABLE 0x8876086Au
+#define E_NOINTERFACE 0x80004002u
+#define E_OUTOFMEMORY 0x8007000Eu
+
+/* D3DFORMAT */
+#define FMT_A8R8G8B8 21u
+#define FMT_X8R8G8B8 22u
+#define FMT_R5G6B5 23u
+#define FMT_X1R5G5B5 24u
+#define FMT_A1R5G5B5 25u
+#define FMT_A4R4G4B4 26u
+#define FMT_A8 28u
+#define FMT_L8 50u
+#define FMT_A8L8 51u
+#define FMT_V8U8 60u
+#define FMT_D16 80u
+#define FMT_D24S8 75u
+#define FMT_D24X8 77u
+#define FMT_INDEX16 101u
+#define FMT_INDEX32 102u
+#define FOURCC(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+#define FMT_DXT1 FOURCC('D', 'X', 'T', '1')
+#define FMT_DXT2 FOURCC('D', 'X', 'T', '2')
+#define FMT_DXT3 FOURCC('D', 'X', 'T', '3')
+#define FMT_DXT4 FOURCC('D', 'X', 'T', '4')
+#define FMT_DXT5 FOURCC('D', 'X', 'T', '5')
+
+/* D3DRESOURCETYPE */
+#define RT_SURFACE 1u
+#define RT_TEXTURE 3u
+#define RT_VOLUMETEXTURE 4u
+#define RT_CUBETEXTURE 5u
+#define RT_VERTEXBUFFER 6u
+#define RT_INDEXBUFFER 7u
+
+#define USAGE_RENDERTARGET 1u
+#define USAGE_DEPTHSTENCIL 2u
+
+/* D3DCAPS8 (212 bytes) as Windows 11's d3d8 reports it for a HAL device (NVIDIA RTX A4500,
+ * captured 2026-09-24): vertex shader 1.1, pixel shader 1.4, 8 texture stages, 16384 textures,
+ * 8 lights, 16 streams. Everything here is within what Metal on an M1 provides. */
+static const uint32_t CAPS8[53] = {
+    0x00000001, 0x00000000, 0x00020000, 0x200a0000, 0x00000420, 0x8000000f, 0x00000001, 0x001bbef0, 0x00000ef2,
+    0x00f37191, 0x000000ff, 0x00001fff, 0x00001fff, 0x000000ff, 0x00084208, 0x0001ecc5, 0x03030700, 0x03030300,
+    0x03030300, 0x0000003f, 0x0000003f, 0x0000001f, 0x00004000, 0x00004000, 0x00000800, 0x00002000, 0x00004000,
+    0x00000010, 0x501502f9, 0xccbebc20, 0xccbebc20, 0x4cbebc20, 0x4cbebc20, 0x00000000, 0x000000ff, 0x00180008,
+    0x03feffff, 0x00000008, 0x00000008, 0x0000003b, 0x00000008, 0x00000008, 0x00000004, 0x00000000, 0x46000000,
+    0x00ffffff, 0x00ffffff, 0x00000010, 0x000000ff, 0xfffe0101, 0x00000100, 0xffff0104, 0x477fe000,
+};
+
+static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+
+/* --- formats ----------------------------------------------------------------------------------------- */
+static uint32_t fmt_block(uint32_t f) /* bytes per 4x4 block, or 0 */
+{
+    return f == FMT_DXT1 ? 8u : (f == FMT_DXT2 || f == FMT_DXT3 || f == FMT_DXT4 || f == FMT_DXT5) ? 16u : 0u;
+}
+
+static uint32_t fmt_bytes(uint32_t f) /* bytes per pixel for the uncompressed formats */
+{
+    switch (f)
+    {
+    case FMT_A8:
+    case FMT_L8:
+    case 41: /* P8 */
+    case 52: /* A4L4 */
+        return 1;
+    case FMT_R5G6B5:
+    case FMT_X1R5G5B5:
+    case FMT_A1R5G5B5:
+    case FMT_A4R4G4B4:
+    case FMT_A8L8:
+    case FMT_V8U8:
+    case FMT_D16:
+    case 73: /* D15S1 */
+    case FMT_INDEX16:
+        return 2;
+    default: return 4;
+    }
+}
+
+static uint32_t fmt_pitch(uint32_t f, uint32_t w)
+{
+    uint32_t b = fmt_block(f);
+    return b ? ((w + 3) / 4 ? (w + 3) / 4 : 1) * b : w * fmt_bytes(f);
+}
+
+static uint32_t fmt_size(uint32_t f, uint32_t w, uint32_t h)
+{
+    return fmt_pitch(f, w) * (fmt_block(f) ? ((h + 3) / 4 ? (h + 3) / 4 : 1) : h);
+}
+
+/* --- objects ----------------------------------------------------------------------------------------- */
+enum
+{
+    O_FREE,
+    O_D3D,
+    O_DEVICE,
+    O_TEXTURE,
+    O_CUBE,
+    O_VB,
+    O_IB,
+    O_SURFACE,
+};
+
+typedef struct Obj
+{
+    uint8_t kind, implicit; /* implicit: the swap chain's back buffer, the auto depth buffer */
+    int32_t refs;
+    uint32_t guest;     /* the COM pointer the game holds */
+    uint32_t container; /* surfaces of a texture: its COM pointer; their references are the texture's */
+    uint32_t format, usage, pool, width, height, levels, size, fvf;
+    uint32_t mem; /* guest memory, on first lock */
+    uint32_t* subs; /* textures: level surfaces (cubes: face * levels + level) */
+    uint32_t nsubs;
+    uint32_t lod, priority;
+} Obj;
+
+static Obj* g_objs;
+static uint32_t g_nobjs, g_capobjs, g_free_hint = 1;
+static uint32_t g_vtbl[O_SURFACE + 1];
+
+static uint32_t obj_new(int kind)
+{
+    uint32_t i = g_free_hint;
+    while (i < g_nobjs && g_objs[i].kind != O_FREE)
+        i++;
+    if (i >= g_nobjs)
+    {
+        if (g_nobjs + 2 > g_capobjs)
+        {
+            g_capobjs = g_capobjs ? g_capobjs * 2 : 1024;
+            g_objs = (Obj*)realloc(g_objs, g_capobjs * sizeof *g_objs);
+        }
+        if (!g_nobjs)
+            g_objs[g_nobjs++].kind = O_FREE; /* index 0 is never an object */
+        i = g_nobjs++;
+    }
+    g_free_hint = i + 1;
+    Obj* o = &g_objs[i];
+    memset(o, 0, sizeof *o);
+    o->kind = (uint8_t)kind;
+    o->refs = 1;
+    o->guest = gheap_alloc(8, 1);
+    wr32(o->guest, g_vtbl[kind]);
+    wr32(o->guest + 4, i);
+    return o->guest;
+}
+
+static Obj* obj(uint32_t p)
+{
+    if (!p)
+        return NULL;
+    uint32_t i = rd32(p + 4);
+    return i && i < g_nobjs && g_objs[i].kind != O_FREE && g_objs[i].guest == p ? &g_objs[i] : NULL;
+}
+
+static uint32_t obj_release(uint32_t p);
+
+static void obj_destroy(Obj* o)
+{
+    for (uint32_t i = 0; i < o->nsubs; ++i)
+    {
+        Obj* s = obj(o->subs[i]);
+        if (s)
+        {
+            s->container = 0;
+            s->refs = 1;
+            obj_release(s->guest);
+        }
+    }
+    free(o->subs);
+    if (o->mem)
+        gheap_free(o->mem);
+    uint32_t idx = rd32(o->guest + 4);
+    wr32(o->guest, 0);
+    gheap_free(o->guest);
+    o->kind = O_FREE;
+    if (idx < g_free_hint)
+        g_free_hint = idx;
+}
+
+static uint32_t obj_addref(uint32_t p)
+{
+    Obj* o = obj(p);
+    if (!o)
+        return 0;
+    if (o->container)
+        return obj_addref(o->container);
+    return (uint32_t)++o->refs;
+}
+
+static uint32_t obj_release(uint32_t p)
+{
+    Obj* o = obj(p);
+    if (!o)
+        return 0;
+    if (o->container)
+        return obj_release(o->container);
+    if (o->refs > 0)
+        o->refs--;
+    if (!o->refs && !o->implicit && o->kind != O_DEVICE && o->kind != O_D3D)
+    {
+        obj_destroy(o);
+        return 0;
+    }
+    return (uint32_t)o->refs;
+}
+
+/* a pointer the device or a state block holds: references the new one, releases the old */
+static void bind(uint32_t* slot, uint32_t p)
+{
+    if (*slot == p)
+        return;
+    if (p)
+        obj_addref(p);
+    uint32_t old = *slot;
+    *slot = p;
+    if (old)
+        obj_release(old);
+}
+
+static uint32_t obj_mem(Obj* o)
+{
+    if (!o->mem)
+        o->mem = gheap_alloc(o->size ? o->size : 16, 1);
+    return o->mem;
+}
+
+static uint32_t new_surface(uint32_t fmt, uint32_t w, uint32_t h, uint32_t usage, uint32_t pool, uint32_t container)
+{
+    uint32_t p = obj_new(O_SURFACE);
+    Obj* s = obj(p);
+    s->format = fmt;
+    s->width = w;
+    s->height = h;
+    s->usage = usage;
+    s->pool = pool;
+    s->size = fmt_size(fmt, w, h);
+    s->container = container;
+    return p;
+}
+
+/* --- device state ------------------------------------------------------------------------------------- */
+#define NXF 280 /* transforms: D3DTS 0..23, then WORLDMATRIX(0..255) = 256..511 */
+#define MAX_LIGHTS 64
+#define NSTREAMS 16
+#define NVSC 256
+#define NPSC 8
+
+typedef struct Light
+{
+    uint32_t v[26]; /* D3DLIGHT8 */
+    uint32_t enabled;
+} Light;
+
+typedef struct State
+{
+    uint32_t rs[256];
+    uint32_t tss[8][32];
+    uint32_t tex[8];
+    float xf[NXF][16];
+    uint32_t vp[6];
+    uint32_t mat[17];
+    Light light[MAX_LIGHTS];
+    uint32_t clip[6][4];
+    uint32_t stream[NSTREAMS], stride[NSTREAMS];
+    uint32_t ib, base_vertex;
+    uint32_t vs, ps;
+    float vsc[NVSC][4], psc[NPSC][4];
+} State;
+
+/* what a state block holds */
+typedef struct Mask
+{
+    uint8_t rs[256], tss[8][32], tex[8], xf[NXF], vp, mat, light[MAX_LIGHTS], lighten[MAX_LIGHTS], clip[6],
+        stream[NSTREAMS], ib, vs, ps, vsc[NVSC], psc[NPSC];
+} Mask;
+
+typedef struct Block
+{
+    State s;
+    Mask m;
+} Block;
+
+typedef struct Shader
+{
+    uint32_t* decl;
+    uint32_t ndecl;
+    uint32_t* func;
+    uint32_t nfunc;
+} Shader;
+
+typedef struct Dev
+{
+    uint32_t guest, d3d, hwnd, behavior, device_type;
+    uint32_t pp[13]; /* D3DPRESENT_PARAMETERS */
+    uint32_t backbuffer, depth, rt, ds;
+    State cur;
+    Block* rec;
+    Block** blocks;
+    uint32_t nblocks;
+    Shader* vs;
+    uint32_t nvs;
+    Shader* ps;
+    uint32_t nps;
+    int cursor;
+} Dev;
+
+static Dev g_dev; /* the game makes one device */
+static uint32_t g_d3d;
+
+static int xf_index(uint32_t ts)
+{
+    return ts < 24 ? (int)ts : ts >= 256 && ts < 512 ? (int)(24 + ts - 256) : -1;
+}
+
+static void default_light(Light* l)
+{
+    memset(l, 0, sizeof *l);
+    l->v[0] = 3; /* D3DLIGHT_DIRECTIONAL */
+    l->v[1] = l->v[2] = l->v[3] = f2u(1.0f);
+    l->v[18] = f2u(1.0f); /* direction (0, 0, 1) */
+}
+
+static void state_defaults(State* s, uint32_t w, uint32_t h, int zbuffer)
+{
+    memset(s, 0, sizeof *s);
+    for (int i = 0; i < NXF; ++i)
+        s->xf[i][0] = s->xf[i][5] = s->xf[i][10] = s->xf[i][15] = 1.0f;
+    uint32_t* rs = s->rs;
+    rs[7] = zbuffer ? 1 : 0;           /* ZENABLE */
+    rs[8] = 3;                         /* FILLMODE solid */
+    rs[9] = 2;                         /* SHADEMODE gouraud */
+    rs[14] = 1;                        /* ZWRITEENABLE */
+    rs[16] = 1;                        /* LASTPIXEL */
+    rs[19] = 2;                        /* SRCBLEND one */
+    rs[20] = 1;                        /* DESTBLEND zero */
+    rs[22] = 3;                        /* CULLMODE ccw */
+    rs[23] = 4;                        /* ZFUNC lessequal */
+    rs[25] = 8;                        /* ALPHAFUNC always */
+    rs[37] = f2u(1.0f);                /* FOGEND */
+    rs[38] = f2u(1.0f);                /* FOGDENSITY */
+    rs[53] = rs[54] = rs[55] = 1;      /* STENCILFAIL/ZFAIL/PASS keep */
+    rs[56] = 8;                        /* STENCILFUNC always */
+    rs[58] = rs[59] = 0xFFFFFFFFu;     /* STENCILMASK, STENCILWRITEMASK */
+    rs[60] = 0xFFFFFFFFu;              /* TEXTUREFACTOR */
+    rs[136] = 1;                       /* CLIPPING */
+    rs[137] = 1;                       /* LIGHTING */
+    rs[141] = 1;                       /* COLORVERTEX */
+    rs[142] = 1;                       /* LOCALVIEWER */
+    rs[145] = 1;                       /* DIFFUSEMATERIALSOURCE color1 */
+    rs[146] = 2;                       /* SPECULARMATERIALSOURCE color2 */
+    rs[154] = rs[155] = f2u(1.0f);     /* POINTSIZE, POINTSIZE_MIN */
+    rs[158] = f2u(1.0f);               /* POINTSCALE_A */
+    rs[162] = 0xFFFFFFFFu;             /* MULTISAMPLEMASK */
+    rs[164] = f2u(1.0f);               /* PATCHSEGMENTS */
+    rs[166] = f2u(64.0f);              /* POINTSIZE_MAX */
+    rs[168] = 0xF;                     /* COLORWRITEENABLE */
+    rs[171] = 1;                       /* BLENDOP add */
+    rs[172] = 3;                       /* POSITIONORDER cubic */
+    rs[173] = 1;                       /* NORMALORDER linear */
+    for (uint32_t t = 0; t < 8; ++t)
+    {
+        uint32_t* v = s->tss[t];
+        v[1] = t ? 1 : 4; /* COLOROP: disable / modulate */
+        v[2] = 2;         /* COLORARG1 texture */
+        v[3] = 1;         /* COLORARG2 current */
+        v[4] = t ? 1 : 2; /* ALPHAOP: disable / selectarg1 */
+        v[5] = 2;
+        v[6] = 1;
+        v[11] = t;        /* TEXCOORDINDEX */
+        v[13] = v[14] = v[25] = 1; /* ADDRESSU/V/W wrap */
+        v[16] = v[17] = 1;         /* MAGFILTER, MINFILTER point */
+        v[21] = 1;                 /* MAXANISOTROPY */
+        v[26] = v[27] = v[28] = 1; /* COLORARG0, ALPHAARG0, RESULTARG current */
+    }
+    s->vp[2] = w;
+    s->vp[3] = h;
+    s->vp[5] = f2u(1.0f);
+}
+
+/* The state a setter writes: the block being recorded, or the device. */
+static State* target(Mask** m)
+{
+    if (g_dev.rec)
+    {
+        *m = &g_dev.rec->m;
+        return &g_dev.rec->s;
+    }
+    *m = NULL;
+    return &g_dev.cur;
+}
+
+/* Copies the masked entries from `from` to `to` (Apply: block -> device; Capture: device -> block). */
+static void state_copy(State* to, const State* from, const Mask* m)
+{
+    for (int i = 0; i < 256; ++i)
+        if (m->rs[i])
+            to->rs[i] = from->rs[i];
+    for (int t = 0; t < 8; ++t)
+    {
+        for (int i = 0; i < 32; ++i)
+            if (m->tss[t][i])
+                to->tss[t][i] = from->tss[t][i];
+        if (m->tex[t])
+            bind(&to->tex[t], from->tex[t]);
+    }
+    for (int i = 0; i < NXF; ++i)
+        if (m->xf[i])
+            memcpy(to->xf[i], from->xf[i], 64);
+    if (m->vp)
+        memcpy(to->vp, from->vp, sizeof to->vp);
+    if (m->mat)
+        memcpy(to->mat, from->mat, sizeof to->mat);
+    for (int i = 0; i < MAX_LIGHTS; ++i)
+    {
+        if (m->light[i])
+            memcpy(to->light[i].v, from->light[i].v, sizeof to->light[i].v);
+        if (m->lighten[i])
+            to->light[i].enabled = from->light[i].enabled;
+    }
+    for (int i = 0; i < 6; ++i)
+        if (m->clip[i])
+            memcpy(to->clip[i], from->clip[i], 16);
+    for (int i = 0; i < NSTREAMS; ++i)
+        if (m->stream[i])
+        {
+            bind(&to->stream[i], from->stream[i]);
+            to->stride[i] = from->stride[i];
+        }
+    if (m->ib)
+    {
+        bind(&to->ib, from->ib);
+        to->base_vertex = from->base_vertex;
+    }
+    if (m->vs)
+        to->vs = from->vs;
+    if (m->ps)
+        to->ps = from->ps;
+    for (int i = 0; i < NVSC; ++i)
+        if (m->vsc[i])
+            memcpy(to->vsc[i], from->vsc[i], 16);
+    for (int i = 0; i < NPSC; ++i)
+        if (m->psc[i])
+            memcpy(to->psc[i], from->psc[i], 16);
+}
+
+static void block_free(Block* b)
+{
+    for (int t = 0; t < 8; ++t)
+        bind(&b->s.tex[t], 0);
+    for (int i = 0; i < NSTREAMS; ++i)
+        bind(&b->s.stream[i], 0);
+    bind(&b->s.ib, 0);
+    free(b);
+}
+
+static uint32_t block_token(Block* b)
+{
+    for (uint32_t i = 0; i < g_dev.nblocks; ++i)
+        if (!g_dev.blocks[i])
+        {
+            g_dev.blocks[i] = b;
+            return i + 1;
+        }
+    g_dev.blocks = (Block**)realloc(g_dev.blocks, (g_dev.nblocks + 1) * sizeof *g_dev.blocks);
+    g_dev.blocks[g_dev.nblocks++] = b;
+    return g_dev.nblocks;
+}
+
+static Block* block_of(uint32_t token)
+{
+    return token && token <= g_dev.nblocks ? g_dev.blocks[token - 1] : NULL;
+}
+
+/* --- IUnknown, shared by every interface ----------------------------------------------------------------- */
+static void Unknown_QueryInterface(Guest* g)
+{
+    wr32(ARG(2), 0);
+    RET(E_NOINTERFACE, 3);
+}
+static void Unknown_AddRef(Guest* g) { RET(obj_addref(ARG(0)), 1); }
+static void Unknown_Release(Guest* g) { RET(obj_release(ARG(0)), 1); }
+
+/* --- IDirect3D8 -------------------------------------------------------------------------------------------- */
+static void desktop(uint32_t* w, uint32_t* h, uint32_t* hz)
+{
+    user32_desktop_mode(w, h, hz);
+}
+
+static const uint32_t MODES[][2] = { { 640, 480 },  { 800, 600 },   { 1024, 768 },  { 1152, 864 },  { 1280, 720 },
+                                     { 1280, 800 }, { 1280, 1024 }, { 1366, 768 },  { 1440, 900 },  { 1600, 900 },
+                                     { 1680, 1050 }, { 1920, 1080 }, { 1920, 1200 }, { 2560, 1440 }, { 2560, 1600 } };
+
+/* the display modes offered: the list up to the desktop's size, then the desktop, in both formats */
+static uint32_t modes(uint32_t (*out)[4], uint32_t max)
+{
+    uint32_t dw, dh, hz, n = 0;
+    desktop(&dw, &dh, &hz);
+    const uint32_t fmts[2] = { FMT_X8R8G8B8, FMT_R5G6B5 };
+    for (int f = 0; f < 2; ++f)
+    {
+        int have_desktop = 0;
+        for (size_t i = 0; i < sizeof MODES / sizeof MODES[0]; ++i)
+            if (MODES[i][0] <= dw && MODES[i][1] <= dh && n < max)
+            {
+                have_desktop |= MODES[i][0] == dw && MODES[i][1] == dh;
+                out[n][0] = MODES[i][0], out[n][1] = MODES[i][1], out[n][2] = hz, out[n][3] = fmts[f], n++;
+            }
+        if (!have_desktop && n < max)
+            out[n][0] = dw, out[n][1] = dh, out[n][2] = hz, out[n][3] = fmts[f], n++;
+    }
+    return n;
+}
+
+static void IDirect3D8_GetAdapterCount(Guest* g) { RET(1, 1); }
+
+static void IDirect3D8_GetAdapterIdentifier(Guest* g)
+{
+    if (ARG(1))
+        RET(D3DERR_INVALIDCALL, 4);
+    uint32_t p = ARG(3);
+    memset(GUEST_PTR(p), 0, 1068);
+    strcpy((char*)GUEST_PTR(p), "ffxi-metal");
+    strcpy((char*)GUEST_PTR(p + 512), "FFXI Metal");
+    wr32(p + 1024, 0x00010000u); /* DriverVersion 1.0.0.0 */
+    wr32(p + 1028, 0x00060000u);
+    wr32(p + 1032, 0x106B); /* VendorId: Apple */
+    wr32(p + 1064, 1);      /* WHQLLevel */
+    RET(D3D_OK, 4);
+}
+
+static void IDirect3D8_GetAdapterModeCount(Guest* g)
+{
+    uint32_t m[64][4];
+    RET(ARG(1) ? 0 : modes(m, 64), 2);
+}
+
+static void IDirect3D8_EnumAdapterModes(Guest* g)
+{
+    uint32_t m[64][4], n = modes(m, 64), i = ARG(2);
+    if (ARG(1) || i >= n)
+        RET(D3DERR_INVALIDCALL, 4);
+    for (int k = 0; k < 4; ++k)
+        wr32(ARG(3) + 4u * (uint32_t)k, m[i][k]);
+    RET(D3D_OK, 4);
+}
+
+static void write_desktop_mode(uint32_t p)
+{
+    uint32_t w, h, hz;
+    desktop(&w, &h, &hz);
+    wr32(p, w);
+    wr32(p + 4, h);
+    wr32(p + 8, hz);
+    wr32(p + 12, FMT_X8R8G8B8);
+}
+
+static void IDirect3D8_GetAdapterDisplayMode(Guest* g)
+{
+    if (ARG(1))
+        RET(D3DERR_INVALIDCALL, 3);
+    write_desktop_mode(ARG(2));
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3D8_CheckDeviceType(Guest* g) { RET(ARG(1) ? D3DERR_INVALIDCALL : D3D_OK, 6); }
+
+/* What a Metal device can back. Paletted and 3-3-2 formats are out, as on current D3D9 drivers. */
+static int format_ok(uint32_t usage, uint32_t rtype, uint32_t f)
+{
+    if (rtype == RT_VERTEXBUFFER || rtype == RT_INDEXBUFFER)
+        return 1;
+    if (rtype == RT_VOLUMETEXTURE)
+        return 0;
+    if (usage & USAGE_DEPTHSTENCIL)
+        return f == FMT_D16 || f == FMT_D24S8 || f == FMT_D24X8;
+    if (usage & USAGE_RENDERTARGET)
+        return f == FMT_A8R8G8B8 || f == FMT_X8R8G8B8 || f == FMT_R5G6B5 || f == FMT_X1R5G5B5 || f == FMT_A1R5G5B5;
+    switch (f)
+    {
+    case FMT_A8R8G8B8:
+    case FMT_X8R8G8B8:
+    case FMT_R5G6B5:
+    case FMT_X1R5G5B5:
+    case FMT_A1R5G5B5:
+    case FMT_A4R4G4B4:
+    case FMT_A8:
+    case FMT_L8:
+    case FMT_A8L8:
+    case FMT_V8U8:
+    case FMT_DXT1:
+    case FMT_DXT2:
+    case FMT_DXT3:
+    case FMT_DXT4:
+    case FMT_DXT5:
+        return 1;
+    case FMT_D16:
+    case FMT_D24S8:
+    case FMT_D24X8:
+        return rtype == RT_SURFACE || rtype == RT_TEXTURE;
+    default: return 0;
+    }
+}
+
+static void IDirect3D8_CheckDeviceFormat(Guest* g)
+{
+    RET(!ARG(1) && format_ok(ARG(4), ARG(5), ARG(6)) ? D3D_OK : D3DERR_NOTAVAILABLE, 7);
+}
+
+static void IDirect3D8_CheckDeviceMultiSampleType(Guest* g) { RET(ARG(5) == 0 ? D3D_OK : D3DERR_NOTAVAILABLE, 6); }
+static void IDirect3D8_CheckDepthStencilMatch(Guest* g) { RET(D3D_OK, 6); }
+
+static void IDirect3D8_GetDeviceCaps(Guest* g)
+{
+    if (ARG(1))
+        RET(D3DERR_INVALIDCALL, 4);
+    for (int i = 0; i < 53; ++i)
+        wr32(ARG(3) + 4u * (uint32_t)i, CAPS8[i]);
+    wr32(ARG(3), ARG(2)); /* DeviceType as asked */
+    RET(D3D_OK, 4);
+}
+
+static void IDirect3D8_GetAdapterMonitor(Guest* g) { RET(0x00050001u, 2); }
+
+/* CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, ppDevice) */
+static void IDirect3D8_CreateDevice(Guest* g)
+{
+    wr32(ARG(6), 0);
+    if (ARG(1) || g_dev.guest)
+        RET(g_dev.guest ? D3DERR_NOTAVAILABLE : D3DERR_INVALIDCALL, 7);
+    Dev* d = &g_dev;
+    for (int i = 0; i < 13; ++i)
+        d->pp[i] = rd32(ARG(5) + 4u * (uint32_t)i);
+    d->hwnd = d->pp[6] ? d->pp[6] : ARG(3);
+    d->behavior = ARG(4);
+    d->device_type = ARG(2);
+    d->d3d = ARG(0);
+    if (!d->pp[0] || !d->pp[1])
+    {
+        uint32_t w = 640, h = 480;
+        user32_client_size(d->hwnd, &w, &h);
+        if (!d->pp[0])
+            d->pp[0] = w;
+        if (!d->pp[1])
+            d->pp[1] = h;
+    }
+    if (!d->pp[2])
+        d->pp[2] = FMT_X8R8G8B8;
+    obj_addref(d->d3d);
+    d->guest = obj_new(O_DEVICE);
+    d->backbuffer = new_surface(d->pp[2], d->pp[0], d->pp[1], USAGE_RENDERTARGET, 0, 0);
+    obj(d->backbuffer)->implicit = 1;
+    if (d->pp[8])
+    {
+        d->depth = new_surface(d->pp[9], d->pp[0], d->pp[1], USAGE_DEPTHSTENCIL, 0, 0);
+        obj(d->depth)->implicit = 1;
+    }
+    bind(&d->rt, d->backbuffer);
+    bind(&d->ds, d->depth);
+    state_defaults(&d->cur, d->pp[0], d->pp[1], d->pp[8] != 0);
+    rt_log("[recomp] d3d8: device %ux%u format %u%s, depth %u, behavior %08x, window %08x\n", d->pp[0], d->pp[1],
+        d->pp[2], d->pp[7] ? " windowed" : " fullscreen", d->pp[8] ? d->pp[9] : 0, d->behavior, d->hwnd);
+    wr32(ARG(6), d->guest);
+    RET(D3D_OK, 7);
+}
+
+/* --- IDirect3DDevice8: device -------------------------------------------------------------------------- */
+static void IDirect3DDevice8_TestCooperativeLevel(Guest* g) { RET(D3D_OK, 1); }
+static void IDirect3DDevice8_GetAvailableTextureMem(Guest* g) { RET(512u << 20, 1); }
+static void IDirect3DDevice8_ResourceManagerDiscardBytes(Guest* g) { RET(D3D_OK, 2); }
+
+static void IDirect3DDevice8_GetDirect3D(Guest* g)
+{
+    obj_addref(g_dev.d3d);
+    wr32(ARG(1), g_dev.d3d);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_GetDeviceCaps(Guest* g)
+{
+    for (int i = 0; i < 53; ++i)
+        wr32(ARG(1) + 4u * (uint32_t)i, CAPS8[i]);
+    wr32(ARG(1), g_dev.device_type);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_GetDisplayMode(Guest* g)
+{
+    write_desktop_mode(ARG(1));
+    if (!g_dev.pp[7]) /* fullscreen: the mode the device set */
+    {
+        wr32(ARG(1), g_dev.pp[0]);
+        wr32(ARG(1) + 4, g_dev.pp[1]);
+        wr32(ARG(1) + 12, g_dev.pp[2]);
+    }
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_GetCreationParameters(Guest* g)
+{
+    wr32(ARG(1), 0);
+    wr32(ARG(1) + 4, g_dev.device_type);
+    wr32(ARG(1) + 8, g_dev.hwnd);
+    wr32(ARG(1) + 12, g_dev.behavior);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_SetCursorProperties(Guest* g) { RET(D3D_OK, 4); }
+static void IDirect3DDevice8_SetCursorPosition(Guest* g) { RET(0, 4); }
+
+static void IDirect3DDevice8_ShowCursor(Guest* g)
+{
+    int was = g_dev.cursor;
+    g_dev.cursor = ARG(1) != 0;
+    RET((uint32_t)was, 2);
+}
+
+static void IDirect3DDevice8_Reset(Guest* g)
+{
+    Dev* d = &g_dev;
+    for (int i = 0; i < 13; ++i)
+        d->pp[i] = rd32(ARG(1) + 4u * (uint32_t)i);
+    if (!d->pp[0] || !d->pp[1])
+        user32_client_size(d->hwnd, &d->pp[0], &d->pp[1]);
+    if (!d->pp[2])
+        d->pp[2] = FMT_X8R8G8B8;
+    Obj* bb = obj(d->backbuffer);
+    bb->format = d->pp[2], bb->width = d->pp[0], bb->height = d->pp[1], bb->size = fmt_size(bb->format, bb->width, bb->height);
+    if (bb->mem)
+        gheap_free(bb->mem), bb->mem = 0;
+    Obj* z = obj(d->depth);
+    if (z)
+    {
+        z->width = d->pp[0], z->height = d->pp[1], z->size = fmt_size(z->format, z->width, z->height);
+        if (z->mem)
+            gheap_free(z->mem), z->mem = 0;
+    }
+    bind(&d->rt, d->backbuffer);
+    bind(&d->ds, d->depth);
+    for (int t = 0; t < 8; ++t)
+        bind(&d->cur.tex[t], 0);
+    for (int i = 0; i < NSTREAMS; ++i)
+        bind(&d->cur.stream[i], 0);
+    bind(&d->cur.ib, 0);
+    state_defaults(&d->cur, d->pp[0], d->pp[1], d->pp[8] != 0);
+    rt_log("[recomp] d3d8: reset to %ux%u\n", d->pp[0], d->pp[1]);
+    RET(D3D_OK, 2);
+}
+
+/* Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion): the frame is done */
+static void IDirect3DDevice8_Present(Guest* g) { RET(D3D_OK, 5); }
+
+static void IDirect3DDevice8_GetBackBuffer(Guest* g)
+{
+    if (ARG(1))
+    {
+        wr32(ARG(3), 0);
+        RET(D3DERR_INVALIDCALL, 4);
+    }
+    obj_addref(g_dev.backbuffer);
+    wr32(ARG(3), g_dev.backbuffer);
+    RET(D3D_OK, 4);
+}
+
+static void IDirect3DDevice8_GetRasterStatus(Guest* g)
+{
+    wr32(ARG(1), 1); /* InVBlank */
+    wr32(ARG(1) + 4, 0);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_SetGammaRamp(Guest* g) { RET(0, 3); }
+
+/* --- resources ------------------------------------------------------------------------------------------ */
+static uint32_t chain_levels(uint32_t w, uint32_t h, uint32_t levels)
+{
+    uint32_t full = 1;
+    for (uint32_t m = w > h ? w : h; m > 1; m >>= 1)
+        full++;
+    return !levels || levels > full ? full : levels;
+}
+
+static uint32_t new_texture(int kind, uint32_t w, uint32_t h, uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool)
+{
+    uint32_t p = obj_new(kind);
+    Obj* t = obj(p);
+    t->width = w, t->height = h, t->usage = usage, t->format = fmt, t->pool = pool;
+    uint32_t nl = t->levels = chain_levels(w, h, levels);
+    uint32_t faces = kind == O_CUBE ? 6 : 1;
+    uint32_t* subs = t->subs = (uint32_t*)calloc(faces * nl, 4);
+    t->nsubs = faces * nl;
+    /* new_surface may grow the object table: t is not used past here */
+    for (uint32_t f = 0; f < faces; ++f)
+        for (uint32_t l = 0; l < nl; ++l)
+            subs[f * nl + l] = new_surface(fmt, w >> l ? w >> l : 1, h >> l ? h >> l : 1, usage, pool, p);
+    return p;
+}
+
+/* CreateTexture(Width, Height, Levels, Usage, Format, Pool, ppTexture) */
+static void IDirect3DDevice8_CreateTexture(Guest* g)
+{
+    wr32(ARG(7), 0);
+    if (!ARG(1) || !ARG(2) || !format_ok(ARG(4), RT_TEXTURE, ARG(5)))
+        RET(D3DERR_INVALIDCALL, 8);
+    wr32(ARG(7), new_texture(O_TEXTURE, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6)));
+    RET(D3D_OK, 8);
+}
+
+/* CreateCubeTexture(EdgeLength, Levels, Usage, Format, Pool, ppCubeTexture) */
+static void IDirect3DDevice8_CreateCubeTexture(Guest* g)
+{
+    wr32(ARG(6), 0);
+    if (!ARG(1) || !format_ok(ARG(3), RT_CUBETEXTURE, ARG(4)))
+        RET(D3DERR_INVALIDCALL, 7);
+    wr32(ARG(6), new_texture(O_CUBE, ARG(1), ARG(1), ARG(2), ARG(3), ARG(4), ARG(5)));
+    RET(D3D_OK, 7);
+}
+
+static void IDirect3DDevice8_CreateVolumeTexture(Guest* g)
+{
+    wr32(ARG(8), 0);
+    RET(D3DERR_NOTAVAILABLE, 9);
+}
+
+/* CreateVertexBuffer(Length, Usage, FVF, Pool, ppVertexBuffer) */
+static void IDirect3DDevice8_CreateVertexBuffer(Guest* g)
+{
+    uint32_t p = obj_new(O_VB);
+    Obj* b = obj(p);
+    b->size = ARG(1), b->usage = ARG(2), b->fvf = ARG(3), b->pool = ARG(4);
+    wr32(ARG(5), p);
+    RET(D3D_OK, 6);
+}
+
+/* CreateIndexBuffer(Length, Usage, Format, Pool, ppIndexBuffer) */
+static void IDirect3DDevice8_CreateIndexBuffer(Guest* g)
+{
+    uint32_t p = obj_new(O_IB);
+    Obj* b = obj(p);
+    b->size = ARG(1), b->usage = ARG(2), b->format = ARG(3), b->pool = ARG(4);
+    wr32(ARG(5), p);
+    RET(D3D_OK, 6);
+}
+
+/* CreateRenderTarget(Width, Height, Format, MultiSample, Lockable, ppSurface) */
+static void IDirect3DDevice8_CreateRenderTarget(Guest* g)
+{
+    wr32(ARG(6), new_surface(ARG(3), ARG(1), ARG(2), USAGE_RENDERTARGET, 0, 0));
+    RET(D3D_OK, 7);
+}
+
+/* CreateDepthStencilSurface(Width, Height, Format, MultiSample, ppSurface) */
+static void IDirect3DDevice8_CreateDepthStencilSurface(Guest* g)
+{
+    wr32(ARG(5), new_surface(ARG(3), ARG(1), ARG(2), USAGE_DEPTHSTENCIL, 0, 0));
+    RET(D3D_OK, 6);
+}
+
+/* CreateImageSurface(Width, Height, Format, ppSurface): system memory */
+static void IDirect3DDevice8_CreateImageSurface(Guest* g)
+{
+    wr32(ARG(4), new_surface(ARG(3), ARG(1), ARG(2), 0, 2, 0));
+    RET(D3D_OK, 5);
+}
+
+/* CopyRects(pSourceSurface, pSourceRectsArray, cRects, pDestinationSurface, pDestPointsArray): the
+ * pixels are copied in the guest copies; the Metal back end will also see it as an upload. */
+static void IDirect3DDevice8_CopyRects(Guest* g)
+{
+    Obj* s = obj(ARG(1));
+    Obj* d = obj(ARG(4));
+    if (!s || !d || s->format != d->format)
+        RET(D3DERR_INVALIDCALL, 6);
+    uint32_t n = ARG(2) ? ARG(3) : 1, blk = fmt_block(s->format), unit = blk ? 4 : 1, bpp = blk ? blk : fmt_bytes(s->format);
+    uint32_t sp = fmt_pitch(s->format, s->width), dp = fmt_pitch(d->format, d->width);
+    uint8_t* sm = GUEST_PTR(obj_mem(s));
+    uint8_t* dm = GUEST_PTR(obj_mem(d));
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        int32_t l = 0, t = 0, r = (int32_t)s->width, b = (int32_t)s->height;
+        if (ARG(2))
+        {
+            uint32_t rc = ARG(2) + 16 * i;
+            l = (int32_t)rd32(rc), t = (int32_t)rd32(rc + 4), r = (int32_t)rd32(rc + 8), b = (int32_t)rd32(rc + 12);
+        }
+        int32_t x = l, y = t;
+        if (ARG(5))
+            x = (int32_t)rd32(ARG(5) + 8 * i), y = (int32_t)rd32(ARG(5) + 8 * i + 4);
+        if (l < 0 || t < 0 || r > (int32_t)s->width || b > (int32_t)s->height || r <= l || b <= t || x < 0 || y < 0 ||
+            x + (r - l) > (int32_t)d->width || y + (b - t) > (int32_t)d->height)
+            continue;
+        uint32_t rows = ((uint32_t)(b - t) + unit - 1) / unit, bytes = ((uint32_t)(r - l) + unit - 1) / unit * bpp;
+        for (uint32_t row = 0; row < rows; ++row)
+            memmove(dm + ((uint32_t)y / unit + row) * dp + (uint32_t)x / unit * bpp,
+                sm + ((uint32_t)t / unit + row) * sp + (uint32_t)l / unit * bpp, bytes);
+    }
+    RET(D3D_OK, 6);
+}
+
+/* SetRenderTarget(pRenderTarget, pNewZStencil): NULL render target keeps the current one */
+static void IDirect3DDevice8_SetRenderTarget(Guest* g)
+{
+    if (ARG(1))
+    {
+        bind(&g_dev.rt, ARG(1));
+        Obj* rt = obj(ARG(1));
+        if (rt) /* D3D8 resets the viewport to the new target */
+        {
+            uint32_t* vp = g_dev.cur.vp;
+            vp[0] = vp[1] = 0, vp[2] = rt->width, vp[3] = rt->height, vp[4] = 0, vp[5] = f2u(1.0f);
+        }
+    }
+    bind(&g_dev.ds, ARG(2));
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_GetRenderTarget(Guest* g)
+{
+    obj_addref(g_dev.rt);
+    wr32(ARG(1), g_dev.rt);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_GetDepthStencilSurface(Guest* g)
+{
+    wr32(ARG(1), g_dev.ds);
+    if (!g_dev.ds)
+        RET(0x88760834u, 2); /* D3DERR_NOTFOUND */
+    obj_addref(g_dev.ds);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_BeginScene(Guest* g) { RET(D3D_OK, 1); }
+static void IDirect3DDevice8_EndScene(Guest* g) { RET(D3D_OK, 1); }
+/* Clear(Count, pRects, Flags, Color, Z, Stencil) */
+static void IDirect3DDevice8_Clear(Guest* g) { RET(D3D_OK, 7); }
+
+/* --- IDirect3DDevice8: state ----------------------------------------------------------------------------- */
+static void IDirect3DDevice8_SetTransform(Guest* g)
+{
+    int i = xf_index(ARG(1));
+    if (i < 0)
+        RET(D3DERR_INVALIDCALL, 3);
+    Mask* m;
+    State* s = target(&m);
+    memcpy(s->xf[i], ARGP(2), 64);
+    if (m)
+        m->xf[i] = 1;
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_GetTransform(Guest* g)
+{
+    int i = xf_index(ARG(1));
+    if (i < 0)
+        RET(D3DERR_INVALIDCALL, 3);
+    memcpy(ARGP(2), g_dev.cur.xf[i], 64);
+    RET(D3D_OK, 3);
+}
+
+/* MultiplyTransform(State, pMatrix): the state's matrix becomes pMatrix * matrix */
+static void IDirect3DDevice8_MultiplyTransform(Guest* g)
+{
+    int i = xf_index(ARG(1));
+    if (i < 0)
+        RET(D3DERR_INVALIDCALL, 3);
+    float a[16], r[16];
+    memcpy(a, ARGP(2), 64);
+    const float* b = g_dev.cur.xf[i];
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x)
+            r[y * 4 + x] = a[y * 4] * b[x] + a[y * 4 + 1] * b[4 + x] + a[y * 4 + 2] * b[8 + x] + a[y * 4 + 3] * b[12 + x];
+    Mask* m;
+    State* s = target(&m);
+    memcpy(s->xf[i], r, 64);
+    if (m)
+        m->xf[i] = 1;
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_SetViewport(Guest* g)
+{
+    Mask* m;
+    State* s = target(&m);
+    memcpy(s->vp, ARGP(1), 24);
+    if (m)
+        m->vp = 1;
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_GetViewport(Guest* g)
+{
+    memcpy(ARGP(1), g_dev.cur.vp, 24);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_SetMaterial(Guest* g)
+{
+    Mask* m;
+    State* s = target(&m);
+    memcpy(s->mat, ARGP(1), 68);
+    if (m)
+        m->mat = 1;
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_GetMaterial(Guest* g)
+{
+    memcpy(ARGP(1), g_dev.cur.mat, 68);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_SetLight(Guest* g)
+{
+    uint32_t i = ARG(1);
+    if (i >= MAX_LIGHTS)
+        RET(D3DERR_INVALIDCALL, 3);
+    Mask* m;
+    State* s = target(&m);
+    memcpy(s->light[i].v, ARGP(2), 104);
+    if (m)
+        m->light[i] = 1;
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_GetLight(Guest* g)
+{
+    if (ARG(1) >= MAX_LIGHTS)
+        RET(D3DERR_INVALIDCALL, 3);
+    memcpy(ARGP(2), g_dev.cur.light[ARG(1)].v, 104);
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_LightEnable(Guest* g)
+{
+    uint32_t i = ARG(1);
+    if (i >= MAX_LIGHTS)
+        RET(D3DERR_INVALIDCALL, 3);
+    Mask* m;
+    State* s = target(&m);
+    if (!s->light[i].v[0]) /* never set: D3D enables a default light */
+    {
+        default_light(&s->light[i]);
+        if (m)
+            m->light[i] = 1;
+    }
+    s->light[i].enabled = ARG(2) != 0;
+    if (m)
+        m->lighten[i] = 1;
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_GetLightEnable(Guest* g)
+{
+    if (ARG(1) >= MAX_LIGHTS)
+        RET(D3DERR_INVALIDCALL, 3);
+    wr32(ARG(2), g_dev.cur.light[ARG(1)].enabled);
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_SetClipPlane(Guest* g)
+{
+    if (ARG(1) >= 6)
+        RET(D3DERR_INVALIDCALL, 3);
+    Mask* m;
+    State* s = target(&m);
+    memcpy(s->clip[ARG(1)], ARGP(2), 16);
+    if (m)
+        m->clip[ARG(1)] = 1;
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_SetRenderState(Guest* g)
+{
+    uint32_t i = ARG(1);
+    if (i >= 256)
+        RET(D3DERR_INVALIDCALL, 3);
+    Mask* m;
+    State* s = target(&m);
+    s->rs[i] = ARG(2);
+    if (m)
+        m->rs[i] = 1;
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_GetRenderState(Guest* g)
+{
+    if (ARG(1) >= 256)
+        RET(D3DERR_INVALIDCALL, 3);
+    wr32(ARG(2), g_dev.cur.rs[ARG(1)]);
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_BeginStateBlock(Guest* g)
+{
+    if (g_dev.rec)
+        RET(D3DERR_INVALIDCALL, 1);
+    g_dev.rec = (Block*)calloc(1, sizeof(Block));
+    RET(D3D_OK, 1);
+}
+
+static void IDirect3DDevice8_EndStateBlock(Guest* g)
+{
+    if (!g_dev.rec)
+        RET(D3DERR_INVALIDCALL, 2);
+    wr32(ARG(1), block_token(g_dev.rec));
+    g_dev.rec = NULL;
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_ApplyStateBlock(Guest* g)
+{
+    Block* b = block_of(ARG(1));
+    if (!b || g_dev.rec)
+        RET(D3DERR_INVALIDCALL, 2);
+    state_copy(&g_dev.cur, &b->s, &b->m);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_CaptureStateBlock(Guest* g)
+{
+    Block* b = block_of(ARG(1));
+    if (!b || g_dev.rec)
+        RET(D3DERR_INVALIDCALL, 2);
+    state_copy(&b->s, &g_dev.cur, &b->m);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_DeleteStateBlock(Guest* g)
+{
+    Block* b = block_of(ARG(1));
+    if (!b)
+        RET(D3DERR_INVALIDCALL, 2);
+    block_free(b);
+    g_dev.blocks[ARG(1) - 1] = NULL;
+    RET(D3D_OK, 2);
+}
+
+/* CreateStateBlock(Type, pToken): D3DSBT_ALL 1, PIXELSTATE 2, VERTEXSTATE 3. The pixel and vertex
+ * sets here are the categories, not D3D's exact render-state lists: rendering state that would be
+ * captured by one or the other is captured by both. */
+static void IDirect3DDevice8_CreateStateBlock(Guest* g)
+{
+    uint32_t type = ARG(1);
+    if (type < 1 || type > 3 || g_dev.rec)
+        RET(D3DERR_INVALIDCALL, 3);
+    Block* b = (Block*)calloc(1, sizeof(Block));
+    Mask* m = &b->m;
+    memset(m->rs, 1, sizeof m->rs);
+    memset(m->tss, 1, sizeof m->tss);
+    if (type == 1 || type == 2)
+    {
+        m->ps = 1;
+        memset(m->psc, 1, sizeof m->psc);
+    }
+    if (type == 1 || type == 3)
+    {
+        m->vs = 1;
+        memset(m->vsc, 1, sizeof m->vsc);
+        memset(m->light, 1, sizeof m->light);
+        memset(m->lighten, 1, sizeof m->lighten);
+    }
+    if (type == 1)
+    {
+        memset(m->tex, 1, sizeof m->tex);
+        memset(m->xf, 1, sizeof m->xf);
+        memset(m->clip, 1, sizeof m->clip);
+        memset(m->stream, 1, sizeof m->stream);
+        m->vp = m->mat = m->ib = 1;
+    }
+    state_copy(&b->s, &g_dev.cur, m);
+    wr32(ARG(2), block_token(b));
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_GetTexture(Guest* g)
+{
+    if (ARG(1) >= 8)
+        RET(D3DERR_INVALIDCALL, 3);
+    uint32_t t = g_dev.cur.tex[ARG(1)];
+    if (t)
+        obj_addref(t);
+    wr32(ARG(2), t);
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_SetTexture(Guest* g)
+{
+    if (ARG(1) >= 8)
+        RET(D3DERR_INVALIDCALL, 3);
+    Mask* m;
+    State* s = target(&m);
+    bind(&s->tex[ARG(1)], ARG(2));
+    if (m)
+        m->tex[ARG(1)] = 1;
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_GetTextureStageState(Guest* g)
+{
+    if (ARG(1) >= 8 || ARG(2) >= 32)
+        RET(D3DERR_INVALIDCALL, 4);
+    wr32(ARG(3), g_dev.cur.tss[ARG(1)][ARG(2)]);
+    RET(D3D_OK, 4);
+}
+
+static void IDirect3DDevice8_SetTextureStageState(Guest* g)
+{
+    if (ARG(1) >= 8 || ARG(2) >= 32)
+        RET(D3DERR_INVALIDCALL, 4);
+    Mask* m;
+    State* s = target(&m);
+    s->tss[ARG(1)][ARG(2)] = ARG(3);
+    if (m)
+        m->tss[ARG(1)][ARG(2)] = 1;
+    RET(D3D_OK, 4);
+}
+
+static void IDirect3DDevice8_ValidateDevice(Guest* g)
+{
+    wr32(ARG(1), 1);
+    RET(D3D_OK, 2);
+}
+
+/* --- IDirect3DDevice8: drawing ----------------------------------------------------------------------------- */
+/* DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount) */
+static void IDirect3DDevice8_DrawPrimitive(Guest* g) { RET(D3D_OK, 4); }
+/* DrawIndexedPrimitive(PrimitiveType, minIndex, NumVertices, startIndex, primCount) */
+static void IDirect3DDevice8_DrawIndexedPrimitive(Guest* g) { RET(D3D_OK, 6); }
+
+/* The ...UP draws leave stream 0 (and the indices) unset, as D3D8 does. */
+static void IDirect3DDevice8_DrawPrimitiveUP(Guest* g)
+{
+    bind(&g_dev.cur.stream[0], 0);
+    g_dev.cur.stride[0] = 0;
+    RET(D3D_OK, 5);
+}
+
+static void IDirect3DDevice8_DrawIndexedPrimitiveUP(Guest* g)
+{
+    bind(&g_dev.cur.stream[0], 0);
+    g_dev.cur.stride[0] = 0;
+    bind(&g_dev.cur.ib, 0);
+    RET(D3D_OK, 9);
+}
+
+/* --- IDirect3DDevice8: shaders and streams ------------------------------------------------------------------ */
+static uint32_t* copy_tokens(uint32_t p, uint32_t end, uint32_t* n)
+{
+    uint32_t k = 0;
+    while (k < 65536 && rd32(p + 4 * k) != end)
+        k++;
+    k++;
+    uint32_t* t = (uint32_t*)malloc(4 * k);
+    memcpy(t, GUEST_PTR(p), 4 * k);
+    *n = k;
+    return t;
+}
+
+/* CreateVertexShader(pDeclaration, pFunction, pHandle, Usage). Handles are odd: D3D8 tells a shader
+ * from an FVF code (bit 0 always clear) by that bit. */
+static void IDirect3DDevice8_CreateVertexShader(Guest* g)
+{
+    Dev* d = &g_dev;
+    uint32_t i = 0;
+    while (i < d->nvs && d->vs[i].decl)
+        i++;
+    if (i == d->nvs)
+    {
+        d->vs = (Shader*)realloc(d->vs, (d->nvs + 1) * sizeof *d->vs);
+        memset(&d->vs[d->nvs++], 0, sizeof(Shader));
+    }
+    Shader* s = &d->vs[i];
+    s->decl = copy_tokens(ARG(1), 0xFFFFFFFFu, &s->ndecl);
+    s->func = ARG(2) ? copy_tokens(ARG(2), 0x0000FFFFu, &s->nfunc) : NULL;
+    if (!ARG(2))
+        s->nfunc = 0;
+    wr32(ARG(3), ((i + 1) << 1) | 1);
+    RET(D3D_OK, 5);
+}
+
+static Shader* vs_of(uint32_t h)
+{
+    uint32_t i = (h >> 1) - 1;
+    return (h & 1) && i < g_dev.nvs && g_dev.vs[i].decl ? &g_dev.vs[i] : NULL;
+}
+
+static void IDirect3DDevice8_SetVertexShader(Guest* g)
+{
+    Mask* m;
+    State* s = target(&m);
+    s->vs = ARG(1);
+    if (m)
+        m->vs = 1;
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_GetVertexShader(Guest* g)
+{
+    wr32(ARG(1), g_dev.cur.vs);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_DeleteVertexShader(Guest* g)
+{
+    Shader* s = vs_of(ARG(1));
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 2);
+    free(s->decl);
+    free(s->func);
+    memset(s, 0, sizeof *s);
+    if (g_dev.cur.vs == ARG(1))
+        g_dev.cur.vs = 0;
+    RET(D3D_OK, 2);
+}
+
+/* Set/GetVertexShaderConstant(Register, pConstantData, ConstantCount) */
+static void IDirect3DDevice8_SetVertexShaderConstant(Guest* g)
+{
+    uint32_t r = ARG(1), n = ARG(3);
+    if (r >= NVSC || n > NVSC - r)
+        RET(D3DERR_INVALIDCALL, 4);
+    Mask* m;
+    State* s = target(&m);
+    memcpy(s->vsc[r], ARGP(2), 16 * n);
+    if (m)
+        memset(&m->vsc[r], 1, n);
+    RET(D3D_OK, 4);
+}
+
+static void IDirect3DDevice8_GetVertexShaderConstant(Guest* g)
+{
+    uint32_t r = ARG(1), n = ARG(3);
+    if (r >= NVSC || n > NVSC - r)
+        RET(D3DERR_INVALIDCALL, 4);
+    memcpy(ARGP(2), g_dev.cur.vsc[r], 16 * n);
+    RET(D3D_OK, 4);
+}
+
+static void IDirect3DDevice8_SetStreamSource(Guest* g)
+{
+    if (ARG(1) >= NSTREAMS)
+        RET(D3DERR_INVALIDCALL, 4);
+    Mask* m;
+    State* s = target(&m);
+    bind(&s->stream[ARG(1)], ARG(2));
+    s->stride[ARG(1)] = ARG(3);
+    if (m)
+        m->stream[ARG(1)] = 1;
+    RET(D3D_OK, 4);
+}
+
+static void IDirect3DDevice8_GetStreamSource(Guest* g)
+{
+    if (ARG(1) >= NSTREAMS)
+        RET(D3DERR_INVALIDCALL, 4);
+    uint32_t p = g_dev.cur.stream[ARG(1)];
+    if (p)
+        obj_addref(p);
+    wr32(ARG(2), p);
+    wr32(ARG(3), g_dev.cur.stride[ARG(1)]);
+    RET(D3D_OK, 4);
+}
+
+static void IDirect3DDevice8_SetIndices(Guest* g)
+{
+    Mask* m;
+    State* s = target(&m);
+    bind(&s->ib, ARG(1));
+    s->base_vertex = ARG(2);
+    if (m)
+        m->ib = 1;
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_GetIndices(Guest* g)
+{
+    uint32_t p = g_dev.cur.ib;
+    if (p)
+        obj_addref(p);
+    wr32(ARG(1), p);
+    wr32(ARG(2), g_dev.cur.base_vertex);
+    RET(D3D_OK, 3);
+}
+
+/* CreatePixelShader(pFunction, pHandle) */
+static void IDirect3DDevice8_CreatePixelShader(Guest* g)
+{
+    Dev* d = &g_dev;
+    uint32_t i = 0;
+    while (i < d->nps && d->ps[i].func)
+        i++;
+    if (i == d->nps)
+    {
+        d->ps = (Shader*)realloc(d->ps, (d->nps + 1) * sizeof *d->ps);
+        memset(&d->ps[d->nps++], 0, sizeof(Shader));
+    }
+    d->ps[i].func = copy_tokens(ARG(1), 0x0000FFFFu, &d->ps[i].nfunc);
+    wr32(ARG(2), i + 1);
+    RET(D3D_OK, 3);
+}
+
+static void IDirect3DDevice8_SetPixelShader(Guest* g)
+{
+    Mask* m;
+    State* s = target(&m);
+    s->ps = ARG(1);
+    if (m)
+        m->ps = 1;
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_GetPixelShader(Guest* g)
+{
+    wr32(ARG(1), g_dev.cur.ps);
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_DeletePixelShader(Guest* g)
+{
+    uint32_t i = ARG(1) - 1;
+    if (!ARG(1) || i >= g_dev.nps || !g_dev.ps[i].func)
+        RET(D3DERR_INVALIDCALL, 2);
+    free(g_dev.ps[i].func);
+    memset(&g_dev.ps[i], 0, sizeof(Shader));
+    if (g_dev.cur.ps == ARG(1))
+        g_dev.cur.ps = 0;
+    RET(D3D_OK, 2);
+}
+
+static void IDirect3DDevice8_SetPixelShaderConstant(Guest* g)
+{
+    uint32_t r = ARG(1), n = ARG(3);
+    if (r >= NPSC || n > NPSC - r)
+        RET(D3DERR_INVALIDCALL, 4);
+    Mask* m;
+    State* s = target(&m);
+    memcpy(s->psc[r], ARGP(2), 16 * n);
+    if (m)
+        memset(&m->psc[r], 1, n);
+    RET(D3D_OK, 4);
+}
+
+/* --- resources: IDirect3DResource8, textures, buffers, surfaces ------------------------------------------ */
+static void Resource_GetDevice(Guest* g)
+{
+    obj_addref(g_dev.guest);
+    wr32(ARG(1), g_dev.guest);
+    RET(D3D_OK, 2);
+}
+
+static void Resource_SetPriority(Guest* g)
+{
+    Obj* o = obj(ARG(0));
+    uint32_t old = o ? o->priority : 0;
+    if (o)
+        o->priority = ARG(1);
+    RET(old, 2);
+}
+
+static void Resource_GetPriority(Guest* g)
+{
+    Obj* o = obj(ARG(0));
+    RET(o ? o->priority : 0, 1);
+}
+
+static void Resource_PreLoad(Guest* g) { RET(0, 1); }
+
+static void Resource_GetType(Guest* g)
+{
+    Obj* o = obj(ARG(0));
+    static const uint32_t types[] = { 0, 0, 0, RT_TEXTURE, RT_CUBETEXTURE, RT_VERTEXBUFFER, RT_INDEXBUFFER, RT_SURFACE };
+    RET(o ? types[o->kind] : 0, 1);
+}
+
+static void Texture_SetLOD(Guest* g)
+{
+    Obj* o = obj(ARG(0));
+    uint32_t old = o ? o->lod : 0;
+    if (o && o->pool == 1) /* managed textures only */
+        o->lod = ARG(1) < o->levels ? ARG(1) : o->levels - 1;
+    RET(old, 2);
+}
+
+static void Texture_GetLOD(Guest* g)
+{
+    Obj* o = obj(ARG(0));
+    RET(o ? o->lod : 0, 1);
+}
+
+static void Texture_GetLevelCount(Guest* g)
+{
+    Obj* o = obj(ARG(0));
+    RET(o ? o->levels : 0, 1);
+}
+
+static void write_surface_desc(uint32_t p, const Obj* s)
+{
+    wr32(p, s->format);
+    wr32(p + 4, RT_SURFACE);
+    wr32(p + 8, s->usage);
+    wr32(p + 12, s->pool);
+    wr32(p + 16, s->size);
+    wr32(p + 20, 0); /* MultiSampleType */
+    wr32(p + 24, s->width);
+    wr32(p + 28, s->height);
+}
+
+static Obj* sub(uint32_t tex, uint32_t face, uint32_t level)
+{
+    Obj* t = obj(tex);
+    if (!t || level >= t->levels || face >= (t->kind == O_CUBE ? 6u : 1u))
+        return NULL;
+    return obj(t->subs[face * t->levels + level]);
+}
+
+static void Texture_GetLevelDesc(Guest* g)
+{
+    Obj* s = sub(ARG(0), 0, ARG(1));
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 3);
+    write_surface_desc(ARG(2), s);
+    RET(D3D_OK, 3);
+}
+
+static void Texture_GetSurfaceLevel(Guest* g)
+{
+    Obj* s = sub(ARG(0), 0, ARG(1));
+    wr32(ARG(2), s ? s->guest : 0);
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 3);
+    obj_addref(s->guest);
+    RET(D3D_OK, 3);
+}
+
+/* D3DLOCKED_RECT for a surface and an optional RECT */
+static void lock_rect(Obj* s, uint32_t locked, uint32_t rect)
+{
+    uint32_t pitch = fmt_pitch(s->format, s->width), bits = obj_mem(s);
+    if (rect)
+    {
+        uint32_t l = rd32(rect), t = rd32(rect + 4), blk = fmt_block(s->format);
+        bits += blk ? (t / 4) * pitch + (l / 4) * blk : t * pitch + l * fmt_bytes(s->format);
+    }
+    wr32(locked, pitch);
+    wr32(locked + 4, bits);
+}
+
+/* LockRect(Level, pLockedRect, pRect, Flags) */
+static void Texture_LockRect(Guest* g)
+{
+    Obj* s = sub(ARG(0), 0, ARG(1));
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 5);
+    lock_rect(s, ARG(2), ARG(3));
+    RET(D3D_OK, 5);
+}
+
+static void Texture_UnlockRect(Guest* g) { RET(sub(ARG(0), 0, ARG(1)) ? D3D_OK : D3DERR_INVALIDCALL, 2); }
+static void Texture_AddDirtyRect(Guest* g) { RET(D3D_OK, 2); }
+
+static void Cube_GetLevelDesc(Guest* g)
+{
+    Obj* s = sub(ARG(0), 0, ARG(1));
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 3);
+    write_surface_desc(ARG(2), s);
+    RET(D3D_OK, 3);
+}
+
+/* GetCubeMapSurface(FaceType, Level, ppCubeMapSurface) */
+static void Cube_GetCubeMapSurface(Guest* g)
+{
+    Obj* s = sub(ARG(0), ARG(1), ARG(2));
+    wr32(ARG(3), s ? s->guest : 0);
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 4);
+    obj_addref(s->guest);
+    RET(D3D_OK, 4);
+}
+
+/* LockRect(FaceType, Level, pLockedRect, pRect, Flags) */
+static void Cube_LockRect(Guest* g)
+{
+    Obj* s = sub(ARG(0), ARG(1), ARG(2));
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 6);
+    lock_rect(s, ARG(3), ARG(4));
+    RET(D3D_OK, 6);
+}
+
+static void Cube_UnlockRect(Guest* g) { RET(sub(ARG(0), ARG(1), ARG(2)) ? D3D_OK : D3DERR_INVALIDCALL, 3); }
+static void Cube_AddDirtyRect(Guest* g) { RET(D3D_OK, 3); }
+
+/* Lock(OffsetToLock, SizeToLock, ppbData, Flags) */
+static void Buffer_Lock(Guest* g)
+{
+    Obj* b = obj(ARG(0));
+    if (!b || ARG(1) > b->size)
+        RET(D3DERR_INVALIDCALL, 5);
+    wr32(ARG(3), obj_mem(b) + ARG(1));
+    RET(D3D_OK, 5);
+}
+
+static void Buffer_Unlock(Guest* g) { RET(obj(ARG(0)) ? D3D_OK : D3DERR_INVALIDCALL, 1); }
+
+static void VertexBuffer_GetDesc(Guest* g)
+{
+    Obj* b = obj(ARG(0));
+    if (!b)
+        RET(D3DERR_INVALIDCALL, 2);
+    uint32_t v[6] = { 100 /* D3DFMT_VERTEXDATA */, RT_VERTEXBUFFER, b->usage, b->pool, b->size, b->fvf };
+    memcpy(ARGP(1), v, sizeof v);
+    RET(D3D_OK, 2);
+}
+
+static void IndexBuffer_GetDesc(Guest* g)
+{
+    Obj* b = obj(ARG(0));
+    if (!b)
+        RET(D3DERR_INVALIDCALL, 2);
+    uint32_t v[5] = { b->format, RT_INDEXBUFFER, b->usage, b->pool, b->size };
+    memcpy(ARGP(1), v, sizeof v);
+    RET(D3D_OK, 2);
+}
+
+static void Surface_GetContainer(Guest* g)
+{
+    Obj* s = obj(ARG(0));
+    uint32_t c = s && s->container ? s->container : g_dev.guest;
+    obj_addref(c);
+    wr32(ARG(2), c);
+    RET(D3D_OK, 3);
+}
+
+static void Surface_GetDesc(Guest* g)
+{
+    Obj* s = obj(ARG(0));
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 2);
+    write_surface_desc(ARG(1), s);
+    RET(D3D_OK, 2);
+}
+
+/* LockRect(pLockedRect, pRect, Flags) */
+static void Surface_LockRect(Guest* g)
+{
+    Obj* s = obj(ARG(0));
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 4);
+    lock_rect(s, ARG(1), ARG(2));
+    RET(D3D_OK, 4);
+}
+
+static void Surface_UnlockRect(Guest* g) { RET(obj(ARG(0)) ? D3D_OK : D3DERR_INVALIDCALL, 1); }
+
+/* --- entry point and registration ---------------------------------------------------------------------------- */
+/* Direct3DCreate8(SDKVersion) */
+static void sh_Direct3DCreate8(Guest* g)
+{
+    if (!g_d3d)
+        g_d3d = obj_new(O_D3D);
+    else
+        obj_addref(g_d3d);
+    RET(g_d3d, 1);
+}
+
+/* DebugSetMute(BOOL): D3DX silences the debug runtime; cdecl (the caller pops its argument) */
+static void sh_DebugSetMute(Guest* g) { RETC(0); }
+
+#define D(i, m) { "d3d8.dll", #i "::" #m, i##_##m }
+#define U(i, m, f) { "d3d8.dll", #i "::" #m, f }
+#define UNKNOWN(i) U(i, QueryInterface, Unknown_QueryInterface), U(i, AddRef, Unknown_AddRef), U(i, Release, Unknown_Release)
+#define RESOURCE(i)                                                                                                   \
+    UNKNOWN(i), U(i, GetDevice, Resource_GetDevice), U(i, SetPriority, Resource_SetPriority),                         \
+        U(i, GetPriority, Resource_GetPriority), U(i, PreLoad, Resource_PreLoad), U(i, GetType, Resource_GetType)
+
+static const ShimDef D3D8[] = {
+    { "d3d8.dll", "Direct3DCreate8", sh_Direct3DCreate8 },
+    { "d3d8.dll", "DebugSetMute", sh_DebugSetMute },
+    UNKNOWN(IDirect3D8),
+    D(IDirect3D8, GetAdapterCount),
+    D(IDirect3D8, GetAdapterIdentifier),
+    D(IDirect3D8, GetAdapterModeCount),
+    D(IDirect3D8, EnumAdapterModes),
+    D(IDirect3D8, GetAdapterDisplayMode),
+    D(IDirect3D8, CheckDeviceType),
+    D(IDirect3D8, CheckDeviceFormat),
+    D(IDirect3D8, CheckDeviceMultiSampleType),
+    D(IDirect3D8, CheckDepthStencilMatch),
+    D(IDirect3D8, GetDeviceCaps),
+    D(IDirect3D8, GetAdapterMonitor),
+    D(IDirect3D8, CreateDevice),
+
+    UNKNOWN(IDirect3DDevice8),
+    D(IDirect3DDevice8, TestCooperativeLevel),
+    D(IDirect3DDevice8, GetAvailableTextureMem),
+    D(IDirect3DDevice8, ResourceManagerDiscardBytes),
+    D(IDirect3DDevice8, GetDirect3D),
+    D(IDirect3DDevice8, GetDeviceCaps),
+    D(IDirect3DDevice8, GetDisplayMode),
+    D(IDirect3DDevice8, GetCreationParameters),
+    D(IDirect3DDevice8, SetCursorProperties),
+    D(IDirect3DDevice8, SetCursorPosition),
+    D(IDirect3DDevice8, ShowCursor),
+    D(IDirect3DDevice8, Reset),
+    D(IDirect3DDevice8, Present),
+    D(IDirect3DDevice8, GetBackBuffer),
+    D(IDirect3DDevice8, GetRasterStatus),
+    D(IDirect3DDevice8, SetGammaRamp),
+    D(IDirect3DDevice8, CreateTexture),
+    D(IDirect3DDevice8, CreateVolumeTexture),
+    D(IDirect3DDevice8, CreateCubeTexture),
+    D(IDirect3DDevice8, CreateVertexBuffer),
+    D(IDirect3DDevice8, CreateIndexBuffer),
+    D(IDirect3DDevice8, CreateRenderTarget),
+    D(IDirect3DDevice8, CreateDepthStencilSurface),
+    D(IDirect3DDevice8, CreateImageSurface),
+    D(IDirect3DDevice8, CopyRects),
+    D(IDirect3DDevice8, SetRenderTarget),
+    D(IDirect3DDevice8, GetRenderTarget),
+    D(IDirect3DDevice8, GetDepthStencilSurface),
+    D(IDirect3DDevice8, BeginScene),
+    D(IDirect3DDevice8, EndScene),
+    D(IDirect3DDevice8, Clear),
+    D(IDirect3DDevice8, SetTransform),
+    D(IDirect3DDevice8, GetTransform),
+    D(IDirect3DDevice8, MultiplyTransform),
+    D(IDirect3DDevice8, SetViewport),
+    D(IDirect3DDevice8, GetViewport),
+    D(IDirect3DDevice8, SetMaterial),
+    D(IDirect3DDevice8, GetMaterial),
+    D(IDirect3DDevice8, SetLight),
+    D(IDirect3DDevice8, GetLight),
+    D(IDirect3DDevice8, LightEnable),
+    D(IDirect3DDevice8, GetLightEnable),
+    D(IDirect3DDevice8, SetClipPlane),
+    D(IDirect3DDevice8, SetRenderState),
+    D(IDirect3DDevice8, GetRenderState),
+    D(IDirect3DDevice8, BeginStateBlock),
+    D(IDirect3DDevice8, EndStateBlock),
+    D(IDirect3DDevice8, ApplyStateBlock),
+    D(IDirect3DDevice8, CaptureStateBlock),
+    D(IDirect3DDevice8, DeleteStateBlock),
+    D(IDirect3DDevice8, CreateStateBlock),
+    D(IDirect3DDevice8, GetTexture),
+    D(IDirect3DDevice8, SetTexture),
+    D(IDirect3DDevice8, GetTextureStageState),
+    D(IDirect3DDevice8, SetTextureStageState),
+    D(IDirect3DDevice8, ValidateDevice),
+    D(IDirect3DDevice8, DrawPrimitive),
+    D(IDirect3DDevice8, DrawIndexedPrimitive),
+    D(IDirect3DDevice8, DrawPrimitiveUP),
+    D(IDirect3DDevice8, DrawIndexedPrimitiveUP),
+    D(IDirect3DDevice8, CreateVertexShader),
+    D(IDirect3DDevice8, SetVertexShader),
+    D(IDirect3DDevice8, GetVertexShader),
+    D(IDirect3DDevice8, DeleteVertexShader),
+    D(IDirect3DDevice8, SetVertexShaderConstant),
+    D(IDirect3DDevice8, GetVertexShaderConstant),
+    D(IDirect3DDevice8, SetStreamSource),
+    D(IDirect3DDevice8, GetStreamSource),
+    D(IDirect3DDevice8, SetIndices),
+    D(IDirect3DDevice8, GetIndices),
+    D(IDirect3DDevice8, CreatePixelShader),
+    D(IDirect3DDevice8, SetPixelShader),
+    D(IDirect3DDevice8, GetPixelShader),
+    D(IDirect3DDevice8, DeletePixelShader),
+    D(IDirect3DDevice8, SetPixelShaderConstant),
+
+    RESOURCE(IDirect3DTexture8),
+    U(IDirect3DTexture8, SetLOD, Texture_SetLOD),
+    U(IDirect3DTexture8, GetLOD, Texture_GetLOD),
+    U(IDirect3DTexture8, GetLevelCount, Texture_GetLevelCount),
+    U(IDirect3DTexture8, GetLevelDesc, Texture_GetLevelDesc),
+    U(IDirect3DTexture8, GetSurfaceLevel, Texture_GetSurfaceLevel),
+    U(IDirect3DTexture8, LockRect, Texture_LockRect),
+    U(IDirect3DTexture8, UnlockRect, Texture_UnlockRect),
+    U(IDirect3DTexture8, AddDirtyRect, Texture_AddDirtyRect),
+
+    RESOURCE(IDirect3DCubeTexture8),
+    U(IDirect3DCubeTexture8, SetLOD, Texture_SetLOD),
+    U(IDirect3DCubeTexture8, GetLOD, Texture_GetLOD),
+    U(IDirect3DCubeTexture8, GetLevelCount, Texture_GetLevelCount),
+    U(IDirect3DCubeTexture8, GetLevelDesc, Cube_GetLevelDesc),
+    U(IDirect3DCubeTexture8, GetCubeMapSurface, Cube_GetCubeMapSurface),
+    U(IDirect3DCubeTexture8, LockRect, Cube_LockRect),
+    U(IDirect3DCubeTexture8, UnlockRect, Cube_UnlockRect),
+    U(IDirect3DCubeTexture8, AddDirtyRect, Cube_AddDirtyRect),
+
+    RESOURCE(IDirect3DVertexBuffer8),
+    U(IDirect3DVertexBuffer8, Lock, Buffer_Lock),
+    U(IDirect3DVertexBuffer8, Unlock, Buffer_Unlock),
+    U(IDirect3DVertexBuffer8, GetDesc, VertexBuffer_GetDesc),
+
+    RESOURCE(IDirect3DIndexBuffer8),
+    U(IDirect3DIndexBuffer8, Lock, Buffer_Lock),
+    U(IDirect3DIndexBuffer8, Unlock, Buffer_Unlock),
+    U(IDirect3DIndexBuffer8, GetDesc, IndexBuffer_GetDesc),
+
+    UNKNOWN(IDirect3DSurface8),
+    U(IDirect3DSurface8, GetDevice, Resource_GetDevice),
+    U(IDirect3DSurface8, GetContainer, Surface_GetContainer),
+    U(IDirect3DSurface8, GetDesc, Surface_GetDesc),
+    U(IDirect3DSurface8, LockRect, Surface_LockRect),
+    U(IDirect3DSurface8, UnlockRect, Surface_UnlockRect),
+    { NULL, NULL, NULL },
+};
+
+/* vtable order: the D3D8 ABI (d3d8proxy.cpp's tables) */
+#define RESOURCE8_NAMES "QueryInterface", "AddRef", "Release", "GetDevice", "SetPrivateData", "GetPrivateData", \
+    "FreePrivateData", "SetPriority", "GetPriority", "PreLoad", "GetType"
+static const char* const kD3D8[] = { "QueryInterface", "AddRef", "Release", "RegisterSoftwareDevice", "GetAdapterCount",
+    "GetAdapterIdentifier", "GetAdapterModeCount", "EnumAdapterModes", "GetAdapterDisplayMode", "CheckDeviceType",
+    "CheckDeviceFormat", "CheckDeviceMultiSampleType", "CheckDepthStencilMatch", "GetDeviceCaps", "GetAdapterMonitor",
+    "CreateDevice", NULL };
+static const char* const kDevice[] = { "QueryInterface", "AddRef", "Release", "TestCooperativeLevel",
+    "GetAvailableTextureMem", "ResourceManagerDiscardBytes", "GetDirect3D", "GetDeviceCaps", "GetDisplayMode",
+    "GetCreationParameters", "SetCursorProperties", "SetCursorPosition", "ShowCursor", "CreateAdditionalSwapChain",
+    "Reset", "Present", "GetBackBuffer", "GetRasterStatus", "SetGammaRamp", "GetGammaRamp", "CreateTexture",
+    "CreateVolumeTexture", "CreateCubeTexture", "CreateVertexBuffer", "CreateIndexBuffer", "CreateRenderTarget",
+    "CreateDepthStencilSurface", "CreateImageSurface", "CopyRects", "UpdateTexture", "GetFrontBuffer",
+    "SetRenderTarget", "GetRenderTarget", "GetDepthStencilSurface", "BeginScene", "EndScene", "Clear", "SetTransform",
+    "GetTransform", "MultiplyTransform", "SetViewport", "GetViewport", "SetMaterial", "GetMaterial", "SetLight",
+    "GetLight", "LightEnable", "GetLightEnable", "SetClipPlane", "GetClipPlane", "SetRenderState", "GetRenderState",
+    "BeginStateBlock", "EndStateBlock", "ApplyStateBlock", "CaptureStateBlock", "DeleteStateBlock",
+    "CreateStateBlock", "SetClipStatus", "GetClipStatus", "GetTexture", "SetTexture", "GetTextureStageState",
+    "SetTextureStageState", "ValidateDevice", "GetInfo", "SetPaletteEntries", "GetPaletteEntries",
+    "SetCurrentTexturePalette", "GetCurrentTexturePalette", "DrawPrimitive", "DrawIndexedPrimitive",
+    "DrawPrimitiveUP", "DrawIndexedPrimitiveUP", "ProcessVertices", "CreateVertexShader", "SetVertexShader",
+    "GetVertexShader", "DeleteVertexShader", "SetVertexShaderConstant", "GetVertexShaderConstant",
+    "GetVertexShaderDeclaration", "GetVertexShaderFunction", "SetStreamSource", "GetStreamSource", "SetIndices",
+    "GetIndices", "CreatePixelShader", "SetPixelShader", "GetPixelShader", "DeletePixelShader",
+    "SetPixelShaderConstant", "GetPixelShaderConstant", "GetPixelShaderFunction", "DrawRectPatch", "DrawTriPatch",
+    "DeletePatch", NULL };
+static const char* const kTexture[] = { RESOURCE8_NAMES, "SetLOD", "GetLOD", "GetLevelCount", "GetLevelDesc",
+    "GetSurfaceLevel", "LockRect", "UnlockRect", "AddDirtyRect", NULL };
+static const char* const kCube[] = { RESOURCE8_NAMES, "SetLOD", "GetLOD", "GetLevelCount", "GetLevelDesc",
+    "GetCubeMapSurface", "LockRect", "UnlockRect", "AddDirtyRect", NULL };
+static const char* const kVB[] = { RESOURCE8_NAMES, "Lock", "Unlock", "GetDesc", NULL };
+static const char* const kIB[] = { RESOURCE8_NAMES, "Lock", "Unlock", "GetDesc", NULL };
+static const char* const kSurface[] = { "QueryInterface", "AddRef", "Release", "GetDevice", "SetPrivateData",
+    "GetPrivateData", "FreePrivateData", "GetContainer", "GetDesc", "LockRect", "UnlockRect", NULL };
+
+static uint32_t make_vtbl(const char* iface, const char* const* names)
+{
+    uint32_t n = 0;
+    while (names[n])
+        n++;
+    uint32_t v = gheap_alloc(4 * n, 1);
+    char full[96];
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        snprintf(full, sizeof full, "%s::%s", iface, names[i]);
+        wr32(v + 4 * i, thunk_for("d3d8.dll", full));
+    }
+    return v;
+}
+
+void d3d8_init(void)
+{
+    thunk_register(D3D8);
+}
+
+/* the vtables are guest memory: built once the guest heap is up (from the host, before GameStart) */
+void d3d8_setup(void)
+{
+    g_vtbl[O_D3D] = make_vtbl("IDirect3D8", kD3D8);
+    g_vtbl[O_DEVICE] = make_vtbl("IDirect3DDevice8", kDevice);
+    g_vtbl[O_TEXTURE] = make_vtbl("IDirect3DTexture8", kTexture);
+    g_vtbl[O_CUBE] = make_vtbl("IDirect3DCubeTexture8", kCube);
+    g_vtbl[O_VB] = make_vtbl("IDirect3DVertexBuffer8", kVB);
+    g_vtbl[O_IB] = make_vtbl("IDirect3DIndexBuffer8", kIB);
+    g_vtbl[O_SURFACE] = make_vtbl("IDirect3DSurface8", kSurface);
+}
