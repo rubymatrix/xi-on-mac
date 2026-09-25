@@ -21,7 +21,10 @@ import capstone
 import pefile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UNPACKED = os.path.normpath(os.path.join(ROOT, '..', 'ffxi-re', 'unpacked'))
+# unpacked retail DLLs (polcore.dll for slot names): local only, never committed
+UNPACKED = next((d for d in (os.path.join(ROOT, 'generated'),
+                             os.path.normpath(os.path.join(ROOT, '..', 'ffxi-re', 'unpacked')))
+                 if os.path.exists(os.path.join(d, 'polcore.unpacked.dll'))), os.path.join(ROOT, 'generated'))
 POLCORE_TABLE = (0x1006fbe8, 0x10071448)  # static VA range in the unpacked polcore.dll
 
 

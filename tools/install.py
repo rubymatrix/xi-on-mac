@@ -19,7 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'recomp'))
 from recomp import retail_dll  # noqa: E402
 
-META = os.path.normpath(os.path.join(ROOT, '..', 'ffxi-re', 'recomp', 'FFXiMain.2026-08-22.meta.json'))
+META = os.path.join(ROOT, 'meta', 'FFXiMain.2026-08-22.meta.json')
 RETAIL_COPY = os.path.join(ROOT, 'generated', 'FFXiMain.retail.dll')
 STAND_IN = os.path.join(ROOT, 'build', 'host', 'FFXiMain.dll')
 MARKER = b'FFXIRecompile'  # appears in every stand-in build (its dialog title)

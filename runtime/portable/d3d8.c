@@ -14,8 +14,7 @@
  *     bound resources hold, the stream/index reset after the ...UP draws.
  *
  * Nothing is drawn yet: Present, Clear and the Draw* calls are where the Metal back end goes.
- * The method set is the one the game was measured to use (reverse-engineering/recomp/
- * FFXiMain.2026-08-22.d3d8-surface.txt); vtable order is the D3D8 ABI, as the R1 proxy
+ * The method set is the one the game was measured to use (specs/FFXiMain.2026-08-22.d3d8-surface.txt); vtable order is the D3D8 ABI, as the R1 proxy
  * (d3d8proxy.cpp) lists it. */
 #include <stdio.h>
 #include <stdlib.h>

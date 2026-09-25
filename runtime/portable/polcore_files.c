@@ -1,4 +1,5 @@
-/* Our own polcore, paths / files / registry group (R3): the slots specified in reverse-engineering/recomp/polcore-slots.files.txt, all cdecl (RETC).
+/* Our own polcore, paths / files / registry group (R3): the slots specified in
+ * specs/polcore-slots.files.txt, all cdecl (RETC).
  *
  * PlayOnline's file cipher (used by patch.ver, option.bin, ContentsData and the dictionaries) is
  * implemented both ways; the decryption and its inverse were first checked in Python against the
@@ -168,7 +169,7 @@ static int recover_found(uint64_t k0, void* p)
     return 1;
 }
 
-/* Known-plaintext key recovery (reverse-engineering/recomp/polcore-slots.files.txt, slot 1171):
+/* Known-plaintext key recovery (specs/polcore-slots.files.txt, slot 1171):
  * the first two plaintext blocks of patch.ver are zero, so block 0 fixes K[0] up to its byte sum
  * S0 (tried in turn) and block 1, under K[1] = 5 K[0], confirms it. No registry needed; the same
  * key the registry path derives, for every retail title. */

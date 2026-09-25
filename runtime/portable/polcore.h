@@ -1,8 +1,7 @@
 /* Our own polcore (R3, decided 2026-09-24): what
  * PlayOnline's polcore.dll gives FFXi.dll and FFXiMain.dll, implemented natively.
  *
- * Two surfaces (reverse-engineering/recomp/
- * FFXI.polcore-surface.txt):
+ * Two surfaces (specs/FFXI.polcore-surface.txt):
  *   - the IPOLCoreCom object FFXi.dll's GameStart receives. FFXi.dll calls six methods; the
  *     object answers only the US interface id, so FFXi.dll records region 1, as a retail
  *     US client does;
@@ -11,7 +10,7 @@
  *     so a slot with no implementation traps with its offset on first call.
  *
  * The slot implementations (polcore_slots.c) follow the per-slot specifications in
- * reverse-engineering/recomp/polcore-slots.*.txt. */
+ * specs/polcore-slots.*.txt. */
 #pragma once
 
 #include <stdint.h>

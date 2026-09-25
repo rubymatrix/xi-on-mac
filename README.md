@@ -20,13 +20,16 @@ layer.
 
 ## Inputs
 
-| input | where it lives today |
-| --- | --- |
-| per-build metadata `ffxi-recomp-meta/1` | `reverse-engineering/recomp/FFXiMain.2026-08-22.meta.json` |
-| static POL1 unpacker | `reverse-engineering/recomp/pol1_unpack.py` |
-| CRT surface, thread map, D3D8 surface | `reverse-engineering/recomp/FFXiMain.2026-08-22.*.txt` |
+Everything the build reads is in this repository.
 
-They move here once the pipeline consumes them, so there is one copy, not two.
+| input | here |
+| --- | --- |
+| per-build metadata `ffxi-recomp-meta/1` (addresses and shapes, no bytes) | `meta/FFXiMain.2026-08-22.meta.json`, `meta/FFXi.2026-08-22.meta.json` |
+| static POL1 unpacker | `tools/pol1_unpack.py` |
+| the specifications the runtime implements: polcore slots, the polcore and D3D8 surfaces | `specs/` |
+
+These were produced by the discovery pass; the copies here
+are the ones the build uses.
 
 ## Plan (from `client-native-arm64.md` §7)
 
@@ -61,8 +64,8 @@ build\host64.exe --game "<FINAL FANTASY XI>" --session <V> [--lobby a.b.c.d]
 
 ### macOS (arm64)
 
-Copy the Windows install's `SquareEnix` folder
-(`FINAL FANTASY XI` and `PlayOnlineViewer` side by side) to the Mac, e.g. `~/PlayOnline/SquareEnix`.
+Copy the Windows install's `SquareEnix` folder (`FINAL FANTASY XI` and `PlayOnlineViewer` side by
+side) to the Mac, e.g. `~/PlayOnline/SquareEnix`.
 The game sees it as `C:\PlayOnline\SquareEnix`.
 
 ```
@@ -87,7 +90,10 @@ runtime/portable/  R3, 64-bit hosts: plat.h (+ plat_win.c, plat_posix.c), gwin (
                    user32 + input + dinput + dsound (SDL3), d3d8 (the D3D8 front end), ws2 (sockets)
 host/              ffximain.c: the R2 stand-in FFXiMain.dll; host64.c: the R3 game host
 tests/             difftest.c (original vs translation), boot.c (x86), boot64.c (x64)
-tools/             prepare.py, build.py (MSVC), build_posix.py (clang), install.py, trace_report.py
+tools/             prepare.py, pol1_unpack.py, build.py (MSVC), build_posix.py (clang), install.py,
+                   trace_report.py
+meta/              per-build metadata the recompiler reads
+specs/             the specifications the runtime implements (polcore slots, D3D8 and polcore surfaces)
 generated/         (gitignored) unpacked image and recompiler output
 build/             (gitignored)
 ```

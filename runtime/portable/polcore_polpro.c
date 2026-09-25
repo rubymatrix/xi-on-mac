@@ -1,5 +1,6 @@
 /* Our own polcore, the polpro group (R3): polpro client, handle and character records, POL mail,
- * text, the Help Desk FAQ and misc slots. Each follows reverse-engineering/recomp/polcore-slots.polpro.txt; its section 3 is the summary this file
+ * text, the Help Desk FAQ and misc slots. Each follows
+ * specs/polcore-slots.polpro.txt; its section 3 is the summary this file
  * implements. All cdecl (RETC).
  *
  * The model, from that spec: the POL client features (friends, POL mail, FAQ, server-side settings)

@@ -108,9 +108,8 @@ def retail_dll():
 
 def image_constants(prog, image_path):
     """What the loader needs to rebuild .text from the retail DLL and check it is the right build."""
-    sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..',
-                                                     'ffxi-re', 'recomp')))
-    import pol1_unpack  # the static unpacker, consumed in place for now
+    sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools')))
+    import pol1_unpack  # the static POL1 unpacker (tools/pol1_unpack.py)
     pe = pefile.PE(image_path, fast_load=True)
     text = next(s for s in pe.sections if s.Name.rstrip(b'\0') == b'.text')
     pol1 = next(s for s in pe.sections if s.Name.rstrip(b'\0') == b'POL1')

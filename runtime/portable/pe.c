@@ -13,8 +13,8 @@ static uint32_t rd32b(const unsigned char* p) { uint32_t v; memcpy(&v, p, 4); re
 static uint16_t rd16b(const unsigned char* p) { uint16_t v; memcpy(&v, p, 2); return v; }
 
 /* POL1: a flag byte per 8 items, MSB first; 1 = literal byte, 0 = b0 b1 with offset
- * ((b0<<8)|b1)&0xfff and length (b0>>4)+3; offset 0 ends the stream.
- * reverse-engineering/recomp/pol1_unpack.py; the same decoder as runtime/win32/loader.c.) */
+ * ((b0<<8)|b1)&0xfff and length (b0>>4)+3; offset 0 ends the stream. (tools/pol1_unpack.py;
+ * the same decoder as runtime/win32/loader.c.) */
 static uint32_t pol1_decompress(const unsigned char* src, uint32_t src_len, unsigned char* dst, uint32_t dst_len)
 {
     uint32_t i = 0, o = 0;

@@ -27,7 +27,7 @@ static uint32_t g_base;
 static void lzss(const unsigned char* src, uint32_t src_len, unsigned char* dst, uint32_t dst_len, uint32_t* out_len)
 {
     /* Flag byte per 8 items, MSB first: 1 = literal, 0 = b0 b1 with offset ((b0<<8)|b1)&0xfff and
-     * length (b0>>4)+3; offset 0 ends the stream.  */
+     * length (b0>>4)+3; offset 0 ends the stream. (tools/pol1_unpack.py) */
     uint32_t i = 0, o = 0;
     while (i < src_len)
     {

@@ -16,8 +16,8 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RE_DIR = os.path.normpath(os.path.join(ROOT, '..', 'ffxi-re', 'recomp'))
-META = os.path.join(RE_DIR, 'FFXiMain.2026-08-22.meta.json')
+METADIR = os.path.join(ROOT, 'meta')  # per-build metadata (from the discovery pass)
+META = os.path.join(METADIR, 'FFXiMain.2026-08-22.meta.json')
 IMAGE = os.path.join(ROOT, 'generated', 'FFXiMain.unpacked.dll')
 RETAIL = os.path.join(ROOT, 'generated', 'FFXiMain.retail.dll')  # verified copy, written by prepare.py
 SLICE = ('0x10317480,0x10312980,0x10312090,0x10317270,0x10316dd0,0x103169e0,0x10315c20,0x10316840,'
@@ -113,8 +113,8 @@ def boot64(env):
     run(['build\\boot64.exe', RETAIL, game] + ([reg] if os.path.exists(reg) else []), env)
 
 
-FFXI_META = os.path.join(RE_DIR, 'FFXi.2026-08-22.meta.json')
-FFXI_IMAGE = os.path.normpath(os.path.join(RE_DIR, '..', 'unpacked', 'FFXi.unpacked.dll'))
+FFXI_META = os.path.join(METADIR, 'FFXi.2026-08-22.meta.json')
+FFXI_IMAGE = os.path.join(ROOT, 'generated', 'FFXi.unpacked.dll')  # written by tools/prepare.py
 GAME = r'C:\Program Files (x86)\PlayOnline\SquareEnix\FINAL FANTASY XI'
 SDL3 = r'C:\Dev\SDL3\SDL3-3.4.16'
 

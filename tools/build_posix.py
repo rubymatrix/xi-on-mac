@@ -8,9 +8,8 @@
 
 The same sources as tools/build.py's boot64/host64 targets, with plat_posix.c for plat_win.c.
 Needs: clang (Xcode command line tools), python3 with capstone and pefile, and for host64 SDL3
-(`brew install sdl3`, found through pkg-config). the research checkout must sit next to this repository,
-as on Windows. The game folder is the retail "FINAL FANTASY XI" folder copied from a Windows
-install, with "PlayOnlineViewer" next to it.
+(`brew install sdl3`, found through pkg-config). The game folder is the retail "FINAL FANTASY XI"
+folder copied from a Windows install, with "PlayOnlineViewer" next to it.
 """
 import argparse
 import concurrent.futures
@@ -24,7 +23,7 @@ sys.path.insert(0, HERE)
 import build  # noqa: E402  (constants and source lists; nothing Windows-only runs on import)
 
 ROOT = build.ROOT
-GEN_FFXI_IMAGE = os.path.join(ROOT, 'generated', 'FFXi.unpacked.dll')
+GEN_FFXI_IMAGE = build.FFXI_IMAGE
 CFLAGS = ['-O2', '-std=c11', '-g', '-DRT_GUEST_WINDOW', '-fno-strict-aliasing', '-I', 'runtime', '-I', 'runtime/portable']
 # the generated C: every label and local is emitted whether used or not
 GEN_WARNINGS = ['-Wno-unused-label', '-Wno-unused-variable', '-Wno-unused-but-set-variable', '-Wno-unused-function',
@@ -82,8 +81,7 @@ def generated(sub):
 
 
 def prepare(game):
-    run([sys.executable, 'tools/prepare.py', '--dll', os.path.join(game, 'FFXiMain.dll')])
-    run([sys.executable, os.path.join(build.RE_DIR, 'pol1_unpack.py'), os.path.join(game, 'FFXi.dll'), GEN_FFXI_IMAGE])
+    run([sys.executable, 'tools/prepare.py', '--dll', os.path.join(game, 'FFXiMain.dll')])  # and FFXi.dll
 
 
 def translate():

@@ -1,9 +1,9 @@
 """Produce generated/FFXiMain.unpacked.dll from the player's retail install.
 
 Finds FFXiMain.dll through the PlayOnline registry key (or --dll), checks its SHA-256 against the
-metadata's pinned build, and unpacks POL1 statically with pol1_unpack.py (consumed
-in place until the R1 artifacts migrate here). Output lands in generated/, which is gitignored:
-it is Square Enix code and never committed.
+metadata's pinned build, and unpacks POL1 statically with tools/pol1_unpack.py - FFXiMain.dll, and FFXi.dll
+from the same folder. Output lands in generated/, which is gitignored: it is Square Enix code
+and never committed.
 """
 import argparse
 import hashlib
@@ -14,7 +14,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-RE_DIR = os.path.normpath(os.path.join(ROOT, '..', 'ffxi-re', 'recomp'))
+META = os.path.join(ROOT, 'meta', 'FFXiMain.2026-08-22.meta.json')
 
 
 def retail_dll():
@@ -32,7 +32,7 @@ def retail_dll():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dll')
-    ap.add_argument('--meta', default=os.path.join(RE_DIR, 'FFXiMain.2026-08-22.meta.json'))
+    ap.add_argument('--meta', default=META)
     ap.add_argument('--out', default=os.path.join(ROOT, 'generated'))
     args = ap.parse_args()
 
@@ -47,7 +47,11 @@ def main():
     with open(dll, 'rb') as src, open(os.path.join(args.out, 'FFXiMain.retail.dll'), 'wb') as dst:
         dst.write(src.read())
     out = os.path.join(args.out, 'FFXiMain.unpacked.dll')
-    subprocess.check_call([sys.executable, os.path.join(RE_DIR, 'pol1_unpack.py'), dll, out])
+    unpack = os.path.join(HERE, 'pol1_unpack.py')
+    subprocess.check_call([sys.executable, unpack, dll, out])
+    ffxi = os.path.join(os.path.dirname(dll), 'FFXi.dll')
+    if os.path.exists(ffxi):
+        subprocess.check_call([sys.executable, unpack, ffxi, os.path.join(args.out, 'FFXi.unpacked.dll')])
     print('ok: %s (build %s)' % (out, meta['build']))
 
 
