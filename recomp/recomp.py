@@ -37,6 +37,110 @@ class Program:
         self.switches = {s['at']: s['targets'] for s in meta['switches'] if s['targets']}
         self.referenced = set()
         self.relocs = self.text_relocations(pe)
+        self.inner = self.add_data_entries(pe)
+        self.inner |= self.add_branch_entries()
+
+    def add_data_entries(self, pe):
+        """Code the image's data points at (vtables, callbacks, exception handlers) is called
+        indirectly, so each such address must be an entry. The metadata misses some: Ghidra folds a
+        small function into the one that tail-jumps to it (FFXiMain 2026-09-03: 0x100542e0, slot 0
+        of the vtable at 0x1032b69c, a range of 0x10054460), and leaves a few out altogether
+        (0x1019d090). A folded one becomes an entry with its host's ranges (the translation starts
+        at the entry, and every branch back into the host stays inside it); one outside every
+        range, when it decodes as code up to a ret. Returns the entries that sit inside another
+        function's body (the Windows loader must not put a 5-byte jmp there)."""
+        import bisect
+        import struct
+        pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_BASERELOC']])
+        text_lo, text_hi = self.meta['text']
+        spans = sorted((lo, hi, entry) for entry, ranges in self.functions.items() for lo, hi in ranges)
+        starts = [lo for lo, _, _ in spans]
+        inner = set()
+        for block in getattr(pe, 'DIRECTORY_ENTRY_BASERELOC', ()):
+            for e in block.entries:
+                if e.type != 3:  # IMAGE_REL_BASED_HIGHLOW
+                    continue
+                target = struct.unpack_from('<I', self.image, e.rva)[0]
+                if not text_lo <= target < text_hi or target in self.functions:
+                    continue
+                i = bisect.bisect_right(starts, target) - 1
+                if i >= 0 and spans[i][0] <= target < spans[i][1]:
+                    if not self.on_boundary(spans[i][2], target):
+                        continue  # inside one of the host's instructions: a table in .text, not code
+                    self.functions[target] = [list(r) for r in self.functions[spans[i][2]]]
+                    inner.add(target)
+                else:
+                    end = self.code_until_ret(target)
+                    if end:
+                        self.functions[target] = [[target, end]]
+        self.entries = set(self.functions)
+        return inner
+
+    def add_branch_entries(self):
+        """The same for direct branches: a call to an address that is not an entry, or a jump
+        into another function's body (FFXiMain 2026-09-03: 0x101f320f calls 0x101f0260, a range
+        of 0x1007ad70). Each target on one of the host's instruction boundaries becomes an entry,
+        so the branch is a call or tail call into its own translation; one inside an instruction
+        comes from data decoded as code (0x10069500 "jumps" into the operand of a call) and is left. Returns the
+        entries inside another function's body."""
+        import bisect
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)  # no detail: fast
+        text_lo, text_hi = self.meta['text']
+        spans = sorted((lo, hi, entry) for entry, ranges in self.functions.items() for lo, hi in ranges)
+        starts = [lo for lo, _, _ in spans]
+
+        def span_of(a):
+            i = bisect.bisect_right(starts, a) - 1
+            return spans[i] if i >= 0 and spans[i][0] <= a < spans[i][1] else None
+
+        targets = {}
+        for entry, ranges in list(self.functions.items()):
+            own = [(lo, hi) for lo, hi in ranges]
+            for lo, hi in ranges:
+                for addr, size, mn, op in md.disasm_lite(self.read(lo, hi - lo), lo):
+                    if mn != 'call' and not mn.startswith('j') and mn not in ('loop', 'loope', 'loopne'):
+                        continue
+                    if not op.startswith('0x'):
+                        continue
+                    t = int(op, 16)
+                    if t in self.functions or not text_lo <= t < text_hi:
+                        continue
+                    if mn == 'call' or not any(a <= t < b for a, b in own):
+                        targets.setdefault(t, mn == 'call')
+        inner = set()
+        for t, is_call in sorted(targets.items()):
+            s = span_of(t)
+            if s and s[2] != t and not self.on_boundary(s[2], t):
+                continue  # inside one of the host's instructions: the branch is data decoded as code
+            if s and s[2] != t:
+                self.functions[t] = [list(r) for r in self.functions[s[2]]]
+                inner.add(t)
+            elif not s and is_call:
+                end = self.code_until_ret(t)
+                if end:
+                    self.functions[t] = [[t, end]]
+        self.entries = set(self.functions)
+        return inner
+
+    def on_boundary(self, host, a):
+        """Whether a starts an instruction of host's ranges, decoded linearly."""
+        if not hasattr(self, '_boundaries'):
+            self._boundaries = {}
+            self._md_lite = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        if host not in self._boundaries:
+            self._boundaries[host] = {i[0] for lo, hi in self.functions[host]
+                                      for i in self._md_lite.disasm_lite(self.read(lo, hi - lo), lo)}
+        return a in self._boundaries[host]
+
+    def code_until_ret(self, va, limit=0x1000):
+        """The end of straight-line code from va to its first ret, or 0 if it does not look like
+        code (it runs out, or reads ports: data tables inside .text decode as in/ins)."""
+        for ins in self.md.disasm(self.read(va, limit), va):
+            if ins.mnemonic in ('in', 'out', 'insb', 'insd', 'outsb', 'outsd', 'hlt', 'cli', 'sti'):
+                return 0
+            if ins.mnemonic.startswith('ret'):
+                return ins.address + ins.size
+        return 0
 
     def text_relocations(self, pe):
         """Every location in .text that holds an absolute image address.
@@ -85,7 +189,7 @@ def patch_kinds(prog, entries):
     nxt = {a: b for a, b in zip(all_entries, all_entries[1:])}
     kinds = []
     for e in entries:
-        ok = nxt.get(e, e + 5) - e >= 5
+        ok = e not in prog.inner and nxt.get(e, e + 5) - e >= 5
         if ok:
             end = max(hi for lo, hi in prog.functions[e] if lo <= e < hi) if any(lo <= e < hi for lo, hi in prog.functions[e]) else e
             if end < e + 5:
