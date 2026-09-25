@@ -148,21 +148,6 @@ static void write_instance(uint32_t p, int kind, int pad)
     snprintf((char*)GUEST_PTR(p + 300), 260, "%s", name);
 }
 
-/* With XInput on (padmode000's sixth field), FFXiMain loads xinputdll.dll and then leaves out of its
- * DirectInput list every device Microsoft's IsXInputDevice check finds: it asks WMI
- * (CLSID_WbemLocator) for PnP devices whose ID has "IG_". There is no WMI here, the check found
- * nothing, and the Xbox controller came through DirectInput with the XInput button layout applied to
- * DirectInput's numbering. Every pad here is one SDL gamepad the XInput shims read as well, so once
- * the wrapper is loaded DirectInput lists none, as it lists no XInput pad on Windows. */
-static int g_pads_to_xinput;
-
-void dinput_xinput_loaded(void)
-{
-    if (!g_pads_to_xinput)
-        rt_log("[recomp] dinput: xinputdll.dll loaded; gamepads are XInput's, DirectInput lists none\n");
-    g_pads_to_xinput = 1;
-}
-
 /* EnumDevices(dwDevType, lpCallback, pvRef, dwFlags): DI8DEVCLASS_ALL 0, DEVICE 1, POINTER 2,
  * KEYBOARD 3, GAMECTRL 4, or a DI8DEVTYPE_* */
 static void DI_EnumDevices(Guest* g)
@@ -180,7 +165,7 @@ static void DI_EnumDevices(Guest* g)
             uint32_t a[2] = { inst, ref };
             stop = !guest_call(cb, 2, a);
         }
-    for (int i = 0; want[2] && !stop && !g_pads_to_xinput && i < input_pad_count(); ++i)
+    for (int i = 0; want[2] && !stop && i < input_pad_count(); ++i)
     {
         write_instance(inst, D_PAD, i);
         uint32_t a[2] = { inst, ref };
