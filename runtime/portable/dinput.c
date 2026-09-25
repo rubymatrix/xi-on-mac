@@ -141,7 +141,15 @@ static void write_instance(uint32_t p, int kind, int pad)
         name = name ? name : "Gamepad";
         type = 0x00010215; /* DI8DEVTYPE_GAMEPAD, standard, HID */
     }
-    memcpy(GUEST_PTR(p + 4), guid, 16);  /* guidInstance */
+    memcpy(GUEST_PTR(p + 4), guid, 16); /* guidInstance */
+    if (kind == D_PAD)
+    {
+        /* an Xbox 360 controller's product GUID: Data1 is MAKELONG(VID 045E, PID 028E), "PIDVID" after.
+         * With XInput on, the game's IsXInputDevice matches it to the gamepad ole.c's WMI lists, and
+         * reads the pad through XInput instead. */
+        static const uint8_t XBOX360[16] = GUIDB(0x028E045E, 0, 0, 0, 0, 0x50, 0x49, 0x44, 0x56, 0x49, 0x44);
+        memcpy(guid, XBOX360, 16);
+    }
     memcpy(GUEST_PTR(p + 20), guid, 16); /* guidProduct */
     wr32(p + 36, type);
     snprintf((char*)GUEST_PTR(p + 40), 260, "%s", name);
