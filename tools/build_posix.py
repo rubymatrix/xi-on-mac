@@ -10,7 +10,7 @@
   python3 tools/build_posix.py datuitest --game <folder>  the game's UI art read from its DATs (host/datui.c):
         parse checks, and renders in build/datui/ (tests/datui_test.c)
   python3 tools/build_posix.py app --game <folder> [--sign-in pol|lsb] [--server name] [--resolution WxH]
-        [--menu-resolution WxH] [--window-mode 0-3] [--background picture] [--sign-identity name]
+        [--menu-resolution WxH] [--window-mode 0-3] [--background picture] [--fullscreen-space 0|1] [--sign-identity name]
         build/Final Fantasy XI.app: host64 with its libraries, playonline.reg and the defaults above in
         its Info.plist (host/appdefaults.h), so it starts from Finder with no command line. The values
         go into the built app only: nothing names a server in the source.
@@ -272,6 +272,8 @@ def app(game, a):
         keys['FFXIMenuResolution'] = a.menu_resolution
     if a.window_mode is not None:
         keys['FFXIWindowMode'] = a.window_mode
+    if a.fullscreen_space is not None:
+        keys['FFXIFullscreenSpace'] = a.fullscreen_space
     if a.background:
         # the sign-in screen reads PNG, JPEG and BMP; anything else (WebP) becomes a PNG
         src, ext = os.path.expanduser(a.background), os.path.splitext(a.background)[1].lower()
@@ -386,6 +388,7 @@ def main():
     ap.add_argument('--window-mode', type=int, choices=[0, 1, 2, 3])
     ap.add_argument('--background')
     ap.add_argument('--sign-identity')
+    ap.add_argument('--fullscreen-space', type=int, choices=[0, 1])
     args = ap.parse_args()
     if args.target == 'gfxtest':
         return gfxtest()

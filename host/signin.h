@@ -31,6 +31,7 @@ typedef struct SigninSetup
     int default_w, default_h;        /* 0001 x 0002 */
     int default_menu_w, default_menu_h; /* 0037 x 0038 */
     const char* default_background;  /* a picture, when the player has none */
+    int default_space;               /* full screen in a macOS Space of its own: 1, 0, -1 for none */
 } SigninSetup;
 
 typedef struct SigninResult

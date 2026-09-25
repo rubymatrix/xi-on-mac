@@ -39,6 +39,7 @@ typedef struct Config
     char user[64];
     int remember;
     int theme;
+    int space; /* full screen in a macOS Space of its own (1) or in place (0) */
     uint16_t auth_port, data_port, view_port;
     char background[1024]; /* a picture behind the screen; "": background.png/.jpg beside signin.cfg */
 } Config;
@@ -72,6 +73,8 @@ static void config_load(const char* path, Config* c)
             c->remember = atoi(v) != 0;
         else if (!strcmp(line, "theme"))
             c->theme = atoi(v);
+        else if (!strcmp(line, "fullscreen_space"))
+            c->space = atoi(v) != 0;
         else if (!strcmp(line, "background"))
             SDL_strlcpy(c->background, v, sizeof c->background);
         else if (!strcmp(line, "auth_port"))
@@ -94,6 +97,7 @@ static void config_save(const char* path, const Config* c)
     }
     fprintf(f, "method=%s\nserver=%s\nuser=%s\nremember=%d\ntheme=%d\n", c->method == SIGNIN_POL ? "pol" : "lsb",
         c->server, c->user, c->remember, c->theme);
+    fprintf(f, "fullscreen_space=%d\n", c->space);
     if (c->background[0])
         fprintf(f, "background=%s\n", c->background);
     if (c->auth_port || c->data_port || c->view_port)
@@ -347,6 +351,7 @@ enum
     ID_SERVER,
     ID_REMEMBER,
     ID_THEME,
+    ID_SPACE,
     ID_BACK,
 };
 
@@ -483,6 +488,7 @@ static void build(Ui* u)
         add(u, W_TEXT, ID_SERVER, "Server", u->cfg.server, sizeof u->cfg.server);
         add(u, W_CHOICE, ID_REMEMBER, "Remember password", NULL, 0);
         add(u, W_CHOICE, ID_THEME, "Window theme", NULL, 0);
+        add(u, W_CHOICE, ID_SPACE, "Full screen", NULL, 0);
         add(u, W_BUTTON, ID_BACK, "Back", NULL, 0);
     }
     if (u->focus >= u->nw)
@@ -495,6 +501,8 @@ static const char* choice_text(const Ui* u, int id, char* buf, size_t n)
         return u->cfg.method == SIGNIN_POL ? "PlayOnline" : "LandSandBoat";
     if (id == ID_REMEMBER)
         return u->cfg.remember ? "Yes" : "No";
+    if (id == ID_SPACE)
+        return u->cfg.space ? "Own desktop" : "In place";
     snprintf(buf, n, "%d", u->cfg.theme);
     return buf;
 }
@@ -568,6 +576,12 @@ static void cycle(Ui* u, int id, int dir)
     }
     else if (id == ID_REMEMBER)
         u->cfg.remember = !u->cfg.remember;
+    else if (id == ID_SPACE)
+    {
+        u->cfg.space = !u->cfg.space;
+        /* SDL reads it when it starts */
+        set_status(u, "Full screen changes the next time the game starts.", 0);
+    }
     else if (id == ID_THEME)
     {
         u->cfg.theme = (u->cfg.theme - 1 + dir + 8) % 8 + 1;
@@ -629,7 +643,7 @@ static void draw(Ui* u, int w, int h)
     {
         /* The PC title (lobbywin sprite 1): Amano's warriors over the logo, centred above the
          * window, as large as fits; its copyright line along the bottom. The window's top stays
-         * where the tallest screen (Settings: 4 rows) needs it, so the art does not move. */
+         * where the tallest screen (Settings: 5 rows) needs it, so the art does not move. */
         const DatSprite* t = &u->lobbywin.sprites[1];
         const DatPart* art = NULL;
         DatPart words[8];
@@ -642,7 +656,7 @@ static void draw(Ui* u, int w, int h)
                 else if (line.nparts < 8)
                     words[line.nparts++] = t->parts[i];
             }
-        float tallest = (60 + 30 + 58) * s + 4 * row;
+        float tallest = (60 + 30 + 58) * s + 5 * row;
         wx = (w - ww) * 0.5f, wy = h - 50 * s - tallest;
         float room_w = w - 80 * s, room_h = wy - 24 * s, k = room_w / art->uw;
         if (art->uh * k > room_h)
@@ -854,15 +868,6 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
     if (!u)
         return -1;
     u->host_game = setup->host_game;
-    /* full screen in place, as on Windows: not a macOS Space sliding in (user32 says the same) */
-    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS))
-    {
-        fprintf(stderr, "[signin] SDL_Init: %s\n", SDL_GetError());
-        free(u);
-        return -1;
-    }
-
     /* where it keeps its files */
     char dir[1024], cfg_path[1100];
     if (setup->data_dir)
@@ -880,6 +885,7 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
 
     Config* c = &u->cfg;
     c->method = setup->default_method ? setup->default_method : SIGNIN_LSB, c->remember = 1, c->theme = 1;
+    c->space = setup->default_space >= 0 ? setup->default_space != 0 : 1;
     SDL_strlcpy(c->server, setup->default_server ? setup->default_server : "127.0.0.1", sizeof c->server);
     config_load(cfg_path, c);
     if (setup->method)
@@ -894,6 +900,16 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
         c->data_port = setup->data_port;
     if (setup->view_port)
         c->view_port = setup->view_port;
+    /* Full screen in a Space of its own (the Mac's way: it slides in, and Ctrl+arrows or a swipe
+     * move between it and the other desktops) or in place over the desktop. SDL reads this when it
+     * starts, for the whole run: the game's window (user32) keeps it. */
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, c->space ? "1" : "0");
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS))
+    {
+        fprintf(stderr, "[signin] SDL_Init: %s\n", SDL_GetError());
+        free(u);
+        return -1;
+    }
     int read_keychain = 0;
     if (setup->password)
         SDL_strlcpy(u->password, setup->password, sizeof u->password);
@@ -912,8 +928,10 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
     int ww = (int)settings_dword(out->settings_reg, "0001", 1280), wh = (int)settings_dword(out->settings_reg, "0002", 720);
     if (ww < 640 || wh < 480)
         ww = 1280, wh = 720;
-    SDL_Window* win = SDL_CreateWindow("FINAL FANTASY XI", ww, wh, mode >= 2 ? SDL_WINDOW_BORDERLESS : 0);
-    if (win && (mode == 0 || mode == 3))
+    int full = mode == 0 || mode == 3;
+    /* a macOS Space is only for a window with a frame (full screen hides it) */
+    SDL_Window* win = SDL_CreateWindow("FINAL FANTASY XI", ww, wh, mode >= 2 && !(full && c->space) ? SDL_WINDOW_BORDERLESS : 0);
+    if (win && full)
     {
         SDL_SetWindowFullscreenMode(win, NULL);
         SDL_SetWindowFullscreen(win, true);

@@ -9,6 +9,7 @@
  *   FFXIResolution       "3440x1440": the game's first-run window
  *   FFXIMenuResolution   "1720x720": its menus
  *   FFXIBackground       a picture in the bundle's Resources, behind the sign-in screen
+ *   FFXIFullscreenSpace  1: full screen in a macOS Space of its own; 0: in place
  *
  * They are defaults: what the player saved (signin.cfg, settings.reg) and the command line win.
  * Elsewhere, and outside a bundle, there are none. */

@@ -396,7 +396,9 @@ int main(int argc, char** argv)
                            lsb.password, lsb.otp, lsb.auth_port != 54231 ? lsb.auth_port : 0,
                            lsb.data_port != 54230 ? lsb.data_port : 0, lsb.view_port != 54001 ? lsb.view_port : 0 };
         /* an app bundle's first-run defaults (appdefaults.h) */
-        su.default_mode = -1;
+        su.default_mode = -1, su.default_space = -1;
+        if (app_default("FFXIFullscreenSpace", app_val, sizeof app_val))
+            su.default_space = atoi(app_val) != 0;
         if (app_default("FFXISignInMethod", app_val, sizeof app_val))
             su.default_method = !strcmp(app_val, "pol") ? SIGNIN_POL : SIGNIN_LSB;
         if (app_default("FFXIServer", app_server, sizeof app_server))

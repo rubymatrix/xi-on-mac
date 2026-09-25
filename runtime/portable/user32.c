@@ -125,8 +125,10 @@ static void sdl_up(void)
 {
     if (g_sdl_up)
         return;
-    /* full screen in place, as on Windows: not a macOS Space sliding in */
-    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+    /* full screen in place, as on Windows, unless the sign-in screen chose a macOS Space already
+     * (it starts SDL first, with the player's choice) */
+    if (!SDL_GetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES))
+        SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD))
         rt_log("[recomp] SDL_Init: %s\n", SDL_GetError());
     g_sdl_up = 1;
@@ -536,12 +538,14 @@ static void apply_frame(Wnd* w)
     if (!w->sdl)
         return;
     int popup = (w->style & 0x80000000u) && (w->style & 0x00C00000u) != 0x00C00000u; /* WS_POPUP, no WS_CAPTION */
-    SDL_SetWindowBordered(w->sdl, !popup);
     uint32_t dw, dh, hz;
     user32_desktop_mode(&dw, &dh, &hz);
-    int cover = popup && (uint32_t)w->w >= dw && (uint32_t)w->h >= dh;
+    int cover = popup && (uint32_t)w->w >= dw && (uint32_t)w->h >= dh, full = cover || w->fullscreen;
+    /* a macOS Space is only for a window with a frame: full screen hides it anyway */
+    int spaces = SDL_GetHintBoolean(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, false);
+    SDL_SetWindowBordered(w->sdl, !popup || (full && spaces));
     SDL_SetWindowFullscreenMode(w->sdl, NULL);
-    SDL_SetWindowFullscreen(w->sdl, cover || w->fullscreen);
+    SDL_SetWindowFullscreen(w->sdl, full);
 #endif
 }
 
