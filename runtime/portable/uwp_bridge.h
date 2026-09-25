@@ -40,6 +40,10 @@ void uwp_set_audio_sink(UwpAudioSink sink);
 typedef void (*UwpRumble)(uint16_t low, uint16_t high);
 void uwp_set_rumble(UwpRumble rumble);
 
+/* The Direct3D 12 back end's swap chain (an IDXGISwapChain1, made for composition), to show in the
+ * app's SwapChainPanel. Called once, from the game's thread; returns when the panel has it. */
+void uwp_attach_swapchain(void* dxgi_swap_chain1);
+
 /* The LandSandBoat sign-in's TLS (host/lsb_login.c): one request, one reply, the server's
  * certificate not checked (private servers' are self-signed). SChannel is not available to UWP
  * apps; the app implements this over Windows.Networking.Sockets. 1, or 0 with a message. */

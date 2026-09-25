@@ -27,6 +27,9 @@
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <SDL3/SDL.h>
+#if defined(FFXI_UWP)
+#include "uwp_bridge.h"
+#endif
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2193,6 +2196,39 @@ static int make_device(void)
     return 1;
 }
 
+#if defined(FFXI_UWP)
+/* UWP: no window handle; the swap chain is for composition, and the app shows it in a SwapChainPanel */
+static void make_swap_chain(SDL_Window* win)
+{
+    int pw = 0, ph = 0;
+    SDL_GetWindowSizeInPixels(win, &pw, &ph);
+    DXGI_SWAP_CHAIN_DESC1 sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Width = pw > 0 ? (UINT)pw : 640, sd.Height = ph > 0 ? (UINT)ph : 480;
+    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = FRAMES;
+    sd.Scaling = DXGI_SCALING_STRETCH;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    g_tearing = 0; /* composition swap chains cannot tear */
+    IDXGISwapChain1* sc1 = NULL;
+    HRESULT hr = IDXGIFactory4_CreateSwapChainForComposition(g_factory, (IUnknown*)g_queue, &sd, NULL, &sc1);
+    if (FAILED(hr))
+    {
+        fprintf(stderr, "[recomp] gfx: swap chain failed (%08lx)\n", (unsigned long)hr);
+        return;
+    }
+    uwp_attach_swapchain(sc1);
+    IDXGISwapChain1_QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&g_swap);
+    IDXGISwapChain1_Release(sc1);
+    g_swap_w = sd.Width, g_swap_h = sd.Height;
+    for (int i = 0; i < FRAMES; ++i)
+        g_swap_rtv[i] = -1;
+    swap_acquire();
+}
+#else
 static void make_swap_chain(SDL_Window* win)
 {
     HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(win), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
@@ -2237,6 +2273,7 @@ static void make_swap_chain(SDL_Window* win)
         g_swap_rtv[i] = -1;
     swap_acquire();
 }
+#endif
 
 int gfx_init(void* window, int vsync)
 {

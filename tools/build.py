@@ -10,7 +10,7 @@
   python tools/build.py host64-headless
                                    the same host with no graphics (gfx_null.c), for measuring the
                                    game's CPU time alone: build/host64-headless.exe
-  python tools/build.py uwp-lib    the same, as a library for the UWP app (FFXIXbox): build/uwp/ffxi_uwp.lib
+  python tools/build.py uwp-lib    host64 as a library for the UWP app (FFXIXbox): build/uwp/ffxi_uwp.lib
   python tools/build.py gfxtest    the Direct3D 12 back end and the D3D8 front end, offscreen, without
                                    the game (tests/gfx_test.c, tests/d3d8_test.c); needs no prepare
   python tools/build.py launcher   the launcher (launcher/, Tauri): the PlayOnline tests,
@@ -229,14 +229,14 @@ UWP_CFLAGS = [f for f in CFLAGS64 if f != '/MT'] + ['/MD', '/DFFXI_UWP']
 
 
 def uwp_lib(env):
-    """build/uwp/ffxi_uwp.lib: host64 with no graphics (gfx_null.c) for the UWP app."""
+    """build/uwp/ffxi_uwp.lib: host64 for the UWP app, drawing with Direct3D 12 into its SwapChainPanel."""
     gen = ['generated\\all\\' + f for f in sorted(os.listdir(os.path.join(ROOT, 'generated', 'all'))) if f.endswith('.c')]
     gen_ffxi = ['generated\\ffxi\\' + f for f in sorted(os.listdir(os.path.join(ROOT, 'generated', 'ffxi'))) if f.endswith('.c')]
     game_objects(env)  # translates, if the translation is stale
     objs = compile_stale(env, gen, 'build\\uwp\\all', ['/I', 'generated\\all'], UWP_CFLAGS)
     objs += compile_stale(env, gen_ffxi, 'build\\uwp\\ffxi', ['/I', 'generated\\ffxi'], UWP_CFLAGS)
     sdl_inc = ['/I', os.path.join(SDL3, 'include')]
-    objs += compile_stale(env, PORTABLE + HOST_BASE + ['runtime\\portable\\gfx_null.c', 'runtime\\portable\\sdl_uwp.c'],
+    objs += compile_stale(env, PORTABLE + HOST_SOURCES + ['runtime\\portable\\sdl_uwp.c'],
                           'build\\uwp\\host', sdl_inc + ['/Dmain=host_main'], UWP_CFLAGS)
     run(['lib', '/nologo', '/OUT:build\\uwp\\ffxi_uwp.lib'] + objs, env)
     print('built build\\uwp\\ffxi_uwp.lib')
