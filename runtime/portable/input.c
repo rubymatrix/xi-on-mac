@@ -292,6 +292,46 @@ const char* input_pad_name(int index)
     return p ? SDL_GetGamepadName(p) : NULL;
 }
 
+static int16_t flip(int16_t v) { return v == -32768 ? 32767 : (int16_t)-v; }
+
+int input_xpad(int index, XPad* x)
+{
+    SDL_Gamepad* p = pad(index);
+    memset(x, 0, sizeof *x);
+    if (!p)
+        return 0;
+    static const struct
+    {
+        SDL_GamepadButton b;
+        uint16_t bit;
+    } MAP[] = {
+        { SDL_GAMEPAD_BUTTON_DPAD_UP, 0x0001 },      { SDL_GAMEPAD_BUTTON_DPAD_DOWN, 0x0002 },
+        { SDL_GAMEPAD_BUTTON_DPAD_LEFT, 0x0004 },    { SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 0x0008 },
+        { SDL_GAMEPAD_BUTTON_START, 0x0010 },        { SDL_GAMEPAD_BUTTON_BACK, 0x0020 },
+        { SDL_GAMEPAD_BUTTON_LEFT_STICK, 0x0040 },   { SDL_GAMEPAD_BUTTON_RIGHT_STICK, 0x0080 },
+        { SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0x0100 }, { SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 0x0200 },
+        { SDL_GAMEPAD_BUTTON_SOUTH, 0x1000 },        { SDL_GAMEPAD_BUTTON_EAST, 0x2000 },
+        { SDL_GAMEPAD_BUTTON_WEST, 0x4000 },         { SDL_GAMEPAD_BUTTON_NORTH, 0x8000 },
+    };
+    for (size_t i = 0; i < sizeof MAP / sizeof MAP[0]; ++i)
+        if (SDL_GetGamepadButton(p, MAP[i].b))
+            x->buttons |= MAP[i].bit;
+    x->lt = (uint8_t)(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) >> 7);
+    x->rt = (uint8_t)(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) >> 7);
+    x->lx = SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFTX);
+    x->ly = flip(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFTY)); /* SDL: down is positive */
+    x->rx = SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHTX);
+    x->ry = flip(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHTY));
+    return 1;
+}
+
+void input_rumble(int index, uint16_t low, uint16_t high)
+{
+    SDL_Gamepad* p = pad(index);
+    if (p)
+        SDL_RumbleGamepad(p, low, high, (low || high) ? 0xFFFFFFFFu : 0);
+}
+
 int input_pad_state(int index, PadState* s)
 {
     SDL_Gamepad* p = pad(index);

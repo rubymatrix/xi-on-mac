@@ -42,6 +42,19 @@ typedef struct PadState
     uint8_t buttons[12];     /* A B X Y LB RB Back Start LS RS Guide - */
 } PadState;
 
+/* The same gamepad as XInput reports it (XINPUT_GAMEPAD): buttons, triggers 0..255, sticks with
+ * Y up. 0 if there is no such pad. */
+typedef struct XPad
+{
+    uint16_t buttons;
+    uint8_t lt, rt;
+    int16_t lx, ly, rx, ry;
+} XPad;
+
+int input_xpad(int index, XPad* out);
+/* Rumble: motor speeds 0..65535 (XINPUT_VIBRATION), until the next call. */
+void input_rumble(int index, uint16_t low, uint16_t high);
+
 int input_pad_count(void);
 int input_pad_state(int index, PadState* out);
 const char* input_pad_name(int index);

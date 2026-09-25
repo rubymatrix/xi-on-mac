@@ -43,6 +43,8 @@ static const char* const KNOWN_DLLS[] = {
     /* DirectX 8.1's NAT helper: FFXiMain only checks that it loads (0x100160b0), as its
      * "DirectX 8.1 is installed" test, and quits without it */
     "dpnhpast.dll",
+    /* the game folder's XInput wrapper; its exports are dinput.c's XInput shims */
+    "xinputdll.dll",
     NULL,
 };
 

@@ -95,7 +95,7 @@ typedef struct Dev
 
 #define MAX_DEVS 16
 static Dev g_devs[MAX_DEVS];
-static uint32_t g_di, g_vtbl_di, g_vtbl_dev;
+static uint32_t g_di, g_vtbl_di, g_vtbl_dev, g_vtbl_eff, g_effect;
 static int32_t g_di_refs;
 
 static Dev* dev(uint32_t p)
@@ -675,6 +675,56 @@ static void sh_DirectInput8Create(Guest* g)
     RET(DI_OK, 5);
 }
 
+/* --- force feedback --------------------------------------------------------------------------------------
+ * FFXiMain creates one effect on the gamepad (and ignores whether that worked, keeping whatever
+ * pointer comes back). Effects here are accepted and do nothing: the pad's rumble goes through
+ * XInput (XI_SetState). One shared effect object serves every CreateEffect. */
+/* CreateEffect(rguid, lpeff, ppdeff, punkOuter) */
+static void DD_CreateEffect(Guest* g)
+{
+    if (!g_effect)
+    {
+        g_effect = gheap_alloc(8, 1);
+        wr32(g_effect, g_vtbl_eff);
+    }
+    if (ARG(3))
+        wr32(ARG(3), g_effect);
+    RET(DI_OK, 5);
+}
+
+/* EnumEffects(lpCallback, pvRef, dwEffType): no effects to list */
+static void DD_EnumEffects(Guest* g) { RET(DI_OK, 4); }
+static void DD_GetEffectInfo(Guest* g) { RET(DIERR_DEVICENOTREG, 3); }
+/* GetForceFeedbackState(pdwOut): nothing playing */
+static void DD_GetForceFeedbackState(Guest* g)
+{
+    if (ARG(1))
+        wr32(ARG(1), 0);
+    RET(DI_OK, 2);
+}
+static void DD_SendForceFeedbackCommand(Guest* g) { RET(DI_OK, 2); }
+static void DD_EnumCreatedEffectObjects(Guest* g) { RET(DI_OK, 4); }
+
+static void EF_QueryInterface(Guest* g)
+{
+    if (ARG(2))
+        wr32(ARG(2), 0);
+    RET(DIERR_NOINTERFACE, 3);
+}
+static void EF_AddRef(Guest* g) { RET(1, 1); }
+static void EF_Release(Guest* g) { RET(0, 1); }
+static void EF_Ok1(Guest* g) { RET(DI_OK, 1); }  /* Stop, Download, Unload */
+static void EF_Ok2(Guest* g) { RET(DI_OK, 2); }  /* GetEffectGuid, Escape */
+static void EF_Ok3(Guest* g) { RET(DI_OK, 3); }  /* GetParameters, SetParameters, Start */
+static void EF_Ok4(Guest* g) { RET(DI_OK, 4); }  /* Initialize */
+/* GetEffectStatus(pdwFlags): not playing */
+static void EF_GetEffectStatus(Guest* g)
+{
+    if (ARG(1))
+        wr32(ARG(1), 0);
+    RET(DI_OK, 2);
+}
+
 #define S(i, m, f) { "dinput8.dll", i "::" m, f }
 static const ShimDef DINPUT[] = {
     { "dinput8.dll", "DirectInput8Create", sh_DirectInput8Create },
@@ -702,6 +752,25 @@ static const ShimDef DINPUT[] = {
     S("IDirectInputDevice8A", "SetCooperativeLevel", DD_SetCooperativeLevel),
     S("IDirectInputDevice8A", "GetDeviceInfo", DD_GetDeviceInfo),
     S("IDirectInputDevice8A", "Poll", DD_Poll),
+    S("IDirectInputDevice8A", "CreateEffect", DD_CreateEffect),
+    S("IDirectInputDevice8A", "EnumEffects", DD_EnumEffects),
+    S("IDirectInputDevice8A", "GetEffectInfo", DD_GetEffectInfo),
+    S("IDirectInputDevice8A", "GetForceFeedbackState", DD_GetForceFeedbackState),
+    S("IDirectInputDevice8A", "SendForceFeedbackCommand", DD_SendForceFeedbackCommand),
+    S("IDirectInputDevice8A", "EnumCreatedEffectObjects", DD_EnumCreatedEffectObjects),
+    S("IDirectInputEffect", "QueryInterface", EF_QueryInterface),
+    S("IDirectInputEffect", "AddRef", EF_AddRef),
+    S("IDirectInputEffect", "Release", EF_Release),
+    S("IDirectInputEffect", "Initialize", EF_Ok4),
+    S("IDirectInputEffect", "GetEffectGuid", EF_Ok2),
+    S("IDirectInputEffect", "GetParameters", EF_Ok3),
+    S("IDirectInputEffect", "SetParameters", EF_Ok3),
+    S("IDirectInputEffect", "Start", EF_Ok3),
+    S("IDirectInputEffect", "Stop", EF_Ok1),
+    S("IDirectInputEffect", "GetEffectStatus", EF_GetEffectStatus),
+    S("IDirectInputEffect", "Download", EF_Ok1),
+    S("IDirectInputEffect", "Unload", EF_Ok1),
+    S("IDirectInputEffect", "Escape", EF_Ok2),
     { NULL, NULL, NULL },
 };
 
@@ -714,6 +783,8 @@ static const char* const kDev8[] = { "QueryInterface", "AddRef", "Release", "Get
     "CreateEffect", "EnumEffects", "GetEffectInfo", "GetForceFeedbackState", "SendForceFeedbackCommand",
     "EnumCreatedEffectObjects", "Escape", "Poll", "SendDeviceData", "EnumEffectsInFile", "WriteEffectToFile",
     "BuildActionMap", "SetActionMap", "GetImageInfo", NULL };
+static const char* const kEff[] = { "QueryInterface", "AddRef", "Release", "Initialize", "GetEffectGuid", "GetParameters",
+    "SetParameters", "Start", "Stop", "GetEffectStatus", "Download", "Unload", "Escape", NULL };
 
 static uint32_t make_vtbl(const char* iface, const char* const* names)
 {
@@ -730,13 +801,87 @@ static uint32_t make_vtbl(const char* iface, const char* const* names)
     return v;
 }
 
+/* --- XInput: the game folder's xinputdll.dll -----------------------------------------------------------
+ * FFXiMain loads xinputdll.dll from its own folder (a Square Enix wrapper over XInput 1.3) and uses
+ * its three exports when the pad is set to XInput; it keeps retrying the load while it fails, and
+ * reads no gamepad meanwhile. KERNEL32's LoadLibraryA hands out a module for it (k32.c
+ * KNOWN_DLLS) whose exports are these. All three are cdecl, as the wrapper declares them. */
+#define ERROR_DEVICE_NOT_CONNECTED 1167u
+
+static uint32_t g_xpacket[4];
+static XPad g_xlast[4];
+static int g_xseen[4] = { -1, -1, -1, -1 }; /* connected at the last poll: -1 never polled */
+static int g_xinput_seen[4];
+
+/* XInputGetState_(dwUserIndex, XINPUT_STATE* pState) */
+static void XI_GetState(Guest* g)
+{
+    uint32_t user = ARG(0), out = ARG(1);
+    XPad x;
+    int connected = user < 4 && input_xpad((int)user, &x);
+    if (user < 4 && connected != g_xseen[user])
+    {
+        rt_log("[recomp] xinput: pad %u %s\n", user,
+            g_xseen[user] < 0 ? (connected ? "polled, connected" : "polled, nothing connected") : connected ? "connected" : "disconnected");
+        g_xseen[user] = connected;
+    }
+    if (connected && !g_xinput_seen[user] && (x.buttons || x.lt > 32 || x.rt > 32 || x.lx > 8000 || x.lx < -8000 || x.ly > 8000 ||
+                                                 x.ly < -8000 || x.rx > 8000 || x.rx < -8000 || x.ry > 8000 || x.ry < -8000))
+    {
+        g_xinput_seen[user] = 1;
+        rt_log("[recomp] xinput: pad %u first input (buttons %04x)\n", user, x.buttons);
+    }
+    if (!connected)
+    {
+        if (out)
+            memset(GUEST_PTR(out), 0, 16);
+        RETC(ERROR_DEVICE_NOT_CONNECTED);
+    }
+    if (memcmp(&x, &g_xlast[user], sizeof x))
+        g_xlast[user] = x, g_xpacket[user]++;
+    /* XINPUT_STATE: dwPacketNumber, then XINPUT_GAMEPAD {wButtons, bLeftTrigger, bRightTrigger,
+     * sThumbLX, sThumbLY, sThumbRX, sThumbRY} */
+    wr32(out, g_xpacket[user]);
+    wr16(out + 4, x.buttons);
+    wr8(out + 6, x.lt);
+    wr8(out + 7, x.rt);
+    wr16(out + 8, (uint16_t)x.lx);
+    wr16(out + 10, (uint16_t)x.ly);
+    wr16(out + 12, (uint16_t)x.rx);
+    wr16(out + 14, (uint16_t)x.ry);
+    RETC(0);
+}
+
+/* XInputSetState_(dwUserIndex, XINPUT_VIBRATION* {wLeftMotorSpeed, wRightMotorSpeed}) */
+static void XI_SetState(Guest* g)
+{
+    uint32_t user = ARG(0), v = ARG(1);
+    if (user >= 4 || user >= (uint32_t)input_pad_count())
+        RETC(ERROR_DEVICE_NOT_CONNECTED);
+    if (v)
+        input_rumble((int)user, rd16(v), rd16(v + 2));
+    RETC(0);
+}
+
+/* XInputEnable_(BOOL): the wrapper returns 1 */
+static void XI_Enable(Guest* g) { RETC(1); }
+
+static const ShimDef XINPUT[] = {
+    { "xinputdll.dll", "XInputGetState_", XI_GetState },
+    { "xinputdll.dll", "XInputSetState_", XI_SetState },
+    { "xinputdll.dll", "XInputEnable_", XI_Enable },
+    { NULL, NULL, NULL },
+};
+
 void dinput_init(void)
 {
     thunk_register(DINPUT);
+    thunk_register(XINPUT);
 }
 
 void dinput_setup(void)
 {
     g_vtbl_di = make_vtbl("IDirectInput8A", kDI8);
     g_vtbl_dev = make_vtbl("IDirectInputDevice8A", kDev8);
+    g_vtbl_eff = make_vtbl("IDirectInputEffect", kEff);
 }
