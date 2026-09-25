@@ -133,10 +133,11 @@ RT_INLINE double fpop(Guest* g)
 }
 
 /* Precision control: PC=00 (24-bit) rounds every result to single precision. */
-RT_INLINE double fr(Guest* g, double x)
+RT_INLINE double fr_cw(unsigned cw, double x)
 {
-    return ((g->fcw >> 8) & 3u) == 0 ? (double)(float)x : x;
+    return ((cw >> 8) & 3u) == 0 ? (double)(float)x : x;
 }
+RT_INLINE double fr(Guest* g, double x) { return fr_cw(g->fcw, x); }
 
 /* FCOM/FUCOM/FTST/FICOM: C3 C2 C0 = 000 greater, 001 less, 100 equal, 111 unordered. */
 RT_INLINE void fcom(Guest* g, double a, double b)
@@ -148,15 +149,16 @@ RT_INLINE void fcom(Guest* g, double a, double b)
     g->c1 = 0;
 }
 
-RT_INLINE uint16_t fstsw(Guest* g)
+RT_INLINE uint16_t fstsw_top(Guest* g, unsigned top)
 {
-    return (uint16_t)((g->c3 << 14) | ((g->top & 7u) << 11) | (g->c2 << 10) | (g->c1 << 9) | (g->c0 << 8));
+    return (uint16_t)((g->c3 << 14) | ((top & 7u) << 11) | (g->c2 << 10) | (g->c1 << 9) | (g->c0 << 8));
 }
+RT_INLINE uint16_t fstsw(Guest* g) { return fstsw_top(g, g->top); }
 
 /* Round per the control word's RC field (00 nearest-even, 01 down, 10 up, 11 truncate). */
-RT_INLINE double frnd(Guest* g, double x)
+RT_INLINE double frnd_cw(unsigned cw, double x)
 {
-    switch ((g->fcw >> 10) & 3u)
+    switch ((cw >> 10) & 3u)
     {
     case 0: return nearbyint(x); /* host default rounding mode is nearest-even */
     case 1: return floor(x);
@@ -164,23 +166,63 @@ RT_INLINE double frnd(Guest* g, double x)
     default: return trunc(x);
     }
 }
+RT_INLINE double frnd(Guest* g, double x) { return frnd_cw(g->fcw, x); }
 
 /* FIST/FISTP: out of range or NaN stores the "integer indefinite" value. */
-RT_INLINE int16_t fist16(Guest* g, double x)
+RT_INLINE int16_t fist16_cw(unsigned cw, double x)
 {
-    double r = frnd(g, x);
+    double r = frnd_cw(cw, x);
     return (r != r || r < -32768.0 || r > 32767.0) ? (int16_t)0x8000 : (int16_t)r;
 }
-RT_INLINE int32_t fist32(Guest* g, double x)
+RT_INLINE int32_t fist32_cw(unsigned cw, double x)
 {
-    double r = frnd(g, x);
+    double r = frnd_cw(cw, x);
     return (r != r || r < -2147483648.0 || r > 2147483647.0) ? (int32_t)0x80000000u : (int32_t)r;
 }
-RT_INLINE int64_t fist64(Guest* g, double x)
+RT_INLINE int64_t fist64_cw(unsigned cw, double x)
 {
-    double r = frnd(g, x);
+    double r = frnd_cw(cw, x);
     return (r != r || r < -9223372036854775808.0 || r >= 9223372036854775808.0) ? (int64_t)0x8000000000000000ull : (int64_t)r;
 }
+RT_INLINE int16_t fist16(Guest* g, double x) { return fist16_cw(g->fcw, x); }
+RT_INLINE int32_t fist32(Guest* g, double x) { return fist32_cw(g->fcw, x); }
+RT_INLINE int64_t fist64(Guest* g, double x) { return fist64_cw(g->fcw, x); }
+
+/* --- x87 in locals: what the recompiler emits for functions with x87 code (recomp/x86c.py) ------
+ * g->st[(g->top + i) & 7] as the stack cannot stay in registers: every guest store goes through a
+ * byte pointer that may alias g, so each ST(i) is a reload and an index computation. In these
+ * functions ST(i) is the local x87_s<i> instead, always ST(0) first. A push or pop renames them
+ * (the compiler's copy propagation makes the rotation free), and a pop moves the old ST(0) to
+ * ST(7), as the physical register stack does, so the state written back is exact. g has it at
+ * every REGS_STORE and REGS_LOAD, and around the few instructions that take all of it. */
+#define X87_DECL                                                                                 \
+    double x87_s0, x87_s1, x87_s2, x87_s3, x87_s4, x87_s5, x87_s6, x87_s7, x87_t;                \
+    unsigned x87_top, x87_cw;                                                                    \
+    (void)x87_t
+#define X87_LOAD                                                                                 \
+    x87_top = g->top & 7u; x87_cw = g->fcw;                                                      \
+    x87_s0 = g->st[x87_top]; x87_s1 = g->st[(x87_top + 1) & 7u];                                 \
+    x87_s2 = g->st[(x87_top + 2) & 7u]; x87_s3 = g->st[(x87_top + 3) & 7u];                      \
+    x87_s4 = g->st[(x87_top + 4) & 7u]; x87_s5 = g->st[(x87_top + 5) & 7u];                      \
+    x87_s6 = g->st[(x87_top + 6) & 7u]; x87_s7 = g->st[(x87_top + 7) & 7u]
+#define X87_STORE                                                                                \
+    g->top = x87_top; g->fcw = (uint16_t)x87_cw;                                                 \
+    g->st[x87_top] = x87_s0; g->st[(x87_top + 1) & 7u] = x87_s1;                                 \
+    g->st[(x87_top + 2) & 7u] = x87_s2; g->st[(x87_top + 3) & 7u] = x87_s3;                      \
+    g->st[(x87_top + 4) & 7u] = x87_s4; g->st[(x87_top + 5) & 7u] = x87_s5;                      \
+    g->st[(x87_top + 6) & 7u] = x87_s6; g->st[(x87_top + 7) & 7u] = x87_s7
+#define X87_PUSH(v)                                                                              \
+    do                                                                                           \
+    {                                                                                            \
+        double x87_v_ = (v);                                                                     \
+        x87_s7 = x87_s6; x87_s6 = x87_s5; x87_s5 = x87_s4; x87_s4 = x87_s3;                      \
+        x87_s3 = x87_s2; x87_s2 = x87_s1; x87_s1 = x87_s0; x87_s0 = x87_v_;                      \
+        x87_top = (x87_top - 1) & 7u;                                                            \
+    } while (0)
+#define X87_POP()                                                                                \
+    (x87_t = x87_s0, x87_s0 = x87_s1, x87_s1 = x87_s2, x87_s2 = x87_s3, x87_s3 = x87_s4,         \
+        x87_s4 = x87_s5, x87_s5 = x87_s6, x87_s6 = x87_s7, x87_s7 = x87_t,                       \
+        x87_top = (x87_top + 1) & 7u, x87_t)
 
 /* FXAM: C3 C2 C0 = 001 NaN, 010 normal, 011 infinity, 100 zero, 110 denormal; C1 = sign. */
 RT_INLINE void fxam(Guest* g)

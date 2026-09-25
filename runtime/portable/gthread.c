@@ -46,9 +46,13 @@ int gt_holds(void)
     return t_held;
 }
 
+/* Called at every loop's back edge. The clock is read only every 32nd call while another thread
+ * waits: reading it at each was 8% of the game thread's time where the clock is slow (a virtual
+ * machine's QueryPerformanceCounter), and 32 back edges are far shorter than the quantum. */
 static void yield_if_due(void)
 {
-    if (!t_held || !rt_lock_contended || rt_monotonic_ns() - g_acquired_at < QUANTUM_NS)
+    static RT_TLS unsigned t_skip;
+    if (!t_held || !rt_lock_contended || (++t_skip & 31u) || rt_monotonic_ns() - g_acquired_at < QUANTUM_NS)
         return;
     gt_unlock();
     gt_lock();

@@ -14,6 +14,8 @@ Model (see runtime/guest.h):
 Anything not handled becomes RT_UNIMPL(addr, "text"), which traps at run time; the recompiler
 counts them so coverage can be measured over the whole binary.
 """
+import re
+
 import capstone
 from capstone import x86_const as X
 
@@ -35,6 +37,30 @@ class Unsupported(Exception):
     pass
 
 
+# Emitted x87 statements that take the whole x87 state from g (runtime/guest.h): in a function with
+# the stack in locals, g is brought up to date before them and read back after.
+X87_WHOLE = ('fenv_load(', 'fenv_store(', 'fsave(', 'frstor(', 'fxam(', 'g->top')
+
+
+def x87_locals(lines):
+    """A function's text with its x87 stack in locals (guest.h, "x87 in locals") instead of g->st."""
+    out = []
+    for line in lines:
+        code = line.lstrip()
+        if not code.startswith('/*') and any(k in code for k in X87_WHOLE):
+            out.append(line[:len(line) - len(code)] + 'X87_STORE; ' + code + ' X87_LOAD;')
+            continue
+        s = line.replace('REGS_DECL;', 'REGS_DECL; X87_DECL;').replace('REGS_LOAD;', 'REGS_LOAD; X87_LOAD;')
+        s = s.replace('REGS_STORE;', 'REGS_STORE; X87_STORE;')
+        s = re.sub(r'\bST\(([0-7])\)', r'x87_s\1', s)
+        s = s.replace('fpush(g, ', 'X87_PUSH(').replace('fpop(g)', 'X87_POP()').replace('fr(g, ', 'fr_cw(x87_cw, ')
+        for f in ('frnd', 'fist16', 'fist32', 'fist64'):
+            s = s.replace(f + '(g, ', f + '_cw(x87_cw, ')
+        s = s.replace('fstsw(g)', 'fstsw_top(g, x87_top)').replace('g->fcw', 'x87_cw')
+        out.append(s)
+    return out
+
+
 def mask(bits):
     return (1 << bits) - 1
 
@@ -52,6 +78,7 @@ class FunctionTranslator:
         self.unimpl = []          # (addr, text)
         self.insns = []
         self.labels = set()
+        self.uses_x87 = False     # then the function keeps the x87 stack in locals (x87_locals)
 
     # ------------------------------------------------------------------ decoding
 
@@ -265,7 +292,7 @@ class FunctionTranslator:
             else:
                 out.append(item)
         out.append('}')
-        return out
+        return x87_locals(out) if self.uses_x87 else out
 
     def one(self, ins):
         """Returns (C statements, falls_through)."""
@@ -282,6 +309,7 @@ class FunctionTranslator:
         # x87 by opcode
         opc = self.x87_opcode(ins)
         if opc is not None:
+            self.uses_x87 = True
             return self.x87(ins, opc), True
 
         if mn in ('nop', 'wait', 'fwait', 'pause'):
