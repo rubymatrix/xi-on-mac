@@ -39,7 +39,7 @@ def record(label, game):
 
 
 def current(required=True):
-    """{'build', 'game', 'ffximain_meta', 'ffxi_meta', 'ffximain_sha', 'ffxi_sha', 'addresses', 'crt'},
+    """{'build', 'game', 'ffximain_meta', 'ffxi_meta', 'ffximain_sha', 'ffxi_sha', 'addresses', 'hooks', 'crt'},
     or None if tools/prepare.py has not run and not required."""
     try:
         with open(CHOSEN) as f:
@@ -58,5 +58,6 @@ def current(required=True):
         'ffxi_sha': b['FFXi.dll']['sha256'],
         'version': b['version'],
         'addresses': b['addresses'],
+        'hooks': b.get('hooks', {}),
         'crt': b['crt'],
     }

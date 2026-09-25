@@ -47,6 +47,8 @@ def write_build_h():
              '#define FFXI_VERSION "%s" /* the version string patch.ver carries */' % BUILD['version']]
     for k, v in BUILD['addresses'].items():
         lines.append('#define FFXI_%s 0x%08xu' % (k.upper(), int(v, 16)))
+    for k, v in BUILD['hooks'].items():
+        lines.append('#define FFXI_HOOK_%s 0x%08xu /* rt_hook_%s runs here */' % (k.upper(), int(v, 16), k))
     for k, v in BUILD['crt'].items():
         a = int(v, 16)
         lines.append('#define CRT_%s 0x%08xu' % (k.upper(), a))
@@ -116,7 +118,9 @@ def compile_stale(env, sources, objdir, extra, cflags=CFLAGS):
 
 
 def recomp(out, extra):
-    run([sys.executable, 'recomp/recomp.py', '--meta', META, '--image', IMAGE, '--retail', RETAIL, '--out', out] + extra)
+    hooks = ','.join('%s=%s' % kv for kv in BUILD['hooks'].items())  # host hook points (recomp.py --hooks)
+    run([sys.executable, 'recomp/recomp.py', '--meta', META, '--image', IMAGE, '--retail', RETAIL, '--out', out]
+        + (['--hooks', hooks] if hooks else []) + extra)
 
 
 def difftest(env):

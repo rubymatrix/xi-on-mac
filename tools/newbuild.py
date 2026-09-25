@@ -324,7 +324,7 @@ def carry(old_label, new_label, write):
         return b
 
     main_old, main_new = Image(image(old_label, 'FFXiMain.dll')), Image(image(new_label, 'FFXiMain.dll'))
-    entry = {'FFXiMain.dll': {}, 'FFXi.dll': {}, 'version': None, 'addresses': {}, 'crt': {}}
+    entry = {'FFXiMain.dll': {}, 'FFXi.dll': {}, 'version': None, 'addresses': {}, 'hooks': {}, 'crt': {}}
     report.append('FFXiMain.dll addresses')
     for k, v in old_entry['addresses'].items():
         a = int(v, 16)
@@ -332,6 +332,12 @@ def carry(old_label, new_label, write):
         b, how = map_data(main_old, main_new, a) if not main_old.t0 <= a < main_old.t1 else map_code(main_old, main_new, a)
         put('address', k, a, b, how)
         entry['addresses'][k] = '0x%08x' % b if b else 'UNMAPPED from %s' % v
+    for k, v in old_entry.get('hooks', {}).items():  # host hook points: code sites
+        a = int(v, 16)
+        b, how = map_code(main_old, main_new, a)
+        put('hook', k, a, b, how)
+        if b:
+            entry['hooks'][k] = '0x%08x' % b
     report.append('FFXiMain.dll difftest CRT slice')
     for k, v in old_entry['crt'].items():
         a = int(v, 16)
@@ -382,7 +388,7 @@ def carry(old_label, new_label, write):
         json.dump(doc, f, indent=2)
         f.write('\n')
     write_verdicts(new_label, ts, new_verdicts, old_label,
-                   [line.strip() for line in report if 'UNMAPPED' in line and not line.lstrip().startswith(('address', 'crt'))])
+                   [line.strip() for line in report if 'UNMAPPED' in line and not line.lstrip().startswith(('address', 'hook', 'crt'))])
     print('\nwrote meta/builds.json (%s, version %s) and discovery/verdicts.py' % (new_label, entry['version']))
 
 

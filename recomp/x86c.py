@@ -237,6 +237,12 @@ class FunctionTranslator:
                 text = '%s %s' % (ins.mnemonic, ins.op_str)
                 self.unimpl.append((ins.address, ins.mnemonic, str(e)))
                 stmts, falls = ['RT_UNIMPL(%s, "%s");' % (hexu(ins.address), text.replace('"', "'"))], False
+            hook = self.ctx.hooks.get(ins.address)
+            if hook:
+                # A host hook point (recomp.py --hooks): the host sees and may change the guest's
+                # state here, before this instruction runs; unset, it costs one test.
+                self.ctx.hooked.add(ins.address)
+                body.append('    if (rt_hook_%s) { REGS_STORE; rt_hook_%s(g); REGS_LOAD; }' % (hook, hook))
             body.append('    /* %08x: %s %s */' % (ins.address, ins.mnemonic, ins.op_str))
             if stmts:  # each instruction in its own block, so its temporaries (A, t, ...) are local to it
                 body.append('    {')

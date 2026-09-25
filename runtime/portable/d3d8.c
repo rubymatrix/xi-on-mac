@@ -92,6 +92,12 @@ static const uint32_t CAPS8[53] = {
 static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static float u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 
+/* FFXI_DRAWLOG (see cap_present) */
+static const char* g_cap_path;
+static FILE* g_cap;
+static uint32_t g_cap_esp, g_cap_frame, g_cap_n;
+static void cap_present(void);
+
 /* --- formats ----------------------------------------------------------------------------------------- */
 static uint32_t fmt_block(uint32_t f) /* bytes per 4x4 block, or 0 */
 {
@@ -887,6 +893,7 @@ void d3d8_screen_size(uint32_t* w, uint32_t* h)
 
 static void IDirect3DDevice8_Present(Guest* g)
 {
+    cap_present();
     if (g_present_hook)
         g_present_hook();
     Obj* bb = obj(g_dev.backbuffer);
@@ -1437,6 +1444,7 @@ static void draw(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices
 /* DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount) */
 static void IDirect3DDevice8_DrawPrimitive(Guest* g)
 {
+    g_cap_esp = g->esp;
     draw(ARG(1), ARG(3), ARG(2), 0, 0, 0, 0);
     RET(D3D_OK, 4);
 }
@@ -1445,6 +1453,7 @@ static void IDirect3DDevice8_DrawPrimitive(Guest* g)
  * comes from the indices themselves, not minIndex and NumVertices */
 static void IDirect3DDevice8_DrawIndexedPrimitive(Guest* g)
 {
+    g_cap_esp = g->esp;
     Obj* ib = obj(g_dev.cur.ib);
     if (ib && ib->mem)
     {
@@ -1460,6 +1469,7 @@ static void IDirect3DDevice8_DrawIndexedPrimitive(Guest* g)
  * The ...UP draws leave stream 0 (and the indices) unset, as D3D8 does. */
 static void IDirect3DDevice8_DrawPrimitiveUP(Guest* g)
 {
+    g_cap_esp = g->esp;
     if (!(g_dev.cur.vs & 1) && (g_dev.cur.vs & 0xE) == 4 && ARG(3) && rd32(ARG(3) + 8) == 0x3f7ffffeu)
         g_probe_sky = 1; /* transformed vertices at the sky's depth */
     draw(ARG(1), ARG(2), 0, 0, 0, ARG(3), ARG(4));
@@ -1472,6 +1482,7 @@ static void IDirect3DDevice8_DrawPrimitiveUP(Guest* g)
  * IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride) */
 static void IDirect3DDevice8_DrawIndexedPrimitiveUP(Guest* g)
 {
+    g_cap_esp = g->esp;
     draw(ARG(1), ARG(4), 0, ARG(5), ARG(6) == FMT_INDEX32 ? 4 : 2, ARG(7), ARG(8));
     bind(&g_dev.cur.stream[0], 0);
     g_dev.cur.stride[0] = 0;
@@ -2144,6 +2155,91 @@ static void ui_squeeze(GfxDraw* d, uint32_t first, uint32_t n, uint32_t up_data,
     d->u.vp[0] = c - d->u.vp[2] * 0.5f;
 }
 
+/* FFXI_DRAWLOG=<path>: while <path>.go exists, the next frame's draws are written to <path> (then
+ * .go is removed): the game's return addresses on the guest stack, the texture, and the vertices'
+ * box. For finding which of the game's code draws what. */
+static void cap_present(void)
+{
+    static int init;
+    if (!init)
+        init = 1, g_cap_path = getenv("FFXI_DRAWLOG");
+    if (!g_cap_path)
+        return;
+    ++g_cap_frame;
+    if (g_cap)
+    {
+        fclose(g_cap), g_cap = NULL;
+        char go[1024];
+        snprintf(go, sizeof go, "%s.go", g_cap_path);
+        remove(go);
+        return;
+    }
+    if (g_cap_frame % 30)
+        return;
+    char go[1024];
+    snprintf(go, sizeof go, "%s.go", g_cap_path);
+    FILE* f = fopen(go, "rb");
+    if (!f)
+        return;
+    fclose(f);
+    g_cap = fopen(g_cap_path, "w");
+    g_cap_n = 0;
+    uint32_t w, h;
+    d3d8_screen_size(&w, &h);
+    if (g_cap)
+        fprintf(g_cap, "frame %u screen %ux%u backbuffer %ux%u image %08x-%08x\n", g_cap_frame, w, h, g_dev.pp[0],
+            g_dev.pp[1], rt_image_lo, rt_image_hi);
+}
+
+static void cap_draw(GfxDraw* d, uint32_t prim, uint32_t count, uint32_t first, uint32_t n, uint32_t up_data,
+    uint32_t up_stride)
+{
+    FILE* f = g_cap;
+    fprintf(f, "#%u prim %u count %u n %u vs %x rhw %d rt %s", g_cap_n++, prim, count, n, g_dev.cur.vs, d->vs.rhw,
+        g_dev.rt == g_dev.backbuffer ? "bb" : "off");
+    Obj* t = obj(g_dev.cur.tex[0]);
+    if (t)
+        fprintf(f, " tex %08x %ux%u fmt %u", g_dev.cur.tex[0], t->width, t->height, t->format);
+    fprintf(f, "\n  stack");
+    for (uint32_t a = g_cap_esp, k = 0; a < g_cap_esp + 0x600 && k < 12; a += 4)
+    {
+        uint32_t v = rd32(a);
+        if (v < rt_image_lo + 6 || v >= rt_image_hi)
+            continue;
+        if (rd8(v - 5) == 0xE8 || rd8(v - 6) == 0xFF || rd8(v - 3) == 0xFF || rd8(v - 2) == 0xFF)
+            fprintf(f, " %08x", v), ++k;
+    }
+    fprintf(f, "\n");
+    uint32_t base, stride, size;
+    if (up_data)
+        base = up_data, stride = up_stride, size = 0xFFFFFFFFu;
+    else
+    {
+        uint32_t st = d->vs.el[GFX_R_POSITION].stream;
+        Obj* b = obj(g_dev.cur.stream[st]);
+        if (!b || !b->mem)
+            return;
+        base = b->mem, stride = g_dev.cur.stride[st], size = b->size;
+    }
+    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        uint32_t at = (first + i) * stride + (uint32_t)d->u.offset[GFX_R_POSITION];
+        if (at > size - 12)
+            break;
+        for (int c = 0; c < 3; ++c)
+        {
+            float x = u2f(rd32(base + at + 4 * c));
+            lo[c] = x < lo[c] ? x : lo[c];
+            hi[c] = x > hi[c] ? x : hi[c];
+        }
+        if (i < 4)
+            fprintf(f, "  v%u %.2f %.2f %.4f\n", i, u2f(rd32(base + at)), u2f(rd32(base + at + 4)),
+                u2f(rd32(base + at + 8)));
+    }
+    fprintf(f, "  box %.2f..%.2f  %.2f..%.2f  %.4f..%.4f\n", lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+}
+
 static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices, uint32_t index_size,
     uint32_t up_data, uint32_t up_stride, uint32_t n);
 
@@ -2183,6 +2279,8 @@ static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t 
     }
     if (!set_streams(d, first, nverts, up_data, up_stride))
         return;
+    if (g_cap)
+        cap_draw(d, prim, count, first, nverts, up_data, up_stride);
     if (d->vs.rhw && g_dev.rt == g_dev.backbuffer)
         ui_squeeze(d, first, nverts, up_data, up_stride);
     d->prim = prim, d->count = count;

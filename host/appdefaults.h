@@ -10,6 +10,8 @@
  *   FFXIMenuResolution   "1720x720": its menus
  *   FFXIBackground       a picture in the bundle's Resources, behind the sign-in screen
  *   FFXIFullscreenSpace  1: full screen in a macOS Space of its own; 0: in place
+ *   FFXINameplates       "fix" or "off": names over heads keep their 4:3 shape, or widen with the window
+ *   FFXINameplateScale   "1.25", or "1x1.2" (across x down): the size of those names
  *
  * They are defaults: what the player saved (signin.cfg, settings.reg) and the command line win.
  * Elsewhere, and outside a bundle, there are none. */

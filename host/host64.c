@@ -27,6 +27,11 @@
  * --ui-aspect <w:h>: the interface keeps this shape (16:9, say) centered in a wider window, instead
  * of being stretched across it; the mouse is mapped to match. Off by default.
  *
+ * --nameplates fix|off: the names over characters' heads keep the shape they have in a 4:3 window
+ * (fix, the default) or widen with the window as the game draws them (off).
+ * --nameplate-scale <s>|<sx>x<sy>: their size, 1 as the game draws them (1.25; 1x1.2 for taller).
+ * An app bundle's FFXINameplates and FFXINameplateScale keys are the defaults for both.
+ *
  * Two ways in:
  *   - a server with PlayOnline behind it: the session value V its lobby checks
  *     (pol_accounts.session_value). --session gives it; else the sign-in screen gets it.
@@ -193,6 +198,63 @@ static double parse_shape(const char* s)
     return a / b;
 }
 
+/* --- nameplates ----------------------------------------------------------------------------------------
+ * FFXiMain draws the names over characters' heads (2026-09-03: 0x10086210, given a point in the
+ * world, the text and a size) as screen-space quads into the 3D scene's render target: every glyph
+ * corner is its offset from the projected point times [esp+0x4c] across and [esp+0x50] down. It
+ * sets those from the target's width and height, which the target's stretch to the window turns
+ * into the window's, so a name keeps the shape it was drawn for only in a 4:3 window and widens
+ * with the window (1.8 times at 3440x1440). The hook point (meta/builds.json "nameplate_scale")
+ * is just after both are set: the across factor is brought back to a 4:3 window's, and both take
+ * the size asked for. Text stays centred on the point, since offsets are from it. */
+#ifdef FFXI_HOOK_NAMEPLATE_SCALE
+extern GuestFn rt_hook_nameplate_scale;
+#endif
+static int g_nameplate_fix = 1;                     /* --nameplates: 1 the 4:3 shape, 0 as the game draws */
+static float g_nameplate_sx = 1.0f, g_nameplate_sy = 1.0f; /* --nameplate-scale */
+
+static void nameplate_scale(Guest* g)
+{
+    float kx = g_nameplate_sx, ky = g_nameplate_sy;
+    if (g_nameplate_fix)
+    {
+        uint32_t w = 0, h = 0;
+        d3d8_screen_size(&w, &h);
+        if (w && h)
+            kx *= (4.0f / 3.0f) * (float)h / (float)w;
+    }
+    wrf32(g->esp + 0x4c, rdf32(g->esp + 0x4c) * kx);
+    wrf32(g->esp + 0x50, rdf32(g->esp + 0x50) * ky);
+}
+
+static void setup_nameplates(void)
+{
+    int wanted = g_nameplate_fix || g_nameplate_sx != 1.0f || g_nameplate_sy != 1.0f;
+#ifdef FFXI_HOOK_NAMEPLATE_SCALE
+    if (wanted)
+        rt_hook_nameplate_scale = nameplate_scale;
+    rt_log("[recomp] nameplates: %s, scale %gx%g\n", g_nameplate_fix ? "4:3 shape" : "as the game draws them",
+        g_nameplate_sx, g_nameplate_sy);
+#else
+    (void)nameplate_scale;
+    if (wanted)
+        rt_log("[recomp] nameplates: build %s has no nameplate hook; they stay as the game draws them\n", FFXI_BUILD);
+#endif
+}
+
+/* s, or sx x sy (1.25, 1x1.2); 0 if it is neither */
+static int parse_scale(const char* s, float* sx, float* sy)
+{
+    char* end;
+    double a = strtod(s, &end), b = a;
+    if (*end == 'x' || *end == ':' || *end == ',')
+        b = strtod(end + 1, &end);
+    if (*end || !(a >= 0.25 && a <= 4) || !(b >= 0.25 && b <= 4))
+        return 0;
+    *sx = (float)a, *sy = (float)b;
+    return 1;
+}
+
 static int g_profile_shims;
 
 static void present_hook(void)
@@ -301,6 +363,7 @@ int main(int argc, char** argv)
     int have_session = 0;
     static char base_reg[1100];
     const char* server_name = NULL; /* --server as given, for the sign-in screen */
+    int nameplates_given = 0, nameplate_scale_given = 0;
     for (int i = 1; i + 1 < argc; i += 2)
     {
         if (!strcmp(argv[i], "--game"))
@@ -366,6 +429,25 @@ int main(int argc, char** argv)
             }
             user32_set_ui_aspect((float)(a / b));
         }
+        else if (!strcmp(argv[i], "--nameplates"))
+        {
+            if (strcmp(argv[i + 1], "fix") && strcmp(argv[i + 1], "off"))
+            {
+                fprintf(stderr, "--nameplates: fix (their 4:3 shape in any window) or off (as the game draws them)\n");
+                return 2;
+            }
+            g_nameplate_fix = !strcmp(argv[i + 1], "fix");
+            nameplates_given = 1;
+        }
+        else if (!strcmp(argv[i], "--nameplate-scale"))
+        {
+            if (!parse_scale(argv[i + 1], &g_nameplate_sx, &g_nameplate_sy))
+            {
+                fprintf(stderr, "--nameplate-scale: a size from 0.25 to 4 (1.25), or across x down (1x1.2)\n");
+                return 2;
+            }
+            nameplate_scale_given = 1;
+        }
         else if (!strcmp(argv[i], "--authport") || !strcmp(argv[i], "--dataport") || !strcmp(argv[i], "--viewport"))
         {
             long port = strtol(argv[i + 1], NULL, 10);
@@ -379,11 +461,16 @@ int main(int argc, char** argv)
     }
     if (!game && app_default("FFXIGameFolder", app_game, sizeof app_game))
         game = app_game;
+    if (!nameplates_given && app_default("FFXINameplates", app_val, sizeof app_val))
+        g_nameplate_fix = strcmp(app_val, "off") != 0;
+    if (!nameplate_scale_given && app_default("FFXINameplateScale", app_val, sizeof app_val)
+        && !parse_scale(app_val, &g_nameplate_sx, &g_nameplate_sy))
+        g_nameplate_sx = g_nameplate_sy = 1.0f;
     if (!game)
     {
         fprintf(stderr, "usage: host64 --game <FINAL FANTASY XI folder> [--reg f.reg]... [--reg-overlay f.reg] [--reg-final f.reg]... [--data-dir folder] "
                         "[--server name] [--session V | --user name [--pass p] [--otp code] [--authport n] "
-                        "[--dataport n] [--viewport n]] [--dats folder]...\n");
+                        "[--dataport n] [--viewport n]] [--dats folder]... [--nameplates fix|off] [--nameplate-scale s]\n");
         return 2;
     }
     if (!lsb.password)
@@ -590,6 +677,7 @@ int main(int argc, char** argv)
     polcore_init();
     d3d8_setup();
     d3d8_set_present_hook(present_hook);
+    setup_nameplates();
     if (getenv("FFXI_PROFILE") && getenv("FFXI_PROFILE")[0] && getenv("FFXI_PROFILE")[0] != '0')
         thunk_timer = gfx_prof_shim, g_profile_shims = 1; /* the profile splits the game's time into its code and our API calls */
     dsound_setup();
