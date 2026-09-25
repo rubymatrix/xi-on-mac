@@ -31,6 +31,13 @@ uint32_t thunk_for(const char* dll, const char* name);
 int thunk_dispatch(Guest* g, uint32_t target);
 /* "DLL!name" for a thunk address, or NULL. */
 const char* thunk_name(uint32_t addr);
+/* Profiling: called with the time of every outermost shim call (nested ones - a window procedure
+ * calling back into shims - are inside it), on the calling thread. NULL: not timed. */
+extern void (*thunk_timer)(uint64_t ns);
+/* ... and per shim, for this thread (the game's: host64 sets it at Present); thunk_prof_report
+ * logs the top shims by time since the last report. */
+extern uint32_t thunk_prof_thread;
+void thunk_prof_report(void);
 /* Logs every bound import that has no shim yet; returns how many. */
 unsigned thunk_report_missing(void);
 

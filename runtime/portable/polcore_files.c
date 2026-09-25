@@ -10,6 +10,7 @@
  * written back; the profanity filter off (LSB checks names server-side); no POL storage server
  * ("NO DATA"); English wording for the POL message lines. */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 

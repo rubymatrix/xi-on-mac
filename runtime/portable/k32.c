@@ -114,12 +114,27 @@ static void sh_GetModuleHandleA(Guest* g)
     RET(h, 1);
 }
 
+/* whether a missing library was reported already: the game retries some (xinputdll.dll) every
+ * few frames */
+static int reported_missing(const char* name)
+{
+    static char seen[16][260];
+    static unsigned n;
+    for (unsigned i = 0; i < n; ++i)
+        if (!strcmp(seen[i], name))
+            return 1;
+    if (n < 16)
+        snprintf(seen[n++], sizeof seen[0], "%s", name);
+    return 0;
+}
+
 static void sh_LoadLibraryA(Guest* g)
 {
     uint32_t h = module_handle(ARGS(0));
     if (!h)
     {
-        rt_log("[recomp] LoadLibraryA(%s): not available on this host\n", ARGS(0));
+        if (!reported_missing(ARGS(0)))
+            rt_log("[recomp] LoadLibraryA(%s): not available on this host (reported once)\n", ARGS(0));
         gt_set_error(ERROR_MOD_NOT_FOUND);
     }
     RET(h, 1);

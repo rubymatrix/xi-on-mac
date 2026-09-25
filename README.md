@@ -46,8 +46,13 @@ are the ones the build uses.
   unimplemented, in 195 functions (the runtime reports a CPU without them).
 - **R3.1** (started 2026-09-24): the same translation boots on a 64-bit host with the portable
   runtime (`BOOT64 OK`), and `host64` runs FFXi.dll → `GameStart` → FFXiMain to its title-screen
-  loop on Windows x64 with sound and input through SDL3 and our own polcore. Nothing is drawn
-  yet: the D3D8 front end is in, the Metal back end is next.
+  loop on Windows x64 with sound and input through SDL3 and our own polcore.
+- **R3.2** (started 2026-09-24): the Metal back end under the D3D8 front end (`gfx.h`,
+  `gfx_metal.m`): D3D8's fixed-function pipeline generated as MSL per state key, vs.1.1/ps.1.1
+  translated, textures and render targets on the GPU, clears, draws and Present to the SDL
+  window's CAMetalLayer. Verified offscreen without the game (`build_posix.py gfxtest`: pixel
+  checks of the back end, and of the D3D8 front end through its own COM thunks); not yet run
+  with the game. Windows x64 still draws nothing (`gfx_null.c`).
 
 
 ```
@@ -58,7 +63,7 @@ python tools\build.py boot64     # x64: the portable runtime + boot test (R3.1)
 python tools\install.py install  # put the stand-in in the game folder (restore: undo)
 python tools\trace_report.py <FFXiMain.trace.txt> [--seq <FFXiMain.seq.txt>]   # resolve a boundary trace
 python tools\build.py host64     # x64: the game host (SDL3 at C:\Dev\SDL3)
-build\host64.exe --game "<FINAL FANTASY XI>" --session <V> [--lobby a.b.c.d]
+build\host64.exe --game "<FINAL FANTASY XI>" --session <V> [--pol-server a.b.c.d]
     # FFXI_RECOMP_TRACE=1: every shim call;  FFXI_RECOMP_MISSING=1: imports without a shim
 ```
 
@@ -69,12 +74,20 @@ side) to the Mac, e.g. `~/PlayOnline/SquareEnix`.
 The game sees it as `C:\PlayOnline\SquareEnix`.
 
 ```
-brew install sdl3 pkg-config
+brew install sdl3 pkg-config mbedtls
 pip3 install capstone pefile
 python3 tools/build_posix.py prepare --game ~/PlayOnline/SquareEnix/"FINAL FANTASY XI"
 python3 tools/build_posix.py boot64  --game ~/PlayOnline/SquareEnix/"FINAL FANTASY XI"
 python3 tools/build_posix.py host64  --game ~/PlayOnline/SquareEnix/"FINAL FANTASY XI"
-build/host64 --game ~/PlayOnline/SquareEnix/"FINAL FANTASY XI" --session <V> --lobby <server IP>
+build/host64 --game ~/PlayOnline/SquareEnix/"FINAL FANTASY XI" --reg playonline.reg --reg-overlay build/overlay.reg \
+    --server <name or a.b.c.d> --session <V>                  # a server with PlayOnline behind it
+build/host64 --game ... --server <name> --user <account> [--otp <code>]   # a LandSandBoat server (xiloader's path)
+    # --server: where pol.com and *.pol.com resolve (the lobby included); default 127.0.0.1
+    # --user: the password comes from --pass, FFXI_PASSWORD, or a prompt; --authport/--dataport/--viewport
+    #         as xiloader (54231/54230/54001). Needs `brew install mbedtls`.
+python3 tools/build_posix.py gfxtest     # Metal back end + D3D8 front end, offscreen, no game needed
+build/gfx_test --window                  # the same, then two seconds of frames to a window
+    # MTL_DEBUG_LAYER=1: Metal API validation
 ```
 
 ## Layout
@@ -87,9 +100,12 @@ runtime/win32/     R2, 32-bit Windows: loader (retail DLL mapped by Windows, ent
 runtime/portable/  R3, 64-bit hosts: plat.h (+ plat_win.c, plat_posix.c), gwin (guest window,
                    pages, heap), gthread (threads, lock, guest_call), thunk (imports -> shims),
                    pe (image loader), k32*/kobj/vfs/reg/ole (Win32), polcore* (our own polcore),
-                   user32 + input + dinput + dsound (SDL3), d3d8 (the D3D8 front end), ws2 (sockets)
+                   user32 + input + dinput + dsound (SDL3), d3d8 (the D3D8 front end), ws2 (sockets),
+                   gfx.h (the graphics back end): gfx_metal.m (Metal) + gfx_msl*.c (D3D8 state and
+                   shaders -> MSL), gfx_null.c (elsewhere)
 host/              ffximain.c: the R2 stand-in FFXiMain.dll; host64.c: the R3 game host
-tests/             difftest.c (original vs translation), boot.c (x86), boot64.c (x64)
+tests/             difftest.c (original vs translation), boot.c (x86), boot64.c (x64),
+                   gfx_test.c (the Metal back end), d3d8_test.c (the D3D8 front end on it)
 tools/             prepare.py, pol1_unpack.py, build.py (MSVC), build_posix.py (clang), install.py,
                    trace_report.py
 meta/              per-build metadata the recompiler reads

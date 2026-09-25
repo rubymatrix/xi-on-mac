@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "plat.h"
 #include "thunk.h"
 
 #if defined(_MSC_VER)
@@ -16,6 +17,7 @@ typedef struct Thunk
 {
     char name[96]; /* DLL!name */
     Shim shim;
+    uint64_t prof_ns, prof_calls; /* the game thread's time in it since the last report */
 } Thunk;
 
 static Thunk* g_thunks;
@@ -53,6 +55,7 @@ uint32_t thunk_for(const char* dll, const char* name)
         g_thunks = (Thunk*)realloc(g_thunks, g_cap * sizeof *g_thunks);
     }
     Thunk* t = &g_thunks[g_count];
+    memset(t, 0, sizeof *t);
     strcpy(t->name, full);
     t->shim = find_shim(dll, name);
     return THUNK_BASE + g_count++ * THUNK_STRIDE;
@@ -69,6 +72,44 @@ const char* thunk_name(uint32_t addr)
 /* FFXI_RECOMP_TRACE=1: every shim call, with its call site, first four arguments and the result
  * (the portable counterpart of R2's boundary trace, runtime/win32/bridge.c). */
 static int g_trace = -1;
+
+void (*thunk_timer)(uint64_t ns);
+uint32_t thunk_prof_thread;
+static _Thread_local int t_depth;
+
+/* the shims the game thread spent the most time in since the last call, one line, then reset */
+void thunk_prof_report(void)
+{
+    unsigned top[8] = { 0 }, n = 0;
+    for (unsigned i = 0; i < g_count; ++i)
+    {
+        if (!g_thunks[i].prof_calls)
+            continue;
+        unsigned k = n < 8 ? n++ : 8;
+        while (k > 0 && g_thunks[top[k - 1]].prof_ns < g_thunks[i].prof_ns)
+        {
+            if (k < 8)
+                top[k] = top[k - 1];
+            k--;
+        }
+        if (k < 8)
+            top[k] = i;
+    }
+    if (!n)
+        return;
+    char line[1024];
+    int o = snprintf(line, sizeof line, "[gfx]   API time (2 s):");
+    for (unsigned k = 0; k < n && o < (int)sizeof line - 100; ++k)
+    {
+        const Thunk* t = &g_thunks[top[k]];
+        const char* nm = strchr(t->name, '!');
+        o += snprintf(line + o, sizeof line - (size_t)o, " %s %.0f ms/%llu", nm ? nm + 1 : t->name, (double)t->prof_ns * 1e-6,
+            (unsigned long long)t->prof_calls);
+    }
+    rt_log("%s\n", line);
+    for (unsigned i = 0; i < g_count; ++i)
+        g_thunks[i].prof_ns = g_thunks[i].prof_calls = 0;
+}
 
 int thunk_dispatch(Guest* g, uint32_t target)
 {
@@ -94,7 +135,24 @@ int thunk_dispatch(Guest* g, uint32_t target)
         rt_log("[trace] %08x %-44s (%08x %08x %08x %08x) = %08x\n", site, name, a0, a1, a2, a3, g->eax);
         return 1;
     }
+    if (thunk_timer && !t_depth)
+    {
+        uint64_t t0 = rt_monotonic_ns();
+        t_depth++;
+        s(g);
+        t_depth--;
+        uint64_t ns = rt_monotonic_ns() - t0;
+        thunk_timer(ns);
+        if (plat_thread_id() == thunk_prof_thread)
+        {
+            Thunk* t = &g_thunks[(target - THUNK_BASE) / THUNK_STRIDE];
+            t->prof_ns += ns, t->prof_calls++;
+        }
+        return 1;
+    }
+    t_depth++;
     s(g);
+    t_depth--;
     return 1;
 }
 

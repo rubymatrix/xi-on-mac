@@ -39,6 +39,13 @@ static void m_QueryInterface(Guest* g)
 static void m_AddRef(Guest* g) { RET(++g_refs, 1); }
 static void m_Release(Guest* g) { RET(g_refs > 1 ? --g_refs : 1, 1); } /* the object lives as long as the process */
 static void m_GethInstance(Guest* g) { wr32(ARG(1), EXE_HANDLE); RET(S_OK, 2); }
+static char g_cmdline_text[256];
+
+void polcore_set_cmdline(const char* text)
+{
+    snprintf(g_cmdline_text, sizeof g_cmdline_text, "%s", text);
+}
+
 static void m_GetlpCmdLine(Guest* g) { wr32(ARG(1), g_cmdline); RET(S_OK, 2); }
 static void m_GetCommonFunctionTable(Guest* g) { wr32(ARG(1), g_table); RET(S_OK, 2); }
 static void m_PolViewerExec(Guest* g) { RET(S_OK, 2); }
@@ -97,7 +104,7 @@ void polcore_init(void)
     int took = !gt_holds();
     if (took)
         gt_lock();
-    g_cmdline = gheap_strdup("");
+    g_cmdline = gheap_strdup(g_cmdline_text);
     /* the object: a vtable pointer and nothing else the guest reads */
     uint32_t vtbl = gheap_alloc(4 * 36, 1);
     for (unsigned i = 0; i < 36; ++i)

@@ -13,14 +13,25 @@
  *     GetViewport millions of times), state-block recording, capture and apply, the references
  *     bound resources hold, the stream/index reset after the ...UP draws.
  *
- * Nothing is drawn yet: Present, Clear and the Draw* calls are where the Metal back end goes.
+ * What is drawn goes to the graphics back end (gfx.h: Metal on macOS, R3.2): every texture and
+ * render target has a GfxTex beside its guest memory, and Clear, the Draw* calls and Present turn
+ * the device state into the back end's clears and draw packets (see "drawing" below).
+ *
+ * Which copy of a resource is current: for textures the game fills (the managed and system pools)
+ * the guest memory is, and a level is uploaded when it is next drawn with after a lock; for render
+ * targets and depth the GPU is, and a lock reads the level back (and an unlock writes it again).
+ * Vertex and index buffers stay in guest memory; each draw copies the range it uses.
+ *
  * The method set is the one the game was measured to use (specs/FFXiMain.2026-08-22.d3d8-surface.txt); vtable order is the D3D8 ABI, as the R1 proxy
  * (d3d8proxy.cpp) lists it. */
+#include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "d3d8.h"
+#include "gfx.h"
 #include "gthread.h"
 #include "gwin.h"
 #include "thunk.h"
@@ -79,6 +90,7 @@ static const uint32_t CAPS8[53] = {
 };
 
 static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static float u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 
 /* --- formats ----------------------------------------------------------------------------------------- */
 static uint32_t fmt_block(uint32_t f) /* bytes per 4x4 block, or 0 */
@@ -144,6 +156,12 @@ typedef struct Obj
     uint32_t* subs; /* textures: level surfaces (cubes: face * levels + level) */
     uint32_t nsubs;
     uint32_t lod, priority;
+    GfxTex* gpu;         /* textures, render targets, depth surfaces */
+    GfxBuf* gbuf;        /* static vertex and index buffers: the GPU's copy */
+    uint8_t gbuf_dirty;  /* ... which a lock that writes makes stale */
+    uint8_t face, level; /* surfaces of a texture: where in it */
+    uint8_t dirty;       /* surfaces of a texture: guest memory is newer than the GPU's copy */
+    uint8_t gpu_locked;  /* a GPU-owned surface is locked: written back at unlock */
 } Obj;
 
 static Obj* g_objs;
@@ -200,6 +218,8 @@ static void obj_destroy(Obj* o)
         }
     }
     free(o->subs);
+    gfx_tex_destroy(o->gpu);
+    gfx_buf_destroy(o->gbuf);
     if (o->mem)
         gheap_free(o->mem);
     uint32_t idx = rd32(o->guest + 4);
@@ -268,7 +288,59 @@ static uint32_t new_surface(uint32_t fmt, uint32_t w, uint32_t h, uint32_t usage
     s->pool = pool;
     s->size = fmt_size(fmt, w, h);
     s->container = container;
+    if (!container && (usage & (USAGE_RENDERTARGET | USAGE_DEPTHSTENCIL)))
+        s->gpu = gfx_tex_create(GFX_TEX_2D, fmt, w, h, 1, (usage & USAGE_DEPTHSTENCIL) ? GFX_USE_DEPTH : GFX_USE_RT);
     return p;
+}
+
+/* the GPU texture behind a surface, and which face and level of it */
+static GfxTex* surface_gpu(const Obj* s, uint32_t* face, uint32_t* level)
+{
+    if (s->container)
+    {
+        Obj* t = obj(s->container);
+        *face = s->face, *level = s->level;
+        return t ? t->gpu : NULL;
+    }
+    *face = *level = 0;
+    return s->gpu;
+}
+
+/* render targets and depth: the GPU holds the current pixels, not guest memory */
+static int gpu_owned(const Obj* s)
+{
+    uint32_t f, l;
+    return (s->usage & (USAGE_RENDERTARGET | USAGE_DEPTHSTENCIL)) && surface_gpu(s, &f, &l);
+}
+
+static void mark_dirty(Obj* s)
+{
+    s->dirty = 1;
+    Obj* t = s->container ? obj(s->container) : NULL;
+    if (t)
+        t->dirty = 1;
+}
+
+/* A texture about to be drawn with: levels written since their last upload go up first. */
+static GfxTex* texture_for_draw(uint32_t p, int* kind)
+{
+    Obj* t = obj(p);
+    if (!t || !t->gpu || (t->kind != O_TEXTURE && t->kind != O_CUBE))
+        return NULL;
+    if (t->dirty)
+    {
+        for (uint32_t i = 0; i < t->nsubs; ++i)
+        {
+            Obj* s = obj(t->subs[i]);
+            if (s && s->dirty && s->mem && !gpu_owned(s))
+                gfx_tex_upload(t->gpu, s->face, s->level, GUEST_PTR(s->mem), fmt_pitch(s->format, s->width));
+            if (s)
+                s->dirty = 0;
+        }
+        t->dirty = 0;
+    }
+    *kind = t->kind == O_CUBE ? 2 : 1;
+    return t->gpu;
 }
 
 /* --- device state ------------------------------------------------------------------------------------- */
@@ -313,12 +385,22 @@ typedef struct Block
     Mask m;
 } Block;
 
+/* where each input register comes from: an FVF's, or a vertex shader declaration's */
+typedef struct Layout
+{
+    GfxElem el[GFX_NREGS];
+    int32_t offset[GFX_NREGS];
+    uint8_t rhw;
+} Layout;
+
 typedef struct Shader
 {
     uint32_t* decl;
     uint32_t ndecl;
     uint32_t* func;
     uint32_t nfunc;
+    Layout lay;    /* vertex shaders */
+    uint32_t hash; /* of func: the back end's key */
 } Shader;
 
 typedef struct Dev
@@ -678,6 +760,9 @@ static void IDirect3D8_CreateDevice(Guest* g)
     }
     if (!d->pp[2])
         d->pp[2] = FMT_X8R8G8B8;
+    /* windowed devices ignore the presentation interval and wait for the display; so do we unless
+     * a full-screen device asks for IMMEDIATE */
+    gfx_init(user32_sdl_window(d->hwnd), d->pp[7] || d->pp[12] != 0x80000000u);
     obj_addref(d->d3d);
     d->guest = obj_new(O_DEVICE);
     d->backbuffer = new_surface(d->pp[2], d->pp[0], d->pp[1], USAGE_RENDERTARGET, 0, 0);
@@ -760,12 +845,16 @@ static void IDirect3DDevice8_Reset(Guest* g)
     bb->format = d->pp[2], bb->width = d->pp[0], bb->height = d->pp[1], bb->size = fmt_size(bb->format, bb->width, bb->height);
     if (bb->mem)
         gheap_free(bb->mem), bb->mem = 0;
+    gfx_tex_destroy(bb->gpu);
+    bb->gpu = gfx_tex_create(GFX_TEX_2D, bb->format, bb->width, bb->height, 1, GFX_USE_RT);
     Obj* z = obj(d->depth);
     if (z)
     {
         z->width = d->pp[0], z->height = d->pp[1], z->size = fmt_size(z->format, z->width, z->height);
         if (z->mem)
             gheap_free(z->mem), z->mem = 0;
+        gfx_tex_destroy(z->gpu);
+        z->gpu = gfx_tex_create(GFX_TEX_2D, z->format, z->width, z->height, 1, GFX_USE_DEPTH);
     }
     bind(&d->rt, d->backbuffer);
     bind(&d->ds, d->depth);
@@ -780,7 +869,18 @@ static void IDirect3DDevice8_Reset(Guest* g)
 }
 
 /* Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion): the frame is done */
-static void IDirect3DDevice8_Present(Guest* g) { RET(D3D_OK, 5); }
+static void (*g_present_hook)(void);
+
+void d3d8_set_present_hook(void (*fn)(void)) { g_present_hook = fn; }
+
+static void IDirect3DDevice8_Present(Guest* g)
+{
+    if (g_present_hook)
+        g_present_hook();
+    Obj* bb = obj(g_dev.backbuffer);
+    gfx_present(bb ? bb->gpu : NULL);
+    RET(D3D_OK, 5);
+}
 
 static void IDirect3DDevice8_GetBackBuffer(Guest* g)
 {
@@ -824,7 +924,14 @@ static uint32_t new_texture(int kind, uint32_t w, uint32_t h, uint32_t levels, u
     /* new_surface may grow the object table: t is not used past here */
     for (uint32_t f = 0; f < faces; ++f)
         for (uint32_t l = 0; l < nl; ++l)
-            subs[f * nl + l] = new_surface(fmt, w >> l ? w >> l : 1, h >> l ? h >> l : 1, usage, pool, p);
+        {
+            uint32_t sp = new_surface(fmt, w >> l ? w >> l : 1, h >> l ? h >> l : 1, usage, pool, p);
+            subs[f * nl + l] = sp;
+            obj(sp)->face = (uint8_t)f, obj(sp)->level = (uint8_t)l;
+        }
+    if (pool != 2) /* system memory textures are only ever copied from */
+        obj(p)->gpu = gfx_tex_create(kind == O_CUBE ? GFX_TEX_CUBE : GFX_TEX_2D, fmt, w, h, nl,
+            (usage & USAGE_RENDERTARGET) ? GFX_USE_RT : GFX_USE_SAMPLE);
     return p;
 }
 
@@ -854,12 +961,38 @@ static void IDirect3DDevice8_CreateVolumeTexture(Guest* g)
     RET(D3DERR_NOTAVAILABLE, 9);
 }
 
+#define USAGE_DYNAMIC 0x200u
+
+/* A buffer the game does not declare dynamic is written once and drawn many times: it gets a GPU
+ * copy, refreshed at the next draw after a lock that writes. Dynamic ones are copied per draw. */
+static void static_buffer_init(Obj* b)
+{
+    if (!(b->usage & USAGE_DYNAMIC) && b->size)
+    {
+        b->gbuf = gfx_buf_create(b->size);
+        b->gbuf_dirty = 1;
+    }
+}
+
+static GfxBuf* static_buffer(Obj* b)
+{
+    if (!b->gbuf || !b->mem)
+        return NULL;
+    if (b->gbuf_dirty)
+    {
+        gfx_buf_upload(b->gbuf, GUEST_PTR(b->mem), b->size);
+        b->gbuf_dirty = 0;
+    }
+    return b->gbuf;
+}
+
 /* CreateVertexBuffer(Length, Usage, FVF, Pool, ppVertexBuffer) */
 static void IDirect3DDevice8_CreateVertexBuffer(Guest* g)
 {
     uint32_t p = obj_new(O_VB);
     Obj* b = obj(p);
     b->size = ARG(1), b->usage = ARG(2), b->fvf = ARG(3), b->pool = ARG(4);
+    static_buffer_init(b);
     wr32(ARG(5), p);
     RET(D3D_OK, 6);
 }
@@ -870,6 +1003,7 @@ static void IDirect3DDevice8_CreateIndexBuffer(Guest* g)
     uint32_t p = obj_new(O_IB);
     Obj* b = obj(p);
     b->size = ARG(1), b->usage = ARG(2), b->format = ARG(3), b->pool = ARG(4);
+    static_buffer_init(b);
     wr32(ARG(5), p);
     RET(D3D_OK, 6);
 }
@@ -895,18 +1029,30 @@ static void IDirect3DDevice8_CreateImageSurface(Guest* g)
     RET(D3D_OK, 5);
 }
 
-/* CopyRects(pSourceSurface, pSourceRectsArray, cRects, pDestinationSurface, pDestPointsArray): the
- * pixels are copied in the guest copies; the Metal back end will also see it as an upload. */
+/* CopyRects(pSourceSurface, pSourceRectsArray, cRects, pDestinationSurface, pDestPointsArray).
+ * Between two surfaces the GPU owns (the back buffer into a render-target texture, say) the copy is
+ * a GPU blit. Otherwise it happens in guest memory - a GPU-owned source is read back first - and the
+ * destination is uploaded: at once if the GPU owns it, before its next draw if not. */
 static void IDirect3DDevice8_CopyRects(Guest* g)
 {
     Obj* s = obj(ARG(1));
     Obj* d = obj(ARG(4));
     if (!s || !d || s->format != d->format)
         RET(D3DERR_INVALIDCALL, 6);
+    uint32_t sface, slevel, dface, dlevel;
+    GfxTex* sg = surface_gpu(s, &sface, &slevel);
+    GfxTex* dg = surface_gpu(d, &dface, &dlevel);
+    int s_gpu = gpu_owned(s), d_gpu = gpu_owned(d);
     uint32_t n = ARG(2) ? ARG(3) : 1, blk = fmt_block(s->format), unit = blk ? 4 : 1, bpp = blk ? blk : fmt_bytes(s->format);
     uint32_t sp = fmt_pitch(s->format, s->width), dp = fmt_pitch(d->format, d->width);
-    uint8_t* sm = GUEST_PTR(obj_mem(s));
-    uint8_t* dm = GUEST_PTR(obj_mem(d));
+    uint8_t *sm = NULL, *dm = NULL;
+    if (!(s_gpu && d_gpu))
+    {
+        sm = GUEST_PTR(obj_mem(s));
+        dm = GUEST_PTR(obj_mem(d));
+        if (s_gpu && !(s->usage & USAGE_DEPTHSTENCIL))
+            gfx_tex_read(sg, sface, slevel, sm, sp);
+    }
     for (uint32_t i = 0; i < n; ++i)
     {
         int32_t l = 0, t = 0, r = (int32_t)s->width, b = (int32_t)s->height;
@@ -921,11 +1067,21 @@ static void IDirect3DDevice8_CopyRects(Guest* g)
         if (l < 0 || t < 0 || r > (int32_t)s->width || b > (int32_t)s->height || r <= l || b <= t || x < 0 || y < 0 ||
             x + (r - l) > (int32_t)d->width || y + (b - t) > (int32_t)d->height)
             continue;
+        if (s_gpu && d_gpu)
+        {
+            gfx_copy(sg, sface, slevel, (uint32_t)l, (uint32_t)t, (uint32_t)(r - l), (uint32_t)(b - t), dg, dface, dlevel,
+                (uint32_t)x, (uint32_t)y);
+            continue;
+        }
         uint32_t rows = ((uint32_t)(b - t) + unit - 1) / unit, bytes = ((uint32_t)(r - l) + unit - 1) / unit * bpp;
+        uint8_t* drow = dm + ((uint32_t)y / unit) * dp + (uint32_t)x / unit * bpp;
         for (uint32_t row = 0; row < rows; ++row)
-            memmove(dm + ((uint32_t)y / unit + row) * dp + (uint32_t)x / unit * bpp,
-                sm + ((uint32_t)t / unit + row) * sp + (uint32_t)l / unit * bpp, bytes);
+            memmove(drow + row * dp, sm + ((uint32_t)t / unit + row) * sp + (uint32_t)l / unit * bpp, bytes);
+        if (d_gpu && !(d->usage & USAGE_DEPTHSTENCIL))
+            gfx_tex_upload_rect(dg, dface, dlevel, (uint32_t)x, (uint32_t)y, (uint32_t)(r - l), (uint32_t)(b - t), drow, dp);
     }
+    if (!d_gpu)
+        mark_dirty(d);
     RET(D3D_OK, 6);
 }
 
@@ -964,8 +1120,16 @@ static void IDirect3DDevice8_GetDepthStencilSurface(Guest* g)
 
 static void IDirect3DDevice8_BeginScene(Guest* g) { RET(D3D_OK, 1); }
 static void IDirect3DDevice8_EndScene(Guest* g) { RET(D3D_OK, 1); }
-/* Clear(Count, pRects, Flags, Color, Z, Stencil) */
-static void IDirect3DDevice8_Clear(Guest* g) { RET(D3D_OK, 7); }
+static void apply_targets(void);
+
+/* Clear(Count, pRects, Flags, Color, Z, Stencil): D3DRECTs are x1, y1, x2, y2 */
+static void IDirect3DDevice8_Clear(Guest* g)
+{
+    apply_targets();
+    uint32_t n = ARG(2) ? ARG(1) : 0;
+    gfx_clear(n, n ? (const int32_t*)ARGP(2) : NULL, ARG(3), ARG(4), u2f(ARG(5)), ARG(6), g_dev.cur.vp);
+    RET(D3D_OK, 7);
+}
 
 /* --- IDirect3DDevice8: state ----------------------------------------------------------------------------- */
 static void IDirect3DDevice8_SetTransform(Guest* g)
@@ -1255,21 +1419,46 @@ static void IDirect3DDevice8_ValidateDevice(Guest* g)
 }
 
 /* --- IDirect3DDevice8: drawing ----------------------------------------------------------------------------- */
-/* DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount) */
-static void IDirect3DDevice8_DrawPrimitive(Guest* g) { RET(D3D_OK, 4); }
-/* DrawIndexedPrimitive(PrimitiveType, minIndex, NumVertices, startIndex, primCount) */
-static void IDirect3DDevice8_DrawIndexedPrimitive(Guest* g) { RET(D3D_OK, 6); }
+static void draw(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices, uint32_t index_size, uint32_t up_data,
+    uint32_t up_stride);
 
-/* The ...UP draws leave stream 0 (and the indices) unset, as D3D8 does. */
+/* DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount) */
+static void IDirect3DDevice8_DrawPrimitive(Guest* g)
+{
+    draw(ARG(1), ARG(3), ARG(2), 0, 0, 0, 0);
+    RET(D3D_OK, 4);
+}
+
+/* DrawIndexedPrimitive(PrimitiveType, minIndex, NumVertices, startIndex, primCount): the vertex range
+ * comes from the indices themselves, not minIndex and NumVertices */
+static void IDirect3DDevice8_DrawIndexedPrimitive(Guest* g)
+{
+    Obj* ib = obj(g_dev.cur.ib);
+    if (ib && ib->mem)
+    {
+        uint32_t isize = ib->format == FMT_INDEX32 ? 4 : 2;
+        draw(ARG(1), ARG(5), 0, ib->mem + ARG(4) * isize, isize, 0, 0);
+    }
+    else
+        gfx_prof_skip(GFX_SKIP_NO_INDICES);
+    RET(D3D_OK, 6);
+}
+
+/* DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride).
+ * The ...UP draws leave stream 0 (and the indices) unset, as D3D8 does. */
 static void IDirect3DDevice8_DrawPrimitiveUP(Guest* g)
 {
+    draw(ARG(1), ARG(2), 0, 0, 0, ARG(3), ARG(4));
     bind(&g_dev.cur.stream[0], 0);
     g_dev.cur.stride[0] = 0;
     RET(D3D_OK, 5);
 }
 
+/* DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData,
+ * IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride) */
 static void IDirect3DDevice8_DrawIndexedPrimitiveUP(Guest* g)
 {
+    draw(ARG(1), ARG(4), 0, ARG(5), ARG(6) == FMT_INDEX32 ? 4 : 2, ARG(7), ARG(8));
     bind(&g_dev.cur.stream[0], 0);
     g_dev.cur.stride[0] = 0;
     bind(&g_dev.cur.ib, 0);
@@ -1287,6 +1476,95 @@ static uint32_t* copy_tokens(uint32_t p, uint32_t end, uint32_t* n)
     memcpy(t, GUEST_PTR(p), 4 * k);
     *n = k;
     return t;
+}
+
+static uint32_t type_size(uint32_t t)
+{
+    return t == GFX_FLOAT2 || t == GFX_SHORT4 ? 8 : t == GFX_FLOAT3 ? 12 : t == GFX_FLOAT4 ? 16 : 4;
+}
+
+static void add_elem(Layout* l, int reg, uint32_t stream, uint32_t type, uint32_t* off)
+{
+    if (reg >= GFX_NREGS)
+        return;
+    l->el[reg] = (GfxElem){ 1, (uint8_t)stream, (uint8_t)type, 0 };
+    l->offset[reg] = (int32_t)*off;
+    *off += type_size(type);
+}
+
+/* an FVF code: everything in stream 0, in D3D's order */
+static void fvf_layout(uint32_t fvf, Layout* l)
+{
+    memset(l, 0, sizeof *l);
+    uint32_t off = 0, pos = fvf & 0xE;
+    if (pos == 4) /* XYZRHW */
+    {
+        add_elem(l, GFX_R_POSITION, 0, GFX_FLOAT4, &off);
+        l->rhw = 1;
+    }
+    else if (pos)
+    {
+        add_elem(l, GFX_R_POSITION, 0, GFX_FLOAT3, &off);
+        if (pos >= 6) /* XYZB1..5: blend weights, the last one indices with LASTBETA_UBYTE4 */
+        {
+            int betas = (int)(pos - 4) / 2, weights = betas - ((fvf & 0x1000) ? 1 : 0);
+            if (weights > 4)
+                weights = 4;
+            if (weights > 0)
+                add_elem(l, GFX_R_BLENDWEIGHT, 0, GFX_FLOAT1 + (uint32_t)weights - 1, &off);
+            if (fvf & 0x1000)
+                add_elem(l, GFX_R_BLENDINDICES, 0, GFX_UBYTE4, &off);
+        }
+    }
+    if (fvf & 0x10)
+        add_elem(l, GFX_R_NORMAL, 0, GFX_FLOAT3, &off);
+    if (fvf & 0x20)
+        add_elem(l, GFX_R_PSIZE, 0, GFX_FLOAT1, &off);
+    if (fvf & 0x40)
+        add_elem(l, GFX_R_DIFFUSE, 0, GFX_D3DCOLOR, &off);
+    if (fvf & 0x80)
+        add_elem(l, GFX_R_SPECULAR, 0, GFX_D3DCOLOR, &off);
+    uint32_t n = (fvf >> 8) & 0xF;
+    for (uint32_t i = 0; i < n && i < 8; ++i)
+    {
+        uint32_t f = (fvf >> (16 + 2 * i)) & 3;
+        add_elem(l, GFX_R_TEXCOORD0 + (int)i, 0, f == 0 ? GFX_FLOAT2 : f == 1 ? GFX_FLOAT3 : f == 2 ? GFX_FLOAT4 : GFX_FLOAT1, &off);
+    }
+}
+
+/* a vertex shader declaration: D3DVSD_STREAM, then D3DVSD_REG / D3DVSD_SKIP per element */
+static void decl_layout(const uint32_t* t, uint32_t n, Layout* l)
+{
+    memset(l, 0, sizeof *l);
+    uint32_t stream = 0, off = 0;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        uint32_t tok = t[i];
+        if (tok == 0xFFFFFFFFu)
+            break;
+        switch (tok >> 29)
+        {
+        case 1: stream = tok & 0xF, off = 0; break;
+        case 2:
+            if ((tok >> 28) & 1)
+                off += 4 * ((tok >> 16) & 0xF);
+            else
+                add_elem(l, (int)(tok & 0x1F), stream, (tok >> 16) & 0xF, &off);
+            break;
+        case 4: i += 4 * ((tok >> 25) & 0xF); break; /* constants: SetVertexShader loads them */
+        case 5: i += (tok >> 24) & 0x1F; break;
+        default: break;
+        }
+    }
+}
+
+static uint32_t token_hash(const uint32_t* t, uint32_t n)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; ++i)
+        for (int b = 0; b < 32; b += 8)
+            h = (h ^ ((t[i] >> b) & 255)) * 16777619u;
+    return h ? h : 1;
 }
 
 /* CreateVertexShader(pDeclaration, pFunction, pHandle, Usage). Handles are odd: D3D8 tells a shader
@@ -1307,6 +1585,8 @@ static void IDirect3DDevice8_CreateVertexShader(Guest* g)
     s->func = ARG(2) ? copy_tokens(ARG(2), 0x0000FFFFu, &s->nfunc) : NULL;
     if (!ARG(2))
         s->nfunc = 0;
+    decl_layout(s->decl, s->ndecl, &s->lay);
+    s->hash = s->func ? token_hash(s->func, s->nfunc) : 0;
     wr32(ARG(3), ((i + 1) << 1) | 1);
     RET(D3D_OK, 5);
 }
@@ -1324,6 +1604,25 @@ static void IDirect3DDevice8_SetVertexShader(Guest* g)
     s->vs = ARG(1);
     if (m)
         m->vs = 1;
+    /* D3DVSD_CONST in the declaration: constants loaded with the shader */
+    Shader* sh = vs_of(ARG(1));
+    for (uint32_t i = 0; sh && i < sh->ndecl && sh->decl[i] != 0xFFFFFFFFu; ++i)
+    {
+        uint32_t tok = sh->decl[i];
+        if (tok >> 29 == 4)
+        {
+            uint32_t count = (tok >> 25) & 0xF, reg = tok & 0x7F;
+            for (uint32_t k = 0; k < count && reg + k < NVSC && i + 1 + 4 * k + 3 < sh->ndecl; ++k)
+            {
+                memcpy(s->vsc[reg + k], &sh->decl[i + 1 + 4 * k], 16);
+                if (m)
+                    m->vsc[reg + k] = 1;
+            }
+            i += 4 * count;
+        }
+        else if (tok >> 29 == 5)
+            i += (tok >> 24) & 0x1F;
+    }
     RET(D3D_OK, 2);
 }
 
@@ -1428,6 +1727,7 @@ static void IDirect3DDevice8_CreatePixelShader(Guest* g)
         memset(&d->ps[d->nps++], 0, sizeof(Shader));
     }
     d->ps[i].func = copy_tokens(ARG(1), 0x0000FFFFu, &d->ps[i].nfunc);
+    d->ps[i].hash = token_hash(d->ps[i].func, d->ps[i].nfunc);
     wr32(ARG(2), i + 1);
     RET(D3D_OK, 3);
 }
@@ -1471,6 +1771,368 @@ static void IDirect3DDevice8_SetPixelShaderConstant(Guest* g)
     if (m)
         memset(&m->psc[r], 1, n);
     RET(D3D_OK, 4);
+}
+
+/* --- drawing: the device state as the back end's draw packet ------------------------------------------------ */
+/* D3D's v * M with row-major matrices: r = a * b */
+static void mat_mul(float* r, const float* a, const float* b)
+{
+    float t[16];
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x)
+            t[y * 4 + x] = a[y * 4] * b[x] + a[y * 4 + 1] * b[4 + x] + a[y * 4 + 2] * b[8 + x] + a[y * 4 + 3] * b[12 + x];
+    memcpy(r, t, sizeof t);
+}
+
+/* the normal matrix: the inverse transpose of m's upper 3x3 (D3D lights in camera space) */
+static void normal_matrix(float* r, const float* m)
+{
+    float a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
+    float A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+    float det = a * A + b * B + c * C;
+    float s = det != 0.0f ? 1.0f / det : 0.0f;
+    memset(r, 0, 64);
+    /* inverse transpose = cofactor matrix / det */
+    r[0] = A * s, r[1] = B * s, r[2] = C * s;
+    r[4] = -(b * i - c * h) * s, r[5] = (a * i - c * g) * s, r[6] = -(a * h - b * g) * s;
+    r[8] = (b * f - c * e) * s, r[9] = -(a * f - c * d) * s, r[10] = (a * e - b * d) * s;
+    r[15] = 1.0f;
+}
+
+static void xform(float* out, const float* v, float w, const float* m) /* (v, w) * m, xyz */
+{
+    for (int k = 0; k < 3; ++k)
+        out[k] = v[0] * m[k] + v[1] * m[4 + k] + v[2] * m[8 + k] + w * m[12 + k];
+}
+
+static void color4(float* out, uint32_t c)
+{
+    out[0] = ((c >> 16) & 255) / 255.0f, out[1] = ((c >> 8) & 255) / 255.0f, out[2] = (c & 255) / 255.0f, out[3] = (c >> 24) / 255.0f;
+}
+
+/* vertices a D3D primitive count spans */
+static uint32_t prim_vertices(uint32_t prim, uint32_t n)
+{
+    switch (prim)
+    {
+    case 1: return n;
+    case 2: return n * 2;
+    case 3: return n + 1;
+    case 4: return n * 3;
+    case 5:
+    case 6: return n + 2;
+    default: return 0;
+    }
+}
+
+static void apply_targets(void)
+{
+    uint32_t cf = 0, cl = 0, df, dl;
+    Obj* rt = obj(g_dev.rt);
+    Obj* ds = obj(g_dev.ds);
+    GfxTex* c = rt ? surface_gpu(rt, &cf, &cl) : NULL;
+    GfxTex* z = ds ? surface_gpu(ds, &df, &dl) : NULL;
+    gfx_set_targets(c, cf, cl, z);
+}
+
+static GfxDraw g_draw; /* one device, one draw at a time */
+
+/* The keys and uniforms for the current state; 0 when the state cannot be drawn. */
+static int build_draw(GfxDraw* d)
+{
+    State* s = &g_dev.cur;
+    const uint32_t* rs = s->rs;
+    /* the keys and bindings, and the uniforms up to the lights; lights and shader constants are
+     * written where they are used (the back end uploads only those) */
+    memset(d, 0, offsetof(GfxDraw, u));
+    memset(&d->u, 0, offsetof(GfxU, light));
+    memset(d->tex, 0, sizeof(GfxDraw) - offsetof(GfxDraw, tex));
+
+    Layout fvf;
+    const Layout* lay;
+    Shader* vs = NULL;
+    if (s->vs & 1)
+    {
+        vs = vs_of(s->vs);
+        if (!vs)
+            return gfx_prof_skip(GFX_SKIP_NO_SHADER), 0;
+        lay = &vs->lay;
+    }
+    else
+    {
+        fvf_layout(s->vs, &fvf);
+        lay = &fvf;
+    }
+    for (int r = 0; r < GFX_NREGS; ++r)
+    {
+        if (lay->el[r].used && lay->el[r].stream >= GFX_NSTREAMS)
+            return gfx_prof_skip(GFX_SKIP_STREAM), 0;
+        d->vs.el[r] = lay->el[r];
+        d->u.offset[r] = lay->offset[r];
+    }
+    if (!lay->el[GFX_R_POSITION].used && !(vs && vs->func))
+        return gfx_prof_skip(GFX_SKIP_NO_POSITION), 0;
+    d->vs.rhw = lay->rhw;
+    if (vs && vs->func)
+    {
+        d->vs.prog = vs->hash;
+        d->vs_tokens = vs->func;
+        memcpy(d->u.vsc, s->vsc, sizeof d->u.vsc);
+    }
+    if (s->ps)
+    {
+        uint32_t i = s->ps - 1;
+        if (i < g_dev.nps && g_dev.ps[i].func)
+        {
+            d->fs.prog = g_dev.ps[i].hash;
+            d->ps_tokens = g_dev.ps[i].func;
+            memcpy(d->u.psc, s->psc, sizeof d->u.psc);
+        }
+    }
+
+    /* transforms: WORLD is D3DTS_WORLDMATRIX(0), index 24 here */
+    float wv[16];
+    mat_mul(wv, s->xf[24], s->xf[2]);
+    mat_mul(d->u.wvp, wv, s->xf[3]);
+    memcpy(d->u.wv, wv, 64);
+    normal_matrix(d->u.wvit, wv);
+    for (int i = 0; i < 8; ++i)
+        memcpy(d->u.texm[i], s->xf[16 + i], 64);
+
+    /* D3DMATERIAL8: Diffuse, Ambient, Specular, Emissive, Power */
+    memcpy(d->u.mat_d, &s->mat[0], 16);
+    memcpy(d->u.mat_a, &s->mat[4], 16);
+    memcpy(d->u.mat_s, &s->mat[8], 16);
+    memcpy(d->u.mat_e, &s->mat[12], 16);
+    d->u.params[0] = u2f(s->mat[16]);
+    d->u.params[1] = (float)(rs[24] & 255); /* ALPHAREF */
+    d->u.params[2] = u2f(rs[36]);           /* FOGSTART */
+    d->u.params[3] = u2f(rs[37]);           /* FOGEND */
+    d->u.params2[0] = u2f(rs[38]);          /* FOGDENSITY */
+    color4(d->u.ambient, rs[139]);
+    color4(d->u.tfactor, rs[60]);
+    color4(d->u.fogcolor, rs[34]);
+    for (int i = 0; i < 4; ++i)
+        d->u.vp[i] = (float)s->vp[i];
+    memcpy(d->vp, s->vp, sizeof d->vp);
+
+    int ff_vertex = !d->vs.prog && !lay->rhw;
+    if (ff_vertex && rs[137]) /* LIGHTING */
+    {
+        d->vs.lighting = 1;
+        d->vs.normalize = rs[143] != 0;
+        d->vs.localviewer = rs[142] != 0;
+        d->vs.specular = rs[29] != 0;
+        if (rs[141]) /* COLORVERTEX: the material sources */
+        {
+            d->vs.src_diffuse = (uint8_t)rs[145], d->vs.src_specular = (uint8_t)rs[146];
+            d->vs.src_ambient = (uint8_t)rs[147], d->vs.src_emissive = (uint8_t)rs[148];
+        }
+        const float* view = s->xf[2];
+        int n = 0;
+        for (int i = 0; i < MAX_LIGHTS && n < GFX_NLIGHTS; ++i)
+        {
+            const Light* l = &s->light[i];
+            uint32_t type = l->v[0];
+            if (!l->enabled || type < 1 || type > 3)
+                continue;
+            /* D3DLIGHT8: Type, Diffuse, Specular, Ambient, Position, Direction, Range, Falloff,
+             * Attenuation0..2, Theta, Phi */
+            float v[26];
+            memcpy(v, l->v, sizeof v);
+            GfxLight* gl = &d->u.light[n];
+            memcpy(gl->diffuse, &v[1], 16);
+            memcpy(gl->specular, &v[5], 16);
+            memcpy(gl->ambient, &v[9], 16);
+            xform(gl->pos, &v[13], 1.0f, view);
+            gl->pos[3] = v[19];
+            float dir[3];
+            xform(dir, &v[16], 0.0f, view);
+            float len = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+            float k = len > 0 ? (type == 3 ? -1.0f : 1.0f) / len : 0.0f; /* directional: toward the light */
+            gl->dir[0] = dir[0] * k, gl->dir[1] = dir[1] * k, gl->dir[2] = dir[2] * k, gl->dir[3] = v[20];
+            gl->att[0] = v[21], gl->att[1] = v[22], gl->att[2] = v[23];
+            gl->spot[0] = cosf(v[24] * 0.5f), gl->spot[1] = cosf(v[25] * 0.5f);
+            d->vs.light_type[n++] = (uint8_t)type;
+        }
+        d->vs.nlights = (uint8_t)n;
+    }
+
+    if (rs[28]) /* FOGENABLE: table (pixel) fog, else vertex fog, else the vertices' specular alpha */
+    {
+        if (rs[35])
+            d->fs.fog = (uint8_t)rs[35];
+        else
+        {
+            d->fs.fog = 4;
+            if (ff_vertex)
+                d->vs.fog_vertex = (uint8_t)rs[140];
+        }
+        d->vs.range_fog = ff_vertex && rs[48];
+    }
+
+    /* the texture stages, up to the first disabled one */
+    int nst = 0;
+    if (!d->fs.prog)
+        while (nst < 8 && s->tss[nst][1] != 1)
+            nst++;
+    d->fs.nstages = (uint8_t)nst;
+    int nused = d->fs.prog ? 4 : nst;
+    d->vs.ntex = (uint8_t)(d->vs.prog || d->fs.prog ? 8 : nst);
+    for (int i = 0; i < nused; ++i)
+    {
+        const uint32_t* t = s->tss[i];
+        GfxStage* st = &d->fs.st[i];
+        int kind = 0;
+        GfxTex* tex = texture_for_draw(s->tex[i], &kind);
+        if (tex)
+        {
+            d->tex[i] = tex;
+            st->tex = (uint8_t)kind;
+            Obj* to = obj(s->tex[i]);
+            uint32_t maxlevel = t[20] > to->lod ? t[20] : to->lod;
+            d->samp[i] = (GfxSampler){ (uint8_t)t[13], (uint8_t)t[14], (uint8_t)t[25], (uint8_t)t[16], (uint8_t)t[17], (uint8_t)t[18],
+                (uint8_t)t[21], (uint8_t)maxlevel, t[15] };
+        }
+        if (!d->fs.prog)
+        {
+            st->cop = (uint8_t)t[1], st->ca1 = (uint8_t)t[2], st->ca2 = (uint8_t)t[3], st->ca0 = (uint8_t)t[26];
+            st->aop = (uint8_t)t[4], st->aa1 = (uint8_t)t[5], st->aa2 = (uint8_t)t[6], st->aa0 = (uint8_t)t[27];
+            st->result = (uint8_t)t[28];
+        }
+        uint32_t ttf = t[24], count = ttf & 0xFF;
+        st->ncoord = (uint8_t)(count ? count : 2);
+        st->projected = (ttf & 256) && count > 1;
+        if (!d->vs.prog)
+        {
+            d->vs.tci[i] = (uint8_t)((t[11] & 7) | ((t[11] >> 16) & 0xF) << 4);
+            d->vs.ttf[i] = (uint8_t)(count | ((ttf & 256) ? 0x80 : 0));
+        }
+    }
+    d->fs.alpha_func = (uint8_t)(rs[15] ? rs[25] : 0);
+    d->fs.specular_add = !d->fs.prog && rs[29];
+    d->vs.flat = d->fs.flat = rs[9] == 1; /* SHADEMODE flat */
+
+    d->pipe.blend = rs[27] != 0;
+    if (d->pipe.blend)
+        d->pipe.src = (uint8_t)rs[19], d->pipe.dst = (uint8_t)rs[20], d->pipe.op = (uint8_t)rs[171];
+    d->pipe.write_mask = (uint8_t)(rs[168] & 0xF);
+    if (g_dev.ds)
+    {
+        d->depth.zenable = rs[7] != 0, d->depth.zwrite = rs[14] != 0, d->depth.zfunc = (uint8_t)rs[23];
+        if (rs[52]) /* STENCILENABLE */
+        {
+            d->depth.stencil = 1;
+            d->depth.sfail = (uint8_t)rs[53], d->depth.szfail = (uint8_t)rs[54], d->depth.spass = (uint8_t)rs[55];
+            d->depth.sfunc = (uint8_t)rs[56], d->depth.sread = (uint8_t)rs[58], d->depth.swrite = (uint8_t)rs[59];
+            d->stencil_ref = rs[57];
+        }
+    }
+    d->cull = (uint8_t)rs[22];
+    d->fill = (uint8_t)rs[8];
+    d->zbias = (int32_t)rs[47];
+    return 1;
+}
+
+/* Points the draw at vertices first .. first + count of the streams its layout reads: the bound
+ * vertex buffers, or the ...UP draw's memory as stream 0. */
+static int set_streams(GfxDraw* d, uint32_t first, uint32_t count, uint32_t up_data, uint32_t up_stride)
+{
+    int used[GFX_NSTREAMS] = { 0 };
+    for (int r = 0; r < GFX_NREGS; ++r)
+        if (d->vs.el[r].used)
+            used[d->vs.el[r].stream] = 1;
+    for (int st = 0; st < GFX_NSTREAMS; ++st)
+    {
+        if (!used[st])
+            continue;
+        uint32_t stride, base, size;
+        if (up_data)
+        {
+            if (st)
+                return gfx_prof_skip(GFX_SKIP_STREAM), 0;
+            stride = up_stride, base = up_data, size = 0xFFFFFFFFu;
+        }
+        else
+        {
+            Obj* b = obj(g_dev.cur.stream[st]);
+            if (!b || !b->mem)
+                return gfx_prof_skip(GFX_SKIP_NO_BUFFER), 0;
+            stride = g_dev.cur.stride[st], base = b->mem, size = b->size;
+        }
+        uint32_t start = first * stride, bytes = stride ? count * stride : 64;
+        if (start >= size)
+            return gfx_prof_skip(GFX_SKIP_RANGE), 0;
+        if (bytes > size - start)
+            bytes = size - start;
+        GfxBuf* gb = up_data ? NULL : static_buffer(obj(g_dev.cur.stream[st]));
+        if (gb && !(start & 3))
+        {
+            d->buf[st] = gb, d->buf_off[st] = start;
+            d->u.stride[st] = (int32_t)stride;
+            continue;
+        }
+        d->data[st] = GUEST_PTR(base + start);
+        d->size[st] = bytes;
+        d->u.stride[st] = (int32_t)stride;
+    }
+    return 1;
+}
+
+static void index_range(uint32_t indices, uint32_t size, uint32_t n, uint32_t* lo, uint32_t* hi)
+{
+    uint32_t a = 0xFFFFFFFFu, b = 0;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        uint32_t v = size == 4 ? rd32(indices + 4 * i) : rd16(indices + 2 * i);
+        a = v < a ? v : a;
+        b = v > b ? v : b;
+    }
+    *lo = a, *hi = b;
+}
+
+static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices, uint32_t index_size,
+    uint32_t up_data, uint32_t up_stride, uint32_t n);
+
+/* A draw: from `start` (non-indexed), through guest indices, or from ...UP memory. */
+static void draw(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices, uint32_t index_size, uint32_t up_data,
+    uint32_t up_stride)
+{
+    uint32_t n = prim_vertices(prim, count);
+    if (!n)
+        return;
+    uint64_t t0 = gfx_profiling ? gfx_now_ns() : 0;
+    draw_packet(prim, count, start, indices, index_size, up_data, up_stride, n);
+    if (gfx_profiling)
+        gfx_prof_front(gfx_now_ns() - t0);
+}
+
+static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices, uint32_t index_size,
+    uint32_t up_data, uint32_t up_stride, uint32_t n)
+{
+    GfxDraw* d = &g_draw;
+    if (!build_draw(d))
+        return;
+    uint32_t first = start, nverts = n;
+    if (indices)
+    {
+        uint32_t lo, hi;
+        index_range(indices, index_size, n, &lo, &hi);
+        first = lo + (up_data ? 0 : g_dev.cur.base_vertex);
+        nverts = hi - lo + 1;
+        d->u.vofs = -(int32_t)lo;
+        d->indices = GUEST_PTR(indices);
+        d->index_size = index_size;
+        Obj* ib = up_data ? NULL : obj(g_dev.cur.ib);
+        GfxBuf* gb = ib && indices >= ib->mem && indices < ib->mem + ib->size ? static_buffer(ib) : NULL;
+        if (gb && !((indices - ib->mem) & 3) && prim != 6 /* fans are rebuilt from the indices */)
+            d->ibuf = gb, d->ibuf_off = indices - ib->mem;
+    }
+    if (!set_streams(d, first, nverts, up_data, up_stride))
+        return;
+    d->prim = prim, d->count = count;
+    apply_targets();
+    gfx_draw(d);
 }
 
 /* --- resources: IDirect3DResource8, textures, buffers, surfaces ------------------------------------------ */
@@ -1565,10 +2227,46 @@ static void Texture_GetSurfaceLevel(Guest* g)
     RET(D3D_OK, 3);
 }
 
-/* D3DLOCKED_RECT for a surface and an optional RECT */
-static void lock_rect(Obj* s, uint32_t locked, uint32_t rect)
+#define LOCK_READONLY 0x10u
+
+/* D3DLOCKED_RECT for a surface and an optional RECT. A surface the GPU owns is read back first
+ * and written again at unlock; one the game owns is uploaded before its next draw. */
+static void lock_rect(Obj* s, uint32_t locked, uint32_t rect, uint32_t flags)
 {
     uint32_t pitch = fmt_pitch(s->format, s->width), bits = obj_mem(s);
+    if (gpu_owned(s))
+    {
+        uint32_t face, level;
+        GfxTex* g = surface_gpu(s, &face, &level);
+        if (!s->gpu_locked && !(s->usage & USAGE_DEPTHSTENCIL))
+        {
+            /* The game's per-frame probe decides what is drawn from these pixels: a copy even a frame
+             * old makes characters flicker. So the read waits (the back end commits each frame in
+             * chunks, so the wait is the frame's tail); FFXI_ASYNC_READBACK=1 trades that for
+             * the newest finished copy. */
+            static int async = -1, visible = -1;
+            if (async < 0)
+                async = getenv("FFXI_ASYNC_READBACK") && getenv("FFXI_ASYNC_READBACK")[0] == '1';
+            if (visible < 0)
+                visible = !(getenv("FFXI_PROBE") && !strcmp(getenv("FFXI_PROBE"), "gpu"));
+            /* The game's 16x16 occlusion probe (FFXiMain 0x1006c8c0: CopyRects of a 16x16 target,
+             * a read-only lock, bit 7 of the blue byte counted over 8x8 samples: 0 hidden .. 256
+             * fully visible) reads fully visible, with no wait for the GPU. Reading it for real
+             * stalls the CPU on the whole scene every frame (7-8 ms at a 4096x4096 background),
+             * and a late answer makes characters flicker; answering visible draws what the probe
+             * would have hidden, which the depth test hides anyway. FFXI_PROBE=gpu reads it. */
+            if (visible && (flags & LOCK_READONLY) && s->width == 16 && s->height == 16)
+                memset(GUEST_PTR(bits), 0xFF, (size_t)pitch * s->height);
+            else if (async && (flags & LOCK_READONLY) && s->width * s->height <= 128 * 128)
+                gfx_tex_read_async(g, face, level, GUEST_PTR(bits), pitch);
+            else
+                gfx_tex_read(g, face, level, GUEST_PTR(bits), pitch);
+        }
+        if (!(flags & LOCK_READONLY) && !(s->usage & USAGE_DEPTHSTENCIL))
+            s->gpu_locked = 1;
+    }
+    else if (!(flags & LOCK_READONLY))
+        mark_dirty(s);
     if (rect)
     {
         uint32_t l = rd32(rect), t = rd32(rect + 4), blk = fmt_block(s->format);
@@ -1578,17 +2276,34 @@ static void lock_rect(Obj* s, uint32_t locked, uint32_t rect)
     wr32(locked + 4, bits);
 }
 
+static void unlock_rect(Obj* s)
+{
+    if (!s->gpu_locked)
+        return;
+    uint32_t face, level;
+    GfxTex* g = surface_gpu(s, &face, &level);
+    gfx_tex_upload(g, face, level, GUEST_PTR(s->mem), fmt_pitch(s->format, s->width));
+    s->gpu_locked = 0;
+}
+
 /* LockRect(Level, pLockedRect, pRect, Flags) */
 static void Texture_LockRect(Guest* g)
 {
     Obj* s = sub(ARG(0), 0, ARG(1));
     if (!s)
         RET(D3DERR_INVALIDCALL, 5);
-    lock_rect(s, ARG(2), ARG(3));
+    lock_rect(s, ARG(2), ARG(3), ARG(4));
     RET(D3D_OK, 5);
 }
 
-static void Texture_UnlockRect(Guest* g) { RET(sub(ARG(0), 0, ARG(1)) ? D3D_OK : D3DERR_INVALIDCALL, 2); }
+static void Texture_UnlockRect(Guest* g)
+{
+    Obj* s = sub(ARG(0), 0, ARG(1));
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 2);
+    unlock_rect(s);
+    RET(D3D_OK, 2);
+}
 static void Texture_AddDirtyRect(Guest* g) { RET(D3D_OK, 2); }
 
 static void Cube_GetLevelDesc(Guest* g)
@@ -1617,11 +2332,18 @@ static void Cube_LockRect(Guest* g)
     Obj* s = sub(ARG(0), ARG(1), ARG(2));
     if (!s)
         RET(D3DERR_INVALIDCALL, 6);
-    lock_rect(s, ARG(3), ARG(4));
+    lock_rect(s, ARG(3), ARG(4), ARG(5));
     RET(D3D_OK, 6);
 }
 
-static void Cube_UnlockRect(Guest* g) { RET(sub(ARG(0), ARG(1), ARG(2)) ? D3D_OK : D3DERR_INVALIDCALL, 3); }
+static void Cube_UnlockRect(Guest* g)
+{
+    Obj* s = sub(ARG(0), ARG(1), ARG(2));
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 3);
+    unlock_rect(s);
+    RET(D3D_OK, 3);
+}
 static void Cube_AddDirtyRect(Guest* g) { RET(D3D_OK, 3); }
 
 /* Lock(OffsetToLock, SizeToLock, ppbData, Flags) */
@@ -1630,6 +2352,8 @@ static void Buffer_Lock(Guest* g)
     Obj* b = obj(ARG(0));
     if (!b || ARG(1) > b->size)
         RET(D3DERR_INVALIDCALL, 5);
+    if (!(ARG(4) & LOCK_READONLY))
+        b->gbuf_dirty = 1;
     wr32(ARG(3), obj_mem(b) + ARG(1));
     RET(D3D_OK, 5);
 }
@@ -1680,11 +2404,18 @@ static void Surface_LockRect(Guest* g)
     Obj* s = obj(ARG(0));
     if (!s)
         RET(D3DERR_INVALIDCALL, 4);
-    lock_rect(s, ARG(1), ARG(2));
+    lock_rect(s, ARG(1), ARG(2), ARG(3));
     RET(D3D_OK, 4);
 }
 
-static void Surface_UnlockRect(Guest* g) { RET(obj(ARG(0)) ? D3D_OK : D3DERR_INVALIDCALL, 1); }
+static void Surface_UnlockRect(Guest* g)
+{
+    Obj* s = obj(ARG(0));
+    if (!s)
+        RET(D3DERR_INVALIDCALL, 1);
+    unlock_rect(s);
+    RET(D3D_OK, 1);
+}
 
 /* --- entry point and registration ---------------------------------------------------------------------------- */
 /* Direct3DCreate8(SDKVersion) */
@@ -1700,6 +2431,27 @@ static void sh_Direct3DCreate8(Guest* g)
 /* DebugSetMute(BOOL): D3DX silences the debug runtime; cdecl (the caller pops its argument) */
 static void sh_DebugSetMute(Guest* g) { RETC(0); }
 
+/* ValidateVertexShader(pShader, pDeclaration, pCaps, ReturnErrors, ppErrors) and
+ * ValidatePixelShader(pShader, pCaps, ReturnErrors, ppErrors): what D3DX's shader assembler asks
+ * of d3d8.dll after assembling. As Wine: the version token decides (vs.1.0/1.1, ps.1.0-1.4), and
+ * there are never error strings. */
+#define E_FAIL 0x80004005u
+static void sh_ValidateVertexShader(Guest* g)
+{
+    uint32_t v = ARG(0) ? rd32(ARG(0)) : 0;
+    if (ARG(4))
+        wr32(ARG(4), 0);
+    RET(v == 0xFFFE0100u || v == 0xFFFE0101u ? D3D_OK : E_FAIL, 5);
+}
+
+static void sh_ValidatePixelShader(Guest* g)
+{
+    uint32_t v = ARG(0) ? rd32(ARG(0)) : 0;
+    if (ARG(3))
+        wr32(ARG(3), 0);
+    RET(v >= 0xFFFF0100u && v <= 0xFFFF0104u ? D3D_OK : E_FAIL, 4);
+}
+
 #define D(i, m) { "d3d8.dll", #i "::" #m, i##_##m }
 #define U(i, m, f) { "d3d8.dll", #i "::" #m, f }
 #define UNKNOWN(i) U(i, QueryInterface, Unknown_QueryInterface), U(i, AddRef, Unknown_AddRef), U(i, Release, Unknown_Release)
@@ -1710,6 +2462,8 @@ static void sh_DebugSetMute(Guest* g) { RETC(0); }
 static const ShimDef D3D8[] = {
     { "d3d8.dll", "Direct3DCreate8", sh_Direct3DCreate8 },
     { "d3d8.dll", "DebugSetMute", sh_DebugSetMute },
+    { "d3d8.dll", "ValidateVertexShader", sh_ValidateVertexShader },
+    { "d3d8.dll", "ValidatePixelShader", sh_ValidatePixelShader },
     UNKNOWN(IDirect3D8),
     D(IDirect3D8, GetAdapterCount),
     D(IDirect3D8, GetAdapterIdentifier),

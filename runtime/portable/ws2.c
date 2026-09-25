@@ -32,6 +32,7 @@ typedef int host_sock;
 #define host_close close
 static int host_errno(void) { return errno; }
 #endif
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -387,11 +388,41 @@ static void io_done(Sock* s, uint32_t bit, int would_block)
 
 static int host_flags(uint32_t f) { return (f & 1 ? MSG_OOB : 0) | (f & 2 ? MSG_PEEK : 0); }
 
+static uint8_t g_lobby_hash[16];
+static uint16_t g_lobby_ports[2]; /* data, view; 0: no LSB sign-in */
+
+void ws2_set_lobby_session(const uint8_t hash[16], uint16_t data_port, uint16_t view_port)
+{
+    memcpy(g_lobby_hash, hash, 16);
+    g_lobby_ports[0] = data_port, g_lobby_ports[1] = view_port;
+}
+
+/* xiloader's isLobbyCommand: to the login server's data or view port, "IXFF" at +4, and one of
+ * the commands the lobby authenticates */
+static void lobby_session(Sock* s, uint8_t* buf, uint32_t len)
+{
+    if (!g_lobby_ports[0] || len < 28 || memcmp(buf + 4, "IXFF", 4))
+        return;
+    switch (buf[8])
+    {
+    case 0x07: case 0x14: case 0x1F: case 0x21: case 0x22: case 0x24: case 0x26: case 0x28: case 0x2B: break;
+    default: return;
+    }
+    struct sockaddr_in peer;
+    socklen_t pl = sizeof peer;
+    if (getpeername(s->h, (struct sockaddr*)&peer, &pl) != 0)
+        return;
+    uint16_t port = ntohs(peer.sin_port);
+    if (port == g_lobby_ports[0] || port == g_lobby_ports[1])
+        memcpy(buf + 12, g_lobby_hash, 16);
+}
+
 static void sh_send(Guest* g)
 {
     Sock* s = sock(ARG(0));
     if (!s)
         RET(GUEST_SOCKET_ERROR, 4);
+    lobby_session(s, (uint8_t*)ARGP(1), ARG(2));
     int nb = s->nonblocking;
     if (!nb)
         gt_unlock();
@@ -695,21 +726,62 @@ static void sh_inet_ntoa(Guest* g)
     RET(g_ntoa, 1);
 }
 
+static uint32_t g_pol_server; /* host byte order; 0: pol.com names go to DNS */
+
+void ws2_set_pol_server(uint32_t ipv4_host_order)
+{
+    g_pol_server = ipv4_host_order;
+}
+
+/* "pol.com" or a name under it, any case, with or without the root's trailing dot */
+static int is_pol_name(const char* name)
+{
+    size_t n = strlen(name);
+    if (n && name[n - 1] == '.')
+        n--;
+    if (n < 7)
+        return 0;
+    const char* tail = name + n - 7;
+    for (int i = 0; i < 7; ++i)
+        if ((char)tolower((unsigned char)tail[i]) != "pol.com"[i])
+            return 0;
+    return n == 7 || tail[-1] == '.';
+}
+
 /* gethostbyname(name): one hostent the guest reads before the next call, as Winsock's per-thread one */
 static void sh_gethostbyname(Guest* g)
 {
     char name[256];
     snprintf(name, sizeof name, "%s", ARGS(0));
-    struct addrinfo hints, *res = NULL;
+    struct addrinfo hints, *res = NULL, fixed;
+    struct sockaddr_in fixed_addr;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
-    gt_unlock();
-    int r = getaddrinfo(name, NULL, &hints, &res);
-    gt_lock();
-    if (r != 0 || !res)
+    int from_dns = 1;
+    if (g_pol_server && is_pol_name(name))
     {
-        gt_set_error(WSAHOST_NOT_FOUND);
-        RET(0, 1);
+        /* PlayOnline's hosts are ours: one answer, no DNS */
+        memset(&fixed, 0, sizeof fixed);
+        memset(&fixed_addr, 0, sizeof fixed_addr);
+        fixed_addr.sin_family = AF_INET;
+        fixed_addr.sin_addr.s_addr = htonl(g_pol_server);
+        fixed.ai_family = AF_INET;
+        fixed.ai_addr = (struct sockaddr*)&fixed_addr;
+        res = &fixed;
+        from_dns = 0;
+        rt_log("[recomp] ws2: %s -> %u.%u.%u.%u\n", name, g_pol_server >> 24, (g_pol_server >> 16) & 255,
+            (g_pol_server >> 8) & 255, g_pol_server & 255);
+    }
+    else
+    {
+        gt_unlock();
+        int r = getaddrinfo(name, NULL, &hints, &res);
+        gt_lock();
+        if (r != 0 || !res)
+        {
+            gt_set_error(WSAHOST_NOT_FOUND);
+            RET(0, 1);
+        }
     }
     if (!g_hostent)
         g_hostent = gheap_alloc(512, 1);
@@ -727,7 +799,8 @@ static void sh_gethostbyname(Guest* g)
             n++;
         }
     wr32(list + 4 * n, 0);
-    freeaddrinfo(res);
+    if (from_dns)
+        freeaddrinfo(res);
     snprintf((char*)GUEST_PTR(str), 256, "%s", name);
     wr32(h, str);
     wr32(h + 4, aliases);

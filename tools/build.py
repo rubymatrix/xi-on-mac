@@ -117,6 +117,9 @@ FFXI_META = os.path.join(METADIR, 'FFXi.2026-08-22.meta.json')
 FFXI_IMAGE = os.path.join(ROOT, 'generated', 'FFXi.unpacked.dll')  # written by tools/prepare.py
 GAME = r'C:\Program Files (x86)\PlayOnline\SquareEnix\FINAL FANTASY XI'
 SDL3 = r'C:\Dev\SDL3\SDL3-3.4.16'
+# mbedtls 3.x or 4.x built for x64 (the LandSandBoat sign-in's TLS, host\lsb_login.c)
+MBEDTLS = r'C:\Dev\mbedtls'
+MBEDTLS_LIBS = ['mbedtls.lib', 'mbedx509.lib', 'mbedcrypto.lib']
 
 
 def host64(env):
@@ -128,9 +131,10 @@ def host64(env):
     gen_ffxi = ['generated\\ffxi\\' + f for f in sorted(os.listdir(os.path.join(ROOT, 'generated', 'ffxi'))) if f.endswith('.c')]
     objs = compile_stale(env, gen, 'build\\all64', ['/I', 'generated\\all'], CFLAGS64)
     objs += compile_stale(env, gen_ffxi, 'build\\ffxi64', ['/I', 'generated\\ffxi'], CFLAGS64)
-    objs += compile_stale(env, PORTABLE + ['runtime\\portable\\user32.c', 'runtime\\portable\\d3d8.c', 'runtime\\portable\\dsound.c', 'runtime\\portable\\input.c', 'runtime\\portable\\dinput.c', 'runtime\\portable\\ws2.c', 'host\\host64.c'], 'build\\host64', ['/I', os.path.join(SDL3, 'include')], CFLAGS64)
+    objs += compile_stale(env, PORTABLE + ['runtime\\portable\\user32.c', 'runtime\\portable\\d3d8.c', 'runtime\\portable\\dsound.c', 'runtime\\portable\\input.c', 'runtime\\portable\\dinput.c', 'runtime\\portable\\ws2.c', 'runtime\\portable\\gfx_null.c', 'host\\host64.c', 'host\\lsb_login.c'], 'build\\host64', ['/I', os.path.join(SDL3, 'include'), '/I', os.path.join(MBEDTLS, 'include')], CFLAGS64)
     run(['link', '/nologo', '/OUT:build\\host64.exe', '/MACHINE:X64', 'synchronization.lib', 'ws2_32.lib',
-         os.path.join(SDL3, 'lib', 'x64', 'SDL3.lib')] + objs, env)
+         os.path.join(SDL3, 'lib', 'x64', 'SDL3.lib'), 'advapi32.lib', 'bcrypt.lib']
+        + [os.path.join(MBEDTLS, 'lib', l) for l in MBEDTLS_LIBS] + objs, env)
     shutil.copy(os.path.join(SDL3, 'lib', 'x64', 'SDL3.dll'), os.path.join(ROOT, 'build'))
 
 
