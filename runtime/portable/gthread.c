@@ -12,7 +12,12 @@ static RT_TLS int t_held;
 /* --- the guest lock: a FIFO ticket lock with a quantum (bridge.c has the history) ----------- */
 static volatile uint32_t g_next_ticket, g_now_serving;
 static uint64_t g_acquired_at;
-#define QUANTUM_NS 2000000ull
+/* How long a thread keeps the lock while others wait. The game thread (the one that called gt_init,
+ * which runs GameStart) keeps it longest: each time it yields it waits out every other waiting
+ * thread's turn, which on slow cores (an Xbox One's) was 15% of its time with equal turns. */
+#define QUANTUM_NS 1000000ull
+#define GAME_QUANTUM_NS 8000000ull
+static RT_TLS uint64_t t_quantum_ns;
 
 void gt_lock(void)
 {
@@ -52,7 +57,8 @@ int gt_holds(void)
 static void yield_if_due(void)
 {
     static RT_TLS unsigned t_skip;
-    if (!t_held || !rt_lock_contended || (++t_skip & 31u) || rt_monotonic_ns() - g_acquired_at < QUANTUM_NS)
+    if (!t_held || !rt_lock_contended || (++t_skip & 31u) ||
+        rt_monotonic_ns() - g_acquired_at < (t_quantum_ns ? t_quantum_ns : QUANTUM_NS))
         return;
     gt_unlock();
     gt_lock();
@@ -60,6 +66,7 @@ static void yield_if_due(void)
 
 void gt_init(void)
 {
+    t_quantum_ns = GAME_QUANTUM_NS;
     rt_set_yield(yield_if_due);
 }
 
