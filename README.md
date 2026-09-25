@@ -1,4 +1,4 @@
-# FFXIRecompile
+# FFXI on Mac
 
 Static recompilation of FINAL FANTASY XI's `FFXiMain.dll` (and `FFXi.dll`) from 32-bit x86 to C,
 so the game runs natively on arm64 macOS without Wine or Rosetta.
