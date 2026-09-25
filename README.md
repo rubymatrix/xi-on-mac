@@ -39,29 +39,6 @@ Everything the build reads is in this repository.
 The metadata comes from a Ghidra-based discovery pass over each build's unpacked DLLs. That tool is
 not in this repository; the committed metadata is what the build uses.
 
-## Plan
-
-| phase | what |
-| --- | --- |
-| **R2**: recompile, x86-32 Windows | recompiler + runtime; the generated C built as a 32-bit stand-in `FFXiMain.dll` that `pol.exe` loads. Real Win32 and D3D8 underneath, so any divergence is a recompiler bug. |
-| **R3**: arm64 macOS | platform layer: Win32 subset, D3D8 on Metal, audio, input, sockets; `host64` in place of `pol.exe` |
-| R4: install-time pipeline | unpack + recompile + build on the player's machine |
-
-## Status
-
-- **R2** (2026-09-24): the translated game runs inside `pol.exe` on x86 Windows: zone-in, zoning,
-  combat, a busy city. Differential test: 133,681 calls, 0 mismatches. Only MMX/3DNow!/SSE are
-  unimplemented, in 194 functions (the runtime reports a CPU without them).
-- **R3.1** (2026-09-24): the same translation boots on a 64-bit host with the portable runtime
-  (`BOOT64 OK`); `host64` runs FFXi.dll → `GameStart` → FFXiMain with sound and input through SDL3
-  and our own polcore.
-- **R3.2** (2026-09-24): the Metal back end under the D3D8 front end. On arm64 macOS the game signs
-  in, zones in and renders the world at about 58 fps in busy scenes (M1 Max, 4096×4096
-  background). Pipelines build off the game's thread and are cached across sessions. Windows x64
-  still draws nothing (`gfx_null.c`).
-- **2026-09-25**: build 2026-09-03 plays on macOS through a LandSandBoat server with
-  no PlayOnline. DAT overlays (`--dats`) added.
-
 ## Building
 
 ### macOS (arm64)
@@ -88,8 +65,8 @@ re-translate and rebuild what changed.
 ```
 python tools\prepare.py [--game "<FINAL FANTASY XI>"]   # identify the build, unpack into generated\
 python tools\build.py difftest   # x86: translate the CRT slice, differential test
-python tools\build.py host       # x86: the stand-in FFXiMain.dll + boot test (R2)
-python tools\build.py boot64     # x64: the portable runtime + boot test (R3.1)
+python tools\build.py host       # x86: the stand-in FFXiMain.dll + boot test
+python tools\build.py boot64     # x64: the portable runtime + boot test
 python tools\install.py install  # put the stand-in in the game folder (restore: undo)
 python tools\trace_report.py <FFXiMain.trace.txt> [--seq <FFXiMain.seq.txt>]   # resolve a boundary trace
 python tools\build.py host64     # x64: the game host (SDL3 at C:\Dev\SDL3)
@@ -244,15 +221,15 @@ does not know:
 ```
 recomp/            x86c.py (one function -> C), recomp.py (driver: closure or --all, coverage stats)
 runtime/           guest.h (state, memory, x87 helpers), runtime.c (dispatch, traps, cpuid)
-runtime/win32/     R2, 32-bit Windows: loader (retail DLL mapped by Windows, entries patched),
+runtime/win32/     32-bit Windows: loader (retail DLL mapped by Windows, entries patched),
                    bridges (host<->guest on the x86 stack), guest lock, boundary trace, profiler
-runtime/portable/  R3, 64-bit hosts: plat.h (+ plat_win.c, plat_posix.c), gwin (guest window,
+runtime/portable/  64-bit hosts: plat.h (+ plat_win.c, plat_posix.c), gwin (guest window,
                    pages, heap), gthread (threads, lock, guest_call), thunk (imports -> shims),
                    pe (image loader), k32*/kobj/vfs/reg/ole (Win32; vfs also does the DAT overlays),
                    polcore* (our own polcore), user32 + input + dinput + dsound (SDL3),
                    d3d8 (the D3D8 front end), ws2 (sockets), gfx.h (the graphics back end):
                    gfx_metal.m (Metal) + gfx_msl*.c (D3D8 state and shaders -> MSL), gfx_null.c (elsewhere)
-host/              ffximain.c: the R2 stand-in FFXiMain.dll; host64.c: the R3 game host;
+host/              ffximain.c: the 32-bit stand-in FFXiMain.dll; host64.c: the 64-bit game host;
                    lsb_login.c: the LandSandBoat sign-in
 tests/             difftest.c (original vs translation), boot.c (x86), boot64.c (x64),
                    gfx_test.c (the Metal back end), d3d8_test.c (the D3D8 front end on it)
