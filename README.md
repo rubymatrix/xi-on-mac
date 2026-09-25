@@ -141,7 +141,9 @@ then:
 /usr/bin/openssl pkcs12 -export -inkey key.pem -in cert.pem -name "FFXI Local Code Signing" -out cs.p12 -passout pass:x
 security import cs.p12 -k ~/Library/Keychains/login.keychain-db -P x -T /usr/bin/codesign
 rm key.pem cs.p12
-``` The button art is the screen's own
+```
+
+The button art is the screen's own
 (`tools/make_ui_art.py`, `assets/ui/`); `third_party/stb/stb_image.h` (public domain) reads
 pictures.
 
