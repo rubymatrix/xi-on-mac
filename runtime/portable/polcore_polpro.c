@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "build.h" /* FFXI_CHARS_PTR, per retail build */
 #include "polcore.h"
 #include "polcore_config.h"
 
@@ -74,9 +75,8 @@ static void s173_handle(Guest* g)
 }
 
 /* 177 (0x100227d0): character record a0 (0x68 bytes), REQUIRED for world entry (spec 1a). Built
- * from FFXiMain's character table: entry = [[0x104df7b0] + 0x13820 + a0 * 0x8c], contentId =
+ * from FFXiMain's character table: entry = [[FFXI_CHARS_PTR] + 0x13820 + a0 * 0x8c], contentId =
  * d[+4], charId = w[+8] | b[+0xf] << 16, world = w[+0xa]. Registered to handle 0 (q[0x10] bit 15). */
-#define FFXI_CHARS_PTR 0x104DF7B0u
 #define FFXI_MAX_CHARS 16
 
 static void s177_character(Guest* g)

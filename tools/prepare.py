@@ -1,58 +1,65 @@
 """Produce generated/FFXiMain.unpacked.dll from the player's retail install.
 
-Finds FFXiMain.dll through the PlayOnline registry key (or --dll), checks its SHA-256 against the
-metadata's pinned build, and unpacks POL1 statically with tools/pol1_unpack.py - FFXiMain.dll, and FFXi.dll
-from the same folder. Output lands in generated/, which is gitignored: it is Square Enix code
-and never committed.
+  python tools/prepare.py [--game "<FINAL FANTASY XI folder>"]
+
+Finds FFXiMain.dll in --game (default: the PlayOnline registry key), identifies its build by
+SHA-256 in meta/builds.json, and unpacks POL1 statically with tools/pol1_unpack.py - FFXiMain.dll,
+and FFXi.dll from the same folder, which must be the same build. The choice is recorded in
+generated/build.json for build.py and install.py. Output lands in generated/, which is gitignored:
+it is Square Enix code and never committed.
 """
 import argparse
-import hashlib
-import json
 import os
+import shutil
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-META = os.path.join(ROOT, 'meta', 'FFXiMain.2026-08-22.meta.json')
+sys.path.insert(0, HERE)
+import buildinfo  # noqa: E402
 
 
-def retail_dll():
+def registry_game():
     import winreg
     for view in (winreg.KEY_WOW64_32KEY, winreg.KEY_WOW64_64KEY):
         try:
             k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\PlayOnlineUS\InstallFolder', 0, winreg.KEY_READ | view)
             path, _ = winreg.QueryValueEx(k, '0001')
-            return os.path.join(path, 'FFXiMain.dll')
+            return os.path.normpath(path)
         except OSError:
             continue
-    raise SystemExit('PlayOnline install not found in the registry; pass --dll')
+    raise SystemExit('PlayOnline install not found in the registry; pass --game')
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--dll')
-    ap.add_argument('--meta', default=META)
-    ap.add_argument('--out', default=os.path.join(ROOT, 'generated'))
+    ap.add_argument('--game', help='the FINAL FANTASY XI folder (default: from the registry)')
+    ap.add_argument('--out', default=os.path.join(buildinfo.ROOT, 'generated'))
     args = ap.parse_args()
 
-    dll = args.dll or retail_dll()
-    meta = json.load(open(args.meta))
-    digest = hashlib.sha256(open(dll, 'rb').read()).hexdigest()
-    if digest != meta['sha256']:
-        raise SystemExit('%s is build %s, metadata is for %s (%s)' % (dll, digest, meta['build'], meta['sha256']))
+    game = os.path.normpath(args.game) if args.game else registry_game()
+    dll = os.path.join(game, 'FFXiMain.dll')
+    ffxi = os.path.join(game, 'FFXi.dll')
+    digest = buildinfo.sha256(dll)
+    label = buildinfo.match(digest)
+    if label is None:
+        raise SystemExit('%s is build %s, which meta/builds.json does not know (a stand-in? run install.py restore)'
+                         % (dll, digest))
+    want = buildinfo.known()[label]['FFXi.dll']['sha256']
+    if buildinfo.sha256(ffxi) != want:
+        raise SystemExit('%s does not match FFXiMain.dll: build %s needs FFXi.dll %s' % (ffxi, label, want))
+
     os.makedirs(args.out, exist_ok=True)
-    # Keep the verified retail file too: the build and the loader use this copy, so nothing
+    # Keep the verified retail files too: the build and the loader use these copies, so nothing
     # depends on the state of the install afterwards.
-    with open(dll, 'rb') as src, open(os.path.join(args.out, 'FFXiMain.retail.dll'), 'wb') as dst:
-        dst.write(src.read())
-    out = os.path.join(args.out, 'FFXiMain.unpacked.dll')
+    shutil.copyfile(dll, os.path.join(args.out, 'FFXiMain.retail.dll'))
+    shutil.copyfile(ffxi, os.path.join(args.out, 'FFXi.retail.dll'))
     unpack = os.path.join(HERE, 'pol1_unpack.py')
+    out = os.path.join(args.out, 'FFXiMain.unpacked.dll')
     subprocess.check_call([sys.executable, unpack, dll, out])
-    ffxi = os.path.join(os.path.dirname(dll), 'FFXi.dll')
-    if os.path.exists(ffxi):
-        subprocess.check_call([sys.executable, unpack, ffxi, os.path.join(args.out, 'FFXi.unpacked.dll')])
-    print('ok: %s (build %s)' % (out, meta['build']))
+    subprocess.check_call([sys.executable, unpack, ffxi, os.path.join(args.out, 'FFXi.unpacked.dll')])
+    buildinfo.record(label, game)
+    print('ok: %s (build %s, from %s)' % (out, label, game))
 
 
 if __name__ == '__main__':

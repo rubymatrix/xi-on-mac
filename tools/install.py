@@ -5,29 +5,23 @@
                                     FFXiMain.retail.dll <- the verified retail file
   python tools/install.py restore   FFXiMain.dll <- the verified retail file; remove the rest
 
-The retail copy used is generated/FFXiMain.retail.dll, checked against the metadata's SHA-256
-every time. It never overwrites a file it does not recognise (retail, or a stand-in it built).
-The game folder is under Program Files: run from an elevated shell.
+The game folder and build are the ones tools/prepare.py chose (generated/build.json). The retail
+copy used is generated/FFXiMain.retail.dll, checked against that build's SHA-256 every time. It
+never overwrites a file it does not recognise (retail, or a stand-in it built). If the game folder
+is under Program Files, run from an elevated shell.
 """
-import hashlib
-import json
 import os
 import shutil
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, 'recomp'))
-from recomp import retail_dll  # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, 'tools'))
+import buildinfo  # noqa: E402
+from buildinfo import sha256  # noqa: E402
 
-META = os.path.join(ROOT, 'meta', 'FFXiMain.2026-08-22.meta.json')
 RETAIL_COPY = os.path.join(ROOT, 'generated', 'FFXiMain.retail.dll')
 STAND_IN = os.path.join(ROOT, 'build', 'host', 'FFXiMain.dll')
 MARKER = b'FFXIRecompile'  # appears in every stand-in build (its dialog title)
-
-
-def sha256(path):
-    with open(path, 'rb') as f:
-        return hashlib.sha256(f.read()).hexdigest()
 
 
 def classify(path, want):
@@ -43,10 +37,12 @@ def classify(path, want):
 
 def main():
     what = sys.argv[1] if len(sys.argv) > 1 else 'status'
-    want = json.load(open(META))['sha256']
+    build = buildinfo.current()
+    want = build['ffximain_sha']
     if sha256(RETAIL_COPY) != want:
-        raise SystemExit('%s is not the pinned retail build; run tools/prepare.py' % RETAIL_COPY)
-    game = os.path.dirname(retail_dll())
+        raise SystemExit('%s is not build %s; run tools/prepare.py' % (RETAIL_COPY, build['build']))
+    game = build['game']
+    print('build %s in %s' % (build['build'], game))
     main_dll = os.path.join(game, 'FFXiMain.dll')
     side = os.path.join(game, 'FFXiMain.retail.dll')
     print('FFXiMain.dll:        %s' % classify(main_dll, want))
@@ -68,7 +64,7 @@ def main():
         else:
             raise SystemExit(__doc__)
     except PermissionError:
-        raise SystemExit('permission denied: %s is under Program Files, run this from an elevated shell' % game)
+        raise SystemExit('permission denied: %s (under Program Files? run this from an elevated shell)' % game)
     print('done:')
     print('FFXiMain.dll:        %s' % classify(main_dll, want))
     print('FFXiMain.retail.dll: %s' % classify(side, want))

@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "build.h"
 #include "funcs.h"
 #include "runtime.h"
 
@@ -116,15 +117,15 @@ typedef int(__cdecl* memcmp_t)(const void*, const void*, size_t);
 typedef void*(__cdecl* memset_t)(void*, int, size_t);
 typedef void*(__cdecl* memcpy_t)(void*, const void*, size_t);
 
-#define O_STRLEN ((strlen_t)0x10317480)
-#define O_STRRCHR ((strrchr_t)0x10312800)
-#define O_STRNCMP ((strncmp_t)0x10312980)
-#define O_STRNCPY ((strncpy_t)0x10312090)
-#define O_MEMCMP ((memcmp_t)0x10317270)
-#define O_MEMSET ((memset_t)0x10316dd0)
-#define O_MEMCPY ((memcpy_t)0x103169e0)
+#define O_STRLEN ((strlen_t)CRT_STRLEN)
+#define O_STRRCHR ((strrchr_t)CRT_STRRCHR)
+#define O_STRNCMP ((strncmp_t)CRT_STRNCMP)
+#define O_STRNCPY ((strncpy_t)CRT_STRNCPY)
+#define O_MEMCMP ((memcmp_t)CRT_MEMCMP)
+#define O_MEMSET ((memset_t)CRT_MEMSET)
+#define O_MEMCPY ((memcpy_t)CRT_MEMCPY)
 typedef char*(__cdecl* strpbrk_t)(const char*, const char*);
-#define O_STRPBRK ((strpbrk_t)0x10322bf0) /* bts/bt on a 256-bit set on the stack */
+#define O_STRPBRK ((strpbrk_t)CRT_STRPBRK) /* bts/bt on a 256-bit set on the stack */
 
 /* 64-bit helpers: two 64-bit stack arguments, callee pops, result in edx:eax. */
 static uint64_t o_helper2(uint32_t fn, uint64_t a, uint64_t b)
@@ -159,7 +160,7 @@ static uint64_t o_shift(uint32_t fn, uint64_t v, uint32_t n)
 
 static uint64_t o_ftol(double x)
 {
-    uint32_t fn = 0x10311c6c, lo, hi;
+    uint32_t fn = CRT_FTOL, lo, hi;
     __asm {
         fld x
         call fn
@@ -190,13 +191,13 @@ static void test_strings(void)
         uint32_t args[3] = { (uint32_t)(uintptr_t)s };
 
         size_t o = O_STRLEN(s);
-        gcall("strlen", f_10317480, args, 1, 0);
+        gcall("strlen", F_STRLEN, args, 1, 0);
         if (G.eax != o) fail("strlen", "len %d off %d: %u vs %u", len, off, (unsigned)o, G.eax);
 
         int c = 'a' + rnd() % 5;
         args[1] = (uint32_t)c;
         char* r = O_STRRCHR(s, c);
-        gcall("strrchr", f_10312800, args, 2, 0);
+        gcall("strrchr", F_STRRCHR, args, 2, 0);
         if (G.eax != (uint32_t)(uintptr_t)r) fail("strrchr", "%p vs %08x", r, G.eax);
 
         char* t = S2 + rnd() % 8;
@@ -206,7 +207,7 @@ static void test_strings(void)
         args[1] = (uint32_t)(uintptr_t)t;
         args[2] = (uint32_t)n;
         int oc = O_STRNCMP(s, t, n);
-        gcall("strncmp", f_10312980, args, 3, 0);
+        gcall("strncmp", F_STRNCMP, args, 3, 0);
         if ((int)G.eax != oc) fail("strncmp", "%d vs %d", oc, (int)G.eax);
         {
             /* strpbrk over the full byte range, so bit offsets reach far past the 32-bit operand */
@@ -222,12 +223,12 @@ static void test_strings(void)
             hay[hl] = 0;
             char* pr = O_STRPBRK(hay, set);
             uint32_t pa[2] = { (uint32_t)(uintptr_t)hay, (uint32_t)(uintptr_t)set };
-            gcall("strpbrk", f_10322bf0, pa, 2, 0);
+            gcall("strpbrk", F_STRPBRK, pa, 2, 0);
             if (G.eax != (uint32_t)(uintptr_t)pr) fail("strpbrk", "%p vs %08x", pr, G.eax);
         }
         int om = O_MEMCMP(s, t, n < (size_t)len ? n : (size_t)len);
         args[2] = (uint32_t)(n < (size_t)len ? n : (size_t)len);
-        gcall("memcmp", f_10317270, args, 3, 0);
+        gcall("memcmp", F_MEMCMP, args, 3, 0);
         if ((int)G.eax != om) fail("memcmp", "%d vs %d", om, (int)G.eax);
     }
 }
@@ -245,7 +246,7 @@ static void test_buffers(void)
             int c = (int)(rnd() & 0x1FF);
             void* r = O_MEMSET(A + doff, c, n);
             uint32_t args[3] = { (uint32_t)(uintptr_t)(B + doff), (uint32_t)c, (uint32_t)n };
-            gcall("memset", f_10316dd0, args, 3, 0);
+            gcall("memset", F_MEMSET, args, 3, 0);
             if (G.eax - (uint32_t)(uintptr_t)B != (uint32_t)((char*)r - A)) fail("memset", "return value");
         }
         else if (kind == 1) /* memcpy, overlapping both ways */
@@ -253,7 +254,7 @@ static void test_buffers(void)
             int soff = rnd() % 1400;
             void* r = O_MEMCPY(A + doff + 700, A + soff, n);
             uint32_t args[3] = { (uint32_t)(uintptr_t)(B + doff + 700), (uint32_t)(uintptr_t)(B + soff), (uint32_t)n };
-            gcall("memcpy", f_103169e0, args, 3, 0);
+            gcall("memcpy", F_MEMCPY, args, 3, 0);
             if (G.eax - (uint32_t)(uintptr_t)B != (uint32_t)((char*)r - A)) fail("memcpy", "return value");
         }
         else /* strncpy */
@@ -262,7 +263,7 @@ static void test_buffers(void)
             fill_string(S1, len, 26);
             char* r = O_STRNCPY(A + doff, S1, n);
             uint32_t args[3] = { (uint32_t)(uintptr_t)(B + doff), (uint32_t)(uintptr_t)S1, (uint32_t)n };
-            gcall("strncpy", f_10312090, args, 3, 0);
+            gcall("strncpy", F_STRNCPY, args, 3, 0);
             if (G.eax - (uint32_t)(uintptr_t)B != (uint32_t)(r - A)) fail("strncpy", "return value");
         }
         if (memcmp(A, B, sizeof A))
@@ -277,10 +278,10 @@ static void test_buffers(void)
 static void test_int64(void)
 {
     static const struct { const char* name; uint32_t addr; GuestFn fn; int signed_div; } H[] = {
-        { "__allmul", 0x10315c20, f_10315c20, 0 },
-        { "__alldiv", 0x10316840, f_10316840, 1 },
-        { "__aulldiv", 0x10316970, f_10316970, 2 },
-        { "__aullrem", 0x103168f0, f_103168f0, 2 },
+        { "__allmul", CRT_ALLMUL, F_ALLMUL, 0 },
+        { "__alldiv", CRT_ALLDIV, F_ALLDIV, 1 },
+        { "__aulldiv", CRT_AULLDIV, F_AULLDIV, 2 },
+        { "__aullrem", CRT_AULLREM, F_AULLREM, 2 },
     };
     for (int h = 0; h < 4; ++h)
         for (int it = 0; it < 20000; ++it)
@@ -301,8 +302,8 @@ static void test_int64(void)
             if (o != t) fail(H[h].name, "%016llx, %016llx: %016llx vs %016llx", a, b, o, t);
         }
     static const struct { const char* name; uint32_t addr; GuestFn fn; } S[] = {
-        { "__allshl", 0x10312a60, f_10312a60 },
-        { "__aullshr", 0x103152d0, f_103152d0 },
+        { "__allshl", CRT_ALLSHL, F_ALLSHL },
+        { "__aullshr", CRT_AULLSHR, F_AULLSHR },
     };
     for (int h = 0; h < 2; ++h)
         for (int it = 0; it < 5000; ++it)
@@ -334,7 +335,7 @@ static void test_ftol(void)
         uint64_t o = o_ftol(x);
         uint32_t top = G.top;
         fpush(&G, x);
-        gcall("__ftol", f_10311c6c, NULL, 0, 0);
+        gcall("__ftol", F_FTOL, NULL, 0, 0);
         uint64_t t = ((uint64_t)G.edx << 32) | G.eax;
         if (o != t) fail("__ftol", "%.17g: %016llx vs %016llx", x, o, t);
         if (G.top != top) fail("__ftol", "x87 stack not popped");

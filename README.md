@@ -15,8 +15,16 @@ layer.
 - What *is* committed: the recompiler, the runtime, the platform layer, tests, and per-build
   **metadata** — addresses and shapes only (function ranges, switch tables, tail jumps, manual
   verdicts), keyed by the SHA-256 of the retail DLL.
-- One pinned build at a time. Currently `FFXiMain.dll` 2026-08-22,
-  SHA-256 `6f8844eb7f0380f30a3db2fc3c435e1145f5c450bdd0999133cc75c516ec3c3b`.
+- Every supported build is listed in `meta/builds.json`, keyed by the SHA-256 of its retail
+  `FFXiMain.dll` and `FFXi.dll`. `tools/prepare.py` identifies the install's build and records it in
+  `generated/build.json`; the build tools read it from there.
+
+  | build | `FFXiMain.dll` SHA-256 | taken from |
+  | --- | --- | --- |
+  | 2026-08-22 | `6f8844eb…3c3b` | retail PlayOnline, `C:\Program Files (x86)\PlayOnline` |
+  | 2026-09-03 | `f2245d1c…23e4` | a private-server install (no `patch.ver`) |
+
+  New labels are the date of the PE timestamp (2026-08-22 predates that rule).
 
 ## Inputs
 
@@ -24,7 +32,8 @@ Everything the build reads is in this repository.
 
 | input | here |
 | --- | --- |
-| per-build metadata `ffxi-recomp-meta/1` (addresses and shapes, no bytes) | `meta/FFXiMain.2026-08-22.meta.json`, `meta/FFXi.2026-08-22.meta.json` |
+| per-build metadata `ffxi-recomp-meta/1` (addresses and shapes, no bytes) | `meta/<module>.<build>.meta.json` |
+| the builds, their hashes, and the few addresses the runtime and tests name | `meta/builds.json` (written to `generated/build.h`) |
 | static POL1 unpacker | `tools/pol1_unpack.py` |
 | the specifications the runtime implements: polcore slots, the polcore and D3D8 surfaces | `specs/` |
 
@@ -51,7 +60,7 @@ are the ones the build uses.
 
 
 ```
-python tools\prepare.py          # verify + unpack the retail DLL into generated\
+python tools\prepare.py [--game "<FINAL FANTASY XI>"]   # identify the build, unpack into generated\
 python tools\build.py difftest   # x86: translate the CRT slice, differential test
 python tools\build.py host       # x86: the stand-in FFXiMain.dll + boot test (R2)
 python tools\build.py boot64     # x64: the portable runtime + boot test (R3.1)
@@ -90,9 +99,9 @@ runtime/portable/  R3, 64-bit hosts: plat.h (+ plat_win.c, plat_posix.c), gwin (
                    user32 + input + dinput + dsound (SDL3), d3d8 (the D3D8 front end), ws2 (sockets)
 host/              ffximain.c: the R2 stand-in FFXiMain.dll; host64.c: the R3 game host
 tests/             difftest.c (original vs translation), boot.c (x86), boot64.c (x64)
-tools/             prepare.py, pol1_unpack.py, build.py (MSVC), build_posix.py (clang), install.py,
-                   trace_report.py
-meta/              per-build metadata the recompiler reads
+tools/             prepare.py, buildinfo.py, pol1_unpack.py, build.py (MSVC), build_posix.py (clang),
+                   install.py, trace_report.py
+meta/              builds.json, and the per-build metadata the recompiler reads
 specs/             the specifications the runtime implements (polcore slots, D3D8 and polcore surfaces)
 generated/         (gitignored) unpacked image and recompiler output
 build/             (gitignored)

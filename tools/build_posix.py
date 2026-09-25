@@ -1,8 +1,8 @@
 """Build driver for POSIX hosts (clang): arm64 macOS for R3, Linux as a by-product.
 
   python3 tools/build_posix.py prepare --game <FINAL FANTASY XI folder>
-        verify the player's FFXiMain.dll against the pinned build and unpack FFXiMain.dll and
-        FFXi.dll into generated/ (Square Enix code: generated/ is gitignored, never committed)
+        identify the player's build (meta/builds.json) and unpack FFXiMain.dll and FFXi.dll into
+        generated/ (Square Enix code: generated/ is gitignored, never committed)
   python3 tools/build_posix.py boot64 --game <folder>    the boot test (R3.1)
   python3 tools/build_posix.py host64 --game <folder>    the game host, with SDL3
 
@@ -24,7 +24,8 @@ import build  # noqa: E402  (constants and source lists; nothing Windows-only ru
 
 ROOT = build.ROOT
 GEN_FFXI_IMAGE = build.FFXI_IMAGE
-CFLAGS = ['-O2', '-std=c11', '-g', '-DRT_GUEST_WINDOW', '-fno-strict-aliasing', '-I', 'runtime', '-I', 'runtime/portable']
+CFLAGS = ['-O2', '-std=c11', '-g', '-DRT_GUEST_WINDOW', '-fno-strict-aliasing', '-I', 'runtime', '-I', 'runtime/portable',
+          '-I', 'generated']
 # the generated C: every label and local is emitted whether used or not
 GEN_WARNINGS = ['-Wno-unused-label', '-Wno-unused-variable', '-Wno-unused-but-set-variable', '-Wno-unused-function',
                 '-Wno-parentheses-equality', '-Wno-unreachable-code']
@@ -52,6 +53,16 @@ def pkg_config(*args):
         raise SystemExit('SDL3 not found through pkg-config: brew install sdl3 pkg-config')
 
 
+def stale(s, obj):
+    src = os.path.join(ROOT, s)
+    if not os.path.exists(obj) or os.path.getmtime(obj) < os.path.getmtime(src):
+        return True
+    if not s.startswith('generated/') and os.path.getmtime(obj) < os.path.getmtime(build.BUILD_H):
+        with open(src, errors='replace') as f:
+            return '"build.h"' in f.read()  # another build's addresses
+    return False
+
+
 def compile_stale(sources, objdir, extra):
     """Compiles every source whose object is missing or older, in parallel; returns the objects."""
     os.makedirs(os.path.join(ROOT, objdir), exist_ok=True)
@@ -60,7 +71,7 @@ def compile_stale(sources, objdir, extra):
         obj = os.path.join(objdir, os.path.splitext(os.path.basename(s))[0] + '.o')
         objs.append(obj)
         full_obj = os.path.join(ROOT, obj)
-        if not os.path.exists(full_obj) or os.path.getmtime(full_obj) < os.path.getmtime(os.path.join(ROOT, s)):
+        if stale(s, full_obj):
             flags = CFLAGS + extra + (GEN_WARNINGS if s.startswith('generated/') else [])
             jobs.append(['clang', '-c'] + flags + [s, '-o', obj])
     if jobs:
@@ -81,10 +92,13 @@ def generated(sub):
 
 
 def prepare(game):
-    run([sys.executable, 'tools/prepare.py', '--dll', os.path.join(game, 'FFXiMain.dll')])  # and FFXi.dll
+    run([sys.executable, 'tools/prepare.py', '--game', game])  # and FFXi.dll
 
 
 def translate():
+    if build.BUILD is None:
+        raise SystemExit('run: python3 tools/build_posix.py prepare --game <folder>')
+    build.write_build_h()
     build.recomp('generated/all', ['--all'])
 
 
@@ -98,7 +112,7 @@ def boot64(game):
 def host64(game):
     translate()
     run([sys.executable, 'recomp/recomp.py', '--meta', build.FFXI_META, '--image', GEN_FFXI_IMAGE, '--retail',
-         os.path.join(game, 'FFXi.dll'), '--module', 'ffxi', '--out', 'generated/ffxi', '--all'])
+         build.FFXI_RETAIL, '--module', 'ffxi', '--out', 'generated/ffxi', '--all'])
     sdl_cflags, sdl_libs = pkg_config('--cflags', 'sdl3'), pkg_config('--libs', 'sdl3')
     objs = compile_stale(generated('all'), 'build/all64', ['-I', 'generated/all'])
     objs += compile_stale(generated('ffxi'), 'build/ffxi64', ['-I', 'generated/ffxi'])

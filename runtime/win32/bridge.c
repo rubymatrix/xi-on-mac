@@ -25,6 +25,7 @@
 #include <stdlib.h>
 
 #include "bridge.h"
+#include "build.h" /* FFXI_PRESENT_SITE */
 
 #define GUEST_STACK_SIZE (4u << 20)
 #define ARG_WINDOW 32u /* dwords copied across the boundary: enough for any Win32 / COM call */
@@ -618,7 +619,7 @@ int bridge_native(Guest* g, uint32_t target)
     Guest saved = *g;
 
     uint32_t site = rd32(g->esp) - rt_reloc_delta;
-    if (site == 0x100035cbu) /* IDirect3DDevice8::Present, from the game's wrapper 0x100035b0 */
+    if (site == FFXI_PRESENT_SITE) /* IDirect3DDevice8::Present, from the game's wrapper (0x100035b0) */
     {
         g_frames++;
         g_render_tid = GetCurrentThreadId();
