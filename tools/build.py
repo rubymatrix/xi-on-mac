@@ -7,6 +7,9 @@
                                    runtime (runtime/portable), and tests/boot64.exe run (x64, R3.1)
   python tools/build.py host64     the 64-bit game host (x64): FFXiMain and FFXi.dll translated, the
                                    portable runtime, SDL3 and the Direct3D 12 back end
+  python tools/build.py host64-headless
+                                   the same host with no graphics (gfx_null.c), for measuring the
+                                   game's CPU time alone: build\host64-headless.exe
   python tools/build.py gfxtest    the Direct3D 12 back end and the D3D8 front end, offscreen, without
                                    the game (tests/gfx_test.c, tests/d3d8_test.c); needs no prepare
   python tools/build.py launcher   the launcher (launcher/, Tauri): the PlayOnline tests,
@@ -164,11 +167,12 @@ SDL3 = os.environ.get('SDL3_DIR', r'C:\Dev\SDL3\SDL3-3.4.16')  # the SDL3 VC dev
 # the graphics back end on Windows: Direct3D 12, its shaders generated as HLSL and compiled at run time
 GFX_SOURCES = ['runtime\\portable\\gfx_hlsl.c', 'runtime\\portable\\gfx_hlsl_shaders.c', 'runtime\\portable\\gfx_d3d12.c']
 GFX_LIBS = ['d3d12.lib', 'dxgi.lib', 'd3dcompiler.lib', 'dxguid.lib']
-HOST_SOURCES = ['runtime\\portable\\user32.c', 'runtime\\portable\\d3d8.c', 'runtime\\portable\\dsound.c',
-                'runtime\\portable\\input.c', 'runtime\\portable\\dinput.c', 'runtime\\portable\\ws2.c', 'host\\host64.c',
-                'host\\lsb_login.c', 'host\\datui.c', 'host\\uidraw.c', 'host\\signin.c', 'host\\ui_art.c',
-                'host\\keychain.c', 'host\\appdefaults.c', 'launcher\\pol\\polcrypt.c', 'launcher\\pol\\polnet.c',
-                'launcher\\pol\\polsession.c'] + GFX_SOURCES
+HOST_BASE = ['runtime\\portable\\user32.c', 'runtime\\portable\\d3d8.c', 'runtime\\portable\\dsound.c',
+             'runtime\\portable\\input.c', 'runtime\\portable\\dinput.c', 'runtime\\portable\\ws2.c', 'host\\host64.c',
+             'host\\lsb_login.c', 'host\\datui.c', 'host\\uidraw.c', 'host\\signin.c', 'host\\ui_art.c',
+             'host\\keychain.c', 'host\\appdefaults.c', 'launcher\\pol\\polcrypt.c', 'launcher\\pol\\polnet.c',
+             'launcher\\pol\\polsession.c']
+HOST_SOURCES = HOST_BASE + GFX_SOURCES
 # the sign-in screen's: the PlayOnline client, stb_image
 HOST_INCLUDES = ['/I', 'launcher\\pol', '/I', 'third_party\\stb']
 # the LandSandBoat sign-in's TLS is SChannel here (secur32.lib); mbedtls on POSIX hosts
@@ -182,8 +186,8 @@ def sdl3():
     return ['/I', os.path.join(SDL3, 'include')], os.path.join(SDL3, 'lib', 'x64', 'SDL3.lib')
 
 
-def host64(env):
-    """The 64-bit game host: FFXiMain and FFXi.dll translated, the portable runtime, SDL3."""
+def game_objects(env):
+    """FFXiMain and FFXi.dll translated and compiled: the objects every 64-bit host links."""
     recomp('generated/all', ['--all'])
     run([sys.executable, 'recomp/recomp.py', '--meta', FFXI_META, '--image', FFXI_IMAGE, '--retail',
          FFXI_RETAIL, '--module', 'ffxi', '--out', 'generated/ffxi', '--all'])
@@ -191,11 +195,29 @@ def host64(env):
     gen_ffxi = ['generated\\ffxi\\' + f for f in sorted(os.listdir(os.path.join(ROOT, 'generated', 'ffxi'))) if f.endswith('.c')]
     objs = compile_stale(env, gen, 'build\\all64', ['/I', 'generated\\all'], CFLAGS64)
     objs += compile_stale(env, gen_ffxi, 'build\\ffxi64', ['/I', 'generated\\ffxi'], CFLAGS64)
+    return objs
+
+
+def host64(env):
+    """The 64-bit game host: FFXiMain and FFXi.dll translated, the portable runtime, SDL3."""
+    objs = game_objects(env)
     sdl_inc, sdl_lib = sdl3()
     objs += compile_stale(env, PORTABLE + HOST_SOURCES, 'build\\host64', sdl_inc + HOST_INCLUDES, CFLAGS64)
     run(['link', '/nologo', '/OUT:build\\host64.exe', '/MACHINE:X64', sdl_lib] + HOST_LIBS + objs, env)
     shutil.copy(os.path.join(SDL3, 'lib', 'x64', 'SDL3.dll'), os.path.join(ROOT, 'build'))
     print('built build\\host64.exe; run: build\\host64.exe --game "%s" ...' % BUILD['game'])
+
+
+def host64_headless(env):
+    """host64 with the null graphics back end: nothing drawn, the frame profile kept (FFXI_PROFILE=1)."""
+    objs = game_objects(env)
+    sdl_inc, sdl_lib = sdl3()
+    objs += compile_stale(env, PORTABLE + HOST_BASE + ['runtime\\portable\\gfx_null.c'], 'build\\headless', sdl_inc + HOST_INCLUDES,
+                          CFLAGS64)
+    libs = [lib for lib in HOST_LIBS if lib not in GFX_LIBS]
+    run(['link', '/nologo', '/OUT:build\\host64-headless.exe', '/MACHINE:X64', sdl_lib] + libs + objs, env)
+    shutil.copy(os.path.join(SDL3, 'lib', 'x64', 'SDL3.dll'), os.path.join(ROOT, 'build'))
+    print('built build\\host64-headless.exe')
 
 
 def gfxtest(env):
@@ -236,10 +258,11 @@ def main():
     what = sys.argv[1] if len(sys.argv) > 1 else 'difftest'
     if what == 'launcher':
         return launcher(msvc_env('x64'))
-    targets = {'difftest': difftest, 'host': host, 'boot64': boot64, 'host64': host64, 'gfxtest': gfxtest}
+    targets = {'difftest': difftest, 'host': host, 'boot64': boot64, 'host64': host64,
+               'host64-headless': host64_headless, 'gfxtest': gfxtest}
     if what not in targets:
         raise SystemExit('targets: ' + ', '.join(list(targets) + ['launcher']))
-    env = msvc_env('x64' if what in ('boot64', 'host64', 'gfxtest') else 'x86')
+    env = msvc_env('x64' if what in ('boot64', 'host64', 'host64-headless', 'gfxtest') else 'x86')
     if what != 'gfxtest':  # the others translate the game: they need the build prepare.py chose
         if BUILD is None:
             buildinfo.current()  # exits: run tools/prepare.py first
