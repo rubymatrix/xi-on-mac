@@ -45,6 +45,7 @@
 #include "ws2.h"
 #include "plat.h"
 #include "vfs.h"
+#include "build.h" /* FFXI_VERSION */
 
 extern const RtModule rt_module_ffxi; /* recomp.py --module ffxi */
 
@@ -285,17 +286,49 @@ int main(int argc, char** argv)
     rt_log("[recomp] *.pol.com -> %u.%u.%u.%u\n", pol_server >> 24, (pol_server >> 16) & 255, (pol_server >> 8) & 255,
         pol_server & 255);
     reg_init(regs, nregs, overlay);
-    if (plat_path_sep != '\\')
     {
-        /* A registry exported on Windows names the Windows install folders; here the install is
-         * mounted at C:\PlayOnline\SquareEnix, and FFXI checks its own path (FFXI-9001) */
-        char folder[720];
-        snprintf(folder, sizeof folder, "%s\\", guest_game);
-        reg_set_string("HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\InstallFolder", "0001", folder);
-        reg_set_string("HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\InstallFolder", "1000",
-            "C:\\PlayOnline\\SquareEnix\\PlayOnlineViewer");
+        /* The install folders are where the game is now, whatever the imported registry says (it
+         * comes from another machine or folder); the game checks them (FFXI-9001). Retail writes
+         * 0001 with a trailing backslash and 1000 without. */
+        char p[760];
+        snprintf(p, sizeof p, "%s\\", game);
+        reg_set_string("HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\InstallFolder", "0001", p);
+        snprintf(p, sizeof p, "%s\\..\\PlayOnlineViewer", game);
+        char viewer[760];
+        if (vfs_full_path(p, viewer, sizeof viewer))
+            snprintf(p, sizeof p, "%s", viewer);
+        reg_set_string("HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\InstallFolder", "1000", p);
     }
     vfs_init(game);
+    {
+        /* The game reads patch.ver from its folder and will not start without it; the lobby sees
+         * the version inside. Installs launched without the PlayOnline Viewer (private servers'
+         * xiloader) ship none: then one is made for this build's version, next to the host, and
+         * mounted over the game's path. The install itself is never written. */
+        char pv[760];
+        PlatStat st;
+        snprintf(pv, sizeof pv, "%s%cpatch.ver", host_game, plat_path_sep);
+        if (!plat_stat(pv, &st))
+        {
+            uint8_t file[0x120];
+            const char *dir_end = argv[0], *p;
+            for (p = argv[0]; *p; ++p)
+                if (*p == '/' || *p == plat_path_sep)
+                    dir_end = p + 1;
+            snprintf(pv, sizeof pv, "%.*spatch.%s.ver", (int)(dir_end - argv[0]), argv[0], FFXI_VERSION);
+            PlatFile* f = polcore_make_patch_ver(FFXI_VERSION, file) ? plat_file_open(pv, PLAT_WRITE | PLAT_CREATE | PLAT_TRUNCATE) : NULL;
+            if (!f || plat_file_write(f, file, sizeof file) != sizeof file)
+            {
+                fprintf(stderr, "cannot write %s\n", pv);
+                return 1;
+            }
+            plat_file_close(f);
+            char guest_pv[760];
+            snprintf(guest_pv, sizeof guest_pv, "%s\\patch.ver", game);
+            vfs_mount(guest_pv, pv);
+            printf("[recomp] no patch.ver in the install: version %s from %s\n", FFXI_VERSION, pv);
+        }
+    }
     polcore_slots_init();
     polcore_files_init();
     polcore_polpro_init();

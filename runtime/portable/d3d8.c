@@ -2432,9 +2432,10 @@ static void sh_Direct3DCreate8(Guest* g)
 static void sh_DebugSetMute(Guest* g) { RETC(0); }
 
 /* ValidateVertexShader(pShader, pDeclaration, pCaps, ReturnErrors, ppErrors) and
- * ValidatePixelShader(pShader, pCaps, ReturnErrors, ppErrors): what D3DX's shader assembler asks
- * of d3d8.dll after assembling. As Wine: the version token decides (vs.1.0/1.1, ps.1.0-1.4), and
- * there are never error strings. */
+ * ValidatePixelShader(pShader, pCaps, ReturnErrors, ppErrors), stdcall: what D3DX's shader
+ * assembler asks of d3d8.dll after assembling (fetched by GetProcAddress, 0x102ed02c in build
+ * 2026-09-03). As Wine: the version token decides (vs.1.0/1.1, ps.1.0-1.4), and there are never
+ * error strings. The game's shaders are vs.1.1/ps.1.1, which pass. */
 #define E_FAIL 0x80004005u
 static void sh_ValidateVertexShader(Guest* g)
 {

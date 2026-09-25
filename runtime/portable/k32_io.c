@@ -176,12 +176,28 @@ static void sh_GlobalMemoryStatus(Guest* g)
 
 static void file_close(void* f) { plat_file_close((PlatFile*)f); }
 
+/* FFXI_RECOMP_TRACE=1: the guest path of every file open or search that fails */
+static void trace_miss(const char* api, const char* path)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char* e = getenv("FFXI_RECOMP_TRACE");
+        on = e && *e == '1';
+    }
+    if (on)
+        fprintf(stderr, "[trace] %s failed: %s\n", api, path);
+}
+
 static void sh_CreateFileA(Guest* g)
 {
     char host[1400];
     uint32_t access = ARG(1), disp = ARG(4);
     if (!host_of(ARG(0), host, sizeof host))
+    {
+        trace_miss("CreateFileA", ARGS(0));
         RET(INVALID_HANDLE, 7);
+    }
     PlatStat st;
     int existed = plat_stat(host, &st);
     int flags = ((access & GENERIC_READ) || !(access & GENERIC_WRITE) ? PLAT_READ : 0) | ((access & GENERIC_WRITE) ? PLAT_WRITE : 0);
@@ -198,6 +214,7 @@ static void sh_CreateFileA(Guest* g)
     if (!f)
     {
         fail_plat();
+        trace_miss("CreateFileA", ARGS(0));
         RET(INVALID_HANDLE, 7);
     }
     uint32_t h = k_new(K_FILE, f, file_close);
@@ -497,6 +514,7 @@ static void sh_FindFirstFileA(Guest* g)
     if (!d)
     {
         free(f);
+        trace_miss("FindFirstFileA", ARGS(0));
         gt_set_error(ERROR_PATH_NOT_FOUND);
         RET(INVALID_HANDLE, 2);
     }
@@ -523,6 +541,7 @@ static void sh_FindFirstFileA(Guest* g)
     if (!find_fill(f, ARG(1)))
     {
         find_close(f);
+        trace_miss("FindFirstFileA", ARGS(0));
         gt_set_error(ERROR_FILE_NOT_FOUND);
         RET(INVALID_HANDLE, 2);
     }

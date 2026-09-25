@@ -398,6 +398,22 @@ static void s1171_patch_ver(Guest* g)
     RETC(0xFFFFFFFFu);
 }
 
+/* The plaintext layout retail's files have (spec, slot 1171 step 5): zeros, the version string at
+ * 0x18, the payload length 0x118 at 0x118, the checksum at 0x11c. key64 = seed 0 + product 1, what
+ * retail itself falls back to without a registry value; any key decrypts here (key recovery). */
+int polcore_make_patch_ver(const char* version, uint8_t out[0x120])
+{
+    uint8_t plain[0x120] = { 0 };
+    size_t len = strlen(version);
+    if (len >= 0x100)
+        return 0;
+    memcpy(plain + 0x18, version, len);
+    uint32_t payload = 0x118;
+    memcpy(plain + 0x118, &payload, 4);
+    pol_encrypt(plain, out, 0x120, 1);
+    return 1;
+}
+
 /* --- 907-913: option.bin --------------------------------------------------------------------------
  * Loaded synchronously into a guest-heap image with the item pointers relocated, so FFXiMain can
  * read item+0x18 directly. Not written back (910 reports success). */
