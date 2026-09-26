@@ -1251,6 +1251,8 @@ static id<MTLSamplerState> sampler(const GfxSampler* k)
     if ((k->min == 3 || k->mag == 3) && k->max_aniso > 1)
         d.maxAnisotropy = k->max_aniso > 16 ? 16 : k->max_aniso;
     d.lodMinClamp = k->max_level;
+    if (k->lod_cap)
+        d.lodMaxClamp = (float)(k->lod_cap - 1);
     uint32_t a = k->border >> 24, rgb = k->border & 0xFFFFFF;
     d.borderColor = a < 128 ? MTLSamplerBorderColorTransparentBlack
         : rgb >= 0x808080 ? MTLSamplerBorderColorOpaqueWhite : MTLSamplerBorderColorOpaqueBlack;

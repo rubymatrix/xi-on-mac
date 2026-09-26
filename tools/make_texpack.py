@@ -20,6 +20,12 @@ upright boxes, so the lean and the outline are lost at the ends of a name; the r
 must then stay within N texels of each glyph's box. With M, only quads at least M texels tall
 (the name font, not the small menu font packed beside it).
 
+--glyphs names a table of ink boxes (x0 x1 y0 y1 a line, in the original texture's texels), written
+beside the entry as <entry>.glyphs. FFXI draws each glyph of its name and small menu fonts as a
+fixed-width cell from where the glyph starts, which takes in the edge of the glyph beside it in the
+sheet and cuts the glyph's own lean; with a table the renderer draws each such quad over the ink box
+of the glyph that starts in its cell instead.
+
 --additive is for a texture the game draws with ONE/ONE blending (its text, FFXI_DRAWLOG shows the
 blend): only colour reaches the screen, so the colour is multiplied by alpha - a soft edge fades to
 black, not to a hard edge - and every texel's colour counts in the mipmaps and the compression.
@@ -193,6 +199,8 @@ def main():
     ap.add_argument('--pad', type=int, default=0,
                     help='texels to widen each glyph quad drawn with it (italic fonts the game cuts at upright boxes)')
     ap.add_argument('--pad-min', type=int, default=0, help='... only glyph quads at least this many texels tall')
+    ap.add_argument('--glyphs', help='a glyph table (lines of x0 x1 y0 y1, the texture\'s texels): each glyph quad is '
+                    'drawn over the ink box of the glyph starting in its cell')
     a = ap.parse_args()
     digest = int(a.hash, 16)
     w, h = (int(v) for v in a.size.lower().split('x'))
@@ -206,6 +214,9 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, f'{digest:016x}_{w}x{h}' + (f'_pad{a.pad}' + (f'min{a.pad_min}' if a.pad_min else '') if a.pad else '') + '.dds')
     write_dds(path, mip_chain(img, a.additive), a.additive)
+    if a.glyphs:
+        import shutil
+        shutil.copyfile(a.glyphs, path[:-4] + '.glyphs')
     print(f'{digest:016x} ({w}x{h}) -> {path} ({img.shape[1]}x{img.shape[0]} DXT5)')
 
 

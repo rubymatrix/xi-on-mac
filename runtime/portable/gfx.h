@@ -167,6 +167,8 @@ typedef struct GfxSampler
     uint8_t addr_u, addr_v, addr_w; /* D3DTEXTUREADDRESS */
     uint8_t mag, min, mip;          /* D3DTEXTUREFILTERTYPE */
     uint8_t max_aniso, max_level;
+    uint8_t lod_cap, pad[3]; /* 0, or the coarsest mip sampled + 1 (texture packs: glyph sheets whose
+                              * small mips blend neighbouring glyphs into each one's edges) */
     uint32_t border;
 } GfxSampler;
 

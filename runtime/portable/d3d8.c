@@ -173,6 +173,7 @@ typedef struct Obj
     GfxTex* repl;        /* textures: a texture pack's replacement, drawn with instead of gpu */
     uint32_t repl_pad;   /* ... whose glyph quads are drawn this many texels wider each side */
     uint32_t repl_pad_min; /* ... when they are at least this many texels tall */
+    const struct PackEntry* repl_entry; /* ... and its glyph table, if it has one */
     uint32_t pw, ph;     /* render-target textures drawn at the screen's resolution (native_size): gpu's
                           * size, where the game sees width x height; 0 when they are the same */
 } Obj;
@@ -349,6 +350,8 @@ typedef struct PackEntry
     uint64_t hash;
     uint32_t w, h, pad, pad_min; /* _pad<N>[min<M>] in the name: texels each glyph quad drawn with it is
                                   * widened by (only quads at least M texels tall) */
+    float* glyphs;               /* <entry>.glyphs beside it: each glyph's ink box (x0 x1 y0 y1, texels) */
+    uint32_t nglyphs;
     char* path;
     GfxTex* tex;
     uint8_t tried; /* loaded, or failed to */
@@ -383,7 +386,19 @@ void d3d8_texture_pack(const char* dir)
         size_t n = strlen(dir) + strlen(name) + 2;
         char* path = (char*)malloc(n);
         snprintf(path, n, "%s%c%s", dir, plat_path_sep, name);
-        g_pack[g_npack++] = (PackEntry){ hash, w, h, pad, pad_min, path, NULL, 0 };
+        PackEntry e = { hash, w, h, pad, pad_min, NULL, 0, path, NULL, 0 };
+        char gp[1100];
+        snprintf(gp, sizeof gp, "%.*s.glyphs", (int)(strlen(path) - 4), path);
+        FILE* gf = fopen(gp, "r");
+        float b[4];
+        while (gf && fscanf(gf, "%f %f %f %f", &b[0], &b[1], &b[2], &b[3]) == 4)
+        {
+            e.glyphs = (float*)realloc(e.glyphs, (e.nglyphs + 1) * 4 * sizeof(float));
+            memcpy(e.glyphs + 4 * e.nglyphs++, b, sizeof b);
+        }
+        if (gf)
+            fclose(gf);
+        g_pack[g_npack++] = e;
         added++;
     }
     plat_dir_close(d);
@@ -426,8 +441,9 @@ static GfxTex* load_dds(const char* path)
 }
 
 /* The replacement for a texture whose first level was just uploaded, or NULL; *pad its entry's. */
-static GfxTex* texture_replacement(const Obj* t, const Obj* level0, uint32_t* pad, uint32_t* pad_min)
+static GfxTex* texture_replacement(const Obj* t, const Obj* level0, uint32_t* pad, uint32_t* pad_min, const PackEntry** entry)
 {
+    *pad = *pad_min = 0, *entry = NULL;
     if (g_texlog < 0)
         g_texlog = getenv("FFXI_TEXLOG") && getenv("FFXI_TEXLOG")[0] == '1';
     if (t->kind != O_TEXTURE || (!g_npack && !g_texlog))
@@ -455,7 +471,7 @@ static GfxTex* texture_replacement(const Obj* t, const Obj* level0, uint32_t* pa
             if (e->tex)
                 rt_log("[recomp] textures: %ux%u %016llx replaced by %s\n", t->width, t->height, (unsigned long long)hash, e->path);
         }
-        *pad = e->pad, *pad_min = e->pad_min;
+        *pad = e->pad, *pad_min = e->pad_min, *entry = e;
         return e->tex;
     }
     if (g_texlog)
@@ -487,7 +503,7 @@ static GfxTex* texture_for_draw(uint32_t p, int* kind)
             {
                 gfx_tex_upload(t->gpu, s->face, s->level, GUEST_PTR(s->mem), fmt_pitch(s->format, s->width));
                 if (i == 0)
-                    t->repl = texture_replacement(t, s, &t->repl_pad, &t->repl_pad_min);
+                    t->repl = texture_replacement(t, s, &t->repl_pad, &t->repl_pad_min, &t->repl_entry);
             }
             if (s)
                 s->dirty = 0;
@@ -1705,6 +1721,50 @@ static void IDirect3DDevice8_DrawIndexedPrimitive(Guest* g)
 
 /* DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride).
  * The ...UP draws leave stream 0 (and the indices) unset, as D3D8 does. */
+/* A glyph quad from a texture whose pack entry has a glyph table: FFXI draws each glyph of its name
+ * and small menu fonts as a fixed-width cell from where the glyph starts in the sheet, so the cell also
+ * takes in the edge of the glyph beside it there (shown between letters) and cuts the glyph's own lean
+ * and outline. The quad is drawn over the ink box of the glyph that starts in the cell instead: the
+ * same texels where they overlap, so it lands where the game put it. */
+static uint32_t fit_quad(uint32_t data, const Obj* t)
+{
+    const PackEntry* e = (const PackEntry*)t->repl_entry;
+    static uint32_t buf;
+    if (!buf)
+        buf = gheap_alloc(4 * 28, 1);
+    float x[4], u[4], v[4], ulo = 1e30f, uhi = -1e30f, vlo = 1e30f, vhi = -1e30f, xlo = 1e30f, xhi = -1e30f;
+    for (int i = 0; i < 4; ++i)
+    {
+        x[i] = u2f(rd32(data + 28u * (uint32_t)i)), u[i] = u2f(rd32(data + 28u * (uint32_t)i + 20)) * (float)t->width;
+        v[i] = u2f(rd32(data + 28u * (uint32_t)i + 24)) * (float)t->height;
+        ulo = u[i] < ulo ? u[i] : ulo, uhi = u[i] > uhi ? u[i] : uhi, vlo = v[i] < vlo ? v[i] : vlo, vhi = v[i] > vhi ? v[i] : vhi;
+        xlo = x[i] < xlo ? x[i] : xlo, xhi = x[i] > xhi ? x[i] : xhi;
+    }
+    if (!(uhi > ulo) || !(xhi > xlo))
+        return data;
+    const float* best = NULL;
+    for (uint32_t k = 0; k < e->nglyphs; ++k)
+    {
+        const float* g = e->glyphs + 4 * k;
+        float cy = (g[2] + g[3]) * 0.5f;
+        if (cy < vlo || cy > vhi || g[0] < ulo - 3.0f || g[0] >= uhi)
+            continue;
+        if (!best || g[0] < best[0])
+            best = g;
+    }
+    if (!best)
+        return data;
+    float k = (xhi - xlo) / (uhi - ulo);
+    memcpy(GUEST_PTR(buf), GUEST_PTR(data), 4 * 28);
+    for (int i = 0; i < 4; ++i)
+    {
+        float nu = u[i] - ulo < uhi - u[i] ? best[0] : best[1];
+        wr32(buf + 28u * (uint32_t)i, f2u(x[i] + (nu - u[i]) * k));
+        wr32(buf + 28u * (uint32_t)i + 20, f2u(nu / (float)t->width));
+    }
+    return buf;
+}
+
 /* A glyph quad (a strip of four XYZRHW + diffuse + UV vertices) from a texture whose pack entry
  * asks for it, drawn repl_pad texels wider on each side, its UVs moved with it: FFXI cuts each
  * glyph of its italic name font at an upright box, so the lean and the outline at the ends of a
@@ -1743,8 +1803,13 @@ static void IDirect3DDevice8_DrawPrimitiveUP(Guest* g)
         g_probe_sky = 1; /* transformed vertices at the sky's depth */
     uint32_t data = ARG(3);
     Obj* t0 = obj(g_dev.cur.tex[0]);
-    if (t0 && t0->repl && t0->repl_pad && ARG(1) == 5 && ARG(2) == 2 && ARG(4) == 28 && g_dev.cur.vs == 0x144)
-        data = widen_quad(data, t0);
+    if (t0 && t0->repl && ARG(1) == 5 && ARG(2) == 2 && ARG(4) == 28 && g_dev.cur.vs == 0x144)
+    {
+        if (t0->repl_entry && ((const PackEntry*)t0->repl_entry)->nglyphs)
+            data = fit_quad(data, t0);
+        else if (t0->repl_pad)
+            data = widen_quad(data, t0);
+    }
     draw(ARG(1), ARG(2), 0, 0, 0, data, ARG(4));
     bind(&g_dev.cur.stream[0], 0);
     g_dev.cur.stride[0] = 0;
@@ -2291,10 +2356,11 @@ static int build_draw(GfxDraw* d)
             Obj* to = obj(s->tex[i]);
             uint32_t maxlevel = t[20] > to->lod ? t[20] : to->lod;
             d->samp[i] = (GfxSampler){ (uint8_t)t[13], (uint8_t)t[14], (uint8_t)t[25], (uint8_t)t[16], (uint8_t)t[17], (uint8_t)t[18],
-                (uint8_t)t[21], (uint8_t)maxlevel, t[15] };
+                (uint8_t)t[21], (uint8_t)maxlevel, 0, { 0 }, t[15] };
             if (to->repl && tex == to->repl) /* drawn smaller than it is: linear, between its mipmaps */
             {
                 d->samp[i].mag = d->samp[i].min = d->samp[i].mip = 2, d->samp[i].max_level = 0;
+                d->samp[i].lod_cap = 2; /* its half-size mip at most: smaller ones blend neighbouring glyphs in */
                 if (i == 0)
                     repl0 = 1;
             }
