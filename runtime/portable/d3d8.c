@@ -95,6 +95,7 @@ static float u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 
 /* FFXI_DRAWLOG (see cap_present) */
 static const char* g_cap_path;
+static void scene_forget(GfxTex* t);
 static FILE* g_cap;
 static uint32_t g_cap_esp, g_cap_frame, g_cap_n;
 static void cap_present(void);
@@ -232,6 +233,7 @@ static void obj_destroy(Obj* o)
         }
     }
     free(o->subs);
+    scene_forget(o->gpu);
     gfx_tex_destroy(o->gpu);
     gfx_buf_destroy(o->gbuf);
     if (o->mem)
@@ -2664,9 +2666,9 @@ static void cap_draw(GfxDraw* d, uint32_t prim, uint32_t count, uint32_t first, 
 {
     FILE* f = g_cap;
     Obj* crt = obj(g_dev.rt);
-    fprintf(f, "#%u prim %u count %u n %u vs %x rhw %d rt %s %ux%u vp %u,%u %ux%u", g_cap_n++, prim, count, n, g_dev.cur.vs,
-        d->vs.rhw, g_dev.rt == g_dev.backbuffer ? "bb" : "off", crt ? crt->width : 0, crt ? crt->height : 0, d->vp[0], d->vp[1],
-        d->vp[2], d->vp[3]);
+    fprintf(f, "#%u prim %u count %u n %u vs %x rhw %d rt %s %ux%u %08x vp %u,%u %ux%u", g_cap_n++, prim, count, n, g_dev.cur.vs,
+        d->vs.rhw, g_dev.rt == g_dev.backbuffer ? "bb" : "off", crt ? crt->width : 0, crt ? crt->height : 0, g_dev.rt, d->vp[0],
+        d->vp[1], d->vp[2], d->vp[3]);
     const uint32_t* crs = g_dev.cur.rs;
     const uint32_t* ct = g_dev.cur.tss[0];
     fprintf(f, " atest %u func %u ref %u blend %u %u/%u op %u tss0 c%u(%x,%x) a%u(%x,%x) tss1 c%u", crs[15], crs[25], crs[24],
@@ -2674,6 +2676,8 @@ static void cap_draw(GfxDraw* d, uint32_t prim, uint32_t count, uint32_t first, 
     Obj* t = obj(g_dev.cur.tex[0]);
     if (t)
         fprintf(f, " tex %08x %ux%u fmt %u", g_dev.cur.tex[0], t->width, t->height, t->format);
+    fprintf(f, " z %u/%u fog %u/%u lit %u caster %u", d->depth.zenable, d->depth.zwrite, d->fs.fog, d->vs.fog_vertex,
+        d->vs.lighting, d->caster);
     if (!d->vs.rhw)
     {
         const float* P = g_dev.cur.xf[3];
@@ -2734,13 +2738,37 @@ static void cap_draw(GfxDraw* d, uint32_t prim, uint32_t count, uint32_t first, 
 static struct
 {
     GfxTex* rt;     /* the scene's target */
+    /* the world's view: the target that took the most 3D draws the frame before. FFXI draws the world
+     * into one 4096 target and copies it into another, where nameplates and effects go on; other
+     * targets' scenes get no effects, cast no shadows and give no camera. */
+    GfxTex* world;
+    int world_done; /* the effects ran on it this frame: once a frame */
+    struct { GfxTex* t; uint32_t n; } tally[4]; /* this frame's 3D draws per target */
     uint32_t draws; /* 3D draws to it since the effects last ran */
     int done, cam;  /* the effects ran this frame; s holds a camera */
     /* where this frame's camera and sun came from: the draw's number, and for the camera 2 when that
      * draw was fogged (the world), 1 when not; 0 before one is found */
     uint32_t cam_draw, sun_draw, cam_rank;
     GfxScene s;
+    /* the profile (FFXI_PROFILE): scenes by how they ended and where the camera came from, 3D draws
+     * after the effects ran, and screen-space or undepth-tested draws onto the scene before them
+     * (what the effects would shade) */
+    uint32_t st_frames, st_why[4], st_cam[3], st_late, st_over, st_over_rhw;
 } g_scene;
+
+/* a texture going away: the scene no longer points at it */
+static void scene_forget(GfxTex* t)
+{
+    if (!t)
+        return;
+    if (g_scene.rt == t)
+        g_scene.rt = NULL, g_scene.draws = 0, g_scene.done = 0;
+    if (g_scene.world == t)
+        g_scene.world = NULL;
+    for (int i = 0; i < 4; ++i)
+        if (g_scene.tally[i].t == t)
+            g_scene.tally[i].t = NULL, g_scene.tally[i].n = 0;
+}
 
 static void scene_finish(const char* why)
 {
@@ -2755,37 +2783,80 @@ static void scene_finish(const char* why)
             g_scene.sun_draw, p[0], p[5], p[10], p[11], p[14], p[15], vp[0], vp[1], vp[2], vp[3], u2f(vp[4]), u2f(vp[5]),
             f[0], f[1], f[2]);
     }
-    if (g_scene.draws && !g_scene.done && g_scene.cam)
+    if (g_scene.draws && !g_scene.done)
+    {
+        g_scene.st_why[!strcmp(why, "sampled") ? 0 : why[0] == 'i' ? 1 : why[0] == 'p' ? 2 : 3]++;
+        g_scene.st_cam[g_scene.cam ? g_scene.cam_rank : 0]++;
+    }
+    if (g_scene.draws && !g_scene.done && g_scene.cam && (!g_scene.world || g_scene.rt == g_scene.world) &&
+        !g_scene.world_done)
+    {
         gfx_scene_done(g_scene.rt, &g_scene.s);
+        g_scene.world_done = 1;
+    }
     g_scene.draws = 0;
     g_scene.done = 1;
 }
 
-static void scene_note(const GfxDraw* d)
+static void scene_note(GfxDraw* d)
 {
+    d->caster = 0;
     uint32_t face, level;
     Obj* rt = obj(g_dev.rt);
     GfxTex* c = rt ? surface_gpu(rt, &face, &level) : NULL;
     if (!c)
         return;
+    int large = (uint64_t)rt->width * rt->height * 2 >= (uint64_t)g_dev.pp[0] * g_dev.pp[1];
     if (g_scene.draws && !g_scene.done)
     {
         int sampled = 0;
         for (int i = 0; i < 8; ++i)
             sampled |= d->tex[i] == g_scene.rt;
-        if (sampled)
+        /* the scene drawn somewhere as large as the screen (copied into the target the interface goes
+         * on, or onto the back buffer): not the sun flare's occlusion probe, which copies it into
+         * 16x16 - several times a frame, while the world is still being drawn */
+        if (sampled && large)
             scene_finish("sampled");
-        else if (d->vs.rhw && c == g_scene.rt && g_dev.rt == g_dev.backbuffer)
+        /* the interface over the scene - on the back buffer, or into the scene's own target: FFXI draws
+         * nameplates and floating text there, blended, before it draws the scene onto the back buffer;
+         * the effects go under them, not over. (Not the probe's own screen-space quads there, which
+         * are opaque - and textured, some frames.) */
+        else if (d->vs.rhw && c == g_scene.rt && (g_dev.rt == g_dev.backbuffer || d->pipe.blend))
             scene_finish("interface");
     }
+    if (c == g_scene.rt && g_scene.draws && !g_scene.done && (d->vs.rhw || !d->depth.zenable))
+        g_scene.st_over++, g_scene.st_over_rhw += d->vs.rhw;
     if (d->vs.rhw || !d->depth.zenable || !obj(g_dev.ds) || face || level ||
         (uint64_t)rt->width * rt->height * 2 < (uint64_t)g_dev.pp[0] * g_dev.pp[1])
         return;
-    if (c != g_scene.rt)
-        g_scene.rt = c, g_scene.draws = 0, g_scene.done = 0;
-    if (g_scene.done) /* 3D again after the effects ran: drawn as it is */
+    for (int i = 0; i < 4; ++i)
+        if (g_scene.tally[i].t == c || !g_scene.tally[i].t || i == 3)
+        {
+            if (g_scene.tally[i].t != c)
+                g_scene.tally[i].t = c, g_scene.tally[i].n = 0;
+            g_scene.tally[i].n++;
+            break;
+        }
+    /* 3D into other targets - the game draws characters into one partway through the world, then
+     * goes on with the world - is not the world's scene: it neither ends nor starts one */
+    if (g_scene.world && c != g_scene.world)
         return;
+    if (c != g_scene.rt) /* a new scene: the one before is done; the new one's camera and sun are its own */
+    {
+        scene_finish("switch");
+        g_scene.rt = c, g_scene.draws = 0, g_scene.done = 0, g_scene.cam_rank = 0, g_scene.sun_draw = 0;
+    }
+    if (g_scene.done) /* 3D again after the effects ran: drawn as it is */
+    {
+        g_scene.st_late++;
+        return;
+    }
     g_scene.draws++;
+    /* what casts the sun's shadow (the back end's shadow map): the scene's opaque, depth-writing
+     * draws - alpha-tested ones too (leaves, fences) - of the world, which is fogged or drawn by the
+     * zone's shaders; not the sky, the sun and its flare (unfogged, with views of their own) */
+    d->caster = d->depth.zwrite && (!d->pipe.blend || (d->fs.alpha_func && d->fs.alpha_func != 8)) &&
+        (d->vs.prog || d->fs.fog || d->vs.fog_vertex) && !g_scene.world_done;
     const State* s = &g_dev.cur;
     GfxScene* sc = &g_scene.s;
     /* the camera and fog from the frame's first depth-writing fixed-function draw, a fogged one
@@ -2816,6 +2887,25 @@ static void scene_note(const GfxDraw* d)
 static void scene_present(void)
 {
     scene_finish("present");
+    g_scene.world_done = 0;
+    /* next frame's world: this frame's busiest target */
+    uint32_t best = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        if (g_scene.tally[i].t && g_scene.tally[i].n > best)
+            best = g_scene.tally[i].n, g_scene.world = g_scene.tally[i].t;
+        g_scene.tally[i].t = NULL, g_scene.tally[i].n = 0;
+    }
+    if (gfx_profiling && ++g_scene.st_frames == 120)
+    {
+        fprintf(stderr, "[recomp] d3d8: scenes (120 frames, the last on %s): ended sampled %u, interface %u, present %u, switch %u; camera fogged %u, "
+            "unfogged %u, none %u; 3D after the effects %u; over the scene before them %u (%u screen-space)\n",
+            g_scene.rt == g_scene.world ? "the world's view" : "another target", g_scene.st_why[0], g_scene.st_why[1], g_scene.st_why[2],
+            g_scene.st_why[3], g_scene.st_cam[2], g_scene.st_cam[1], g_scene.st_cam[0],
+            g_scene.st_late, g_scene.st_over, g_scene.st_over_rhw);
+        memset(g_scene.st_why, 0, sizeof g_scene.st_why), memset(g_scene.st_cam, 0, sizeof g_scene.st_cam);
+        g_scene.st_frames = g_scene.st_late = g_scene.st_over = g_scene.st_over_rhw = 0;
+    }
     g_scene.done = 0;
     g_scene.cam_draw = g_scene.sun_draw = g_scene.cam_rank = 0;
 }

@@ -207,6 +207,7 @@ int gfx_msl_vs1(Sb* b, const GfxVsKey* k, const uint32_t* t)
     sb_printf(b, "vertex VOut vs_main(uint vid [[vertex_id]], constant U& u [[buffer(4)]]");
     for (int s = 0; s < GFX_NSTREAMS; ++s)
         sb_printf(b, ", device const uchar* s%d [[buffer(%d)]]", s, s);
+    gfx_msl_vs_params(b, k);
     sb_printf(b, ") {\n  VOut o;\n  int vi = int(vid) + u.vofs.x;\n");
     /* the inputs the declaration maps: v# is the declaration's register */
     for (int r = 0; r < GFX_NREGS; ++r)
@@ -266,7 +267,7 @@ int gfx_msl_vs1(Sb* b, const GfxVsKey* k, const uint32_t* t)
     sb_printf(b, "  o.d = saturate(oD0);\n  o.s = saturate(oD1);\n  o.fog = oFog.x;\n  o.ez = oPos.w;\n  o.psize = oPts.x;\n");
     for (int i = 0; i < k->ntex; ++i)
         sb_printf(b, "  o.t%d = oT%d;\n", i, i);
-    sb_printf(b, "  return o;\n}\n");
+    gfx_msl_vs_return(b, k);
     return 1;
 }
 

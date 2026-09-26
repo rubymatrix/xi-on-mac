@@ -59,11 +59,20 @@ static const char PRELUDE[] =
     "static inline int reg_offset(constant U& u, int r) { return u.offset[r >> 2][r & 3]; }\n"
     "static inline float4 ld_color(device const uchar* p) { uchar4 c = *(device const uchar4*)p; return float4(c.z, c.y, c.x, c.w) / 255.0; }\n";
 
+/* lit per pixel: the vertex function passes on what the lighting starts from (the normal, the
+ * position and the material colors), and the fragment function lights - the same equations, but
+ * a point light's pool and a highlight no longer depend on where the vertices fall */
+static int pixel_lit(const GfxVsKey* k) { return k->pixel && k->lighting && !k->rhw && !k->flat && !k->prog; }
+
 /* the vertex function's output: what the fragment function reads */
-static void emit_vout(Sb* b, int ntex, int flat)
+static void emit_vout(Sb* b, const GfxVsKey* k)
 {
-    const char* fl = flat ? " [[flat]]" : "";
+    int ntex = k->ntex;
+    const char* fl = k->flat ? " [[flat]]" : "";
     sb_printf(b, "struct VOut {\n  float4 pos [[position]];\n  float4 d [[user(d)]]%s;\n  float4 s [[user(s)]]%s;\n", fl, fl);
+    if (pixel_lit(k))
+        sb_printf(b, "  float3 n [[user(n)]];\n  float4 pe [[user(pe)]];\n  float4 md [[user(md)]];\n  float4 ma [[user(ma)]];\n"
+                     "  float4 ms [[user(ms)]];\n  float4 me [[user(me)]];\n");
     for (int i = 0; i < ntex; ++i)
         sb_printf(b, "  float4 t%d [[user(t%d)]];\n", i, i);
     sb_printf(b, "  float fog [[user(fog)]];\n  float ez [[user(ez)]];\n  float psize [[point_size]];\n};\n");
@@ -113,11 +122,28 @@ static int elem_components(uint8_t type)
     }
 }
 
-static void emit_vs_signature(Sb* b)
+/* drawn from the sun: whatever clip-space position the function makes (the camera's, from the
+ * transforms or a vertex shader's constants) goes on through the camera's inverse into the sun's
+ * view - one matrix, so any draw of the scene can be drawn again into the shadow map */
+void gfx_msl_vs_params(Sb* b, const GfxVsKey* k)
+{
+    if (k->shadow)
+        sb_printf(b, ", constant float4x4& sm [[buffer(5)]]");
+}
+
+void gfx_msl_vs_return(Sb* b, const GfxVsKey* k)
+{
+    if (k->shadow)
+        sb_printf(b, "  o.pos = sm * o.pos;\n");
+    sb_printf(b, "  return o;\n}\n");
+}
+
+static void emit_vs_signature(Sb* b, const GfxVsKey* k)
 {
     sb_printf(b, "vertex VOut vs_main(uint vid [[vertex_id]], constant U& u [[buffer(4)]]");
     for (int s = 0; s < GFX_NSTREAMS; ++s)
         sb_printf(b, ", device const uchar* s%d [[buffer(%d)]]", s, s);
+    gfx_msl_vs_params(b, k);
     sb_printf(b, ") {\n  VOut o;\n  int vi = int(vid) + u.vofs.x;\n  o.psize = 1.0;\n");
 }
 
@@ -144,9 +170,42 @@ static void emit_fog_factor(Sb* b, const char* dst, int mode, const char* dist)
     }
 }
 
+/* D3D's lighting from N and pe (view space) and the material colors cd, ca, cs, ce in scope, into
+ * lit_d and lit_s */
+static void emit_lighting(Sb* b, const GfxVsKey* k)
+{
+    sb_printf(b, "  float3 amb = u.ambient.rgb, dif = float3(0), spc = float3(0);\n");
+    if (k->specular)
+        sb_printf(b, "  float3 V = %s;\n", k->localviewer ? "normalize(-pe)" : "float3(0, 0, -1)");
+    for (int i = 0; i < k->nlights; ++i)
+    {
+        int t = k->light_type[i];
+        sb_printf(b, "  {\n    constant Light& L = u.light[%d];\n", i);
+        if (t == 3)
+            sb_printf(b, "    float3 l = L.dir.xyz;\n    float a = 1.0;\n");
+        else
+        {
+            sb_printf(b,
+                "    float3 lv = L.pos.xyz - pe;\n    float d = length(lv);\n    float3 l = lv / max(d, 1e-20);\n"
+                "    float a = d > L.pos.w ? 0.0 : 1.0 / max(L.att.x + L.att.y * d + L.att.z * d * d, 1e-20);\n");
+            if (t == 2)
+                sb_printf(b,
+                    "    float rho = dot(-l, L.dir.xyz);\n"
+                    "    a *= rho > L.spot.x ? 1.0 : rho <= L.spot.y ? 0.0 : pow(saturate((rho - L.spot.y) / (L.spot.x - L.spot.y)), L.dir.w);\n");
+        }
+        sb_printf(b, "    amb += L.ambient.rgb * a;\n    float ndl = max(dot(N, l), 0.0);\n    dif += L.diffuse.rgb * (ndl * a);\n");
+        if (k->specular)
+            sb_printf(b, "    if (ndl > 0.0) spc += L.specular.rgb * (pow(max(dot(N, normalize(V + l)), 0.0), u.params.x) * a);\n");
+        sb_printf(b, "  }\n");
+    }
+    sb_printf(b,
+        "  float4 lit_d = saturate(float4(ce.rgb + ca.rgb * amb + cd.rgb * dif, cd.a));\n"
+        "  float4 lit_s = saturate(float4(cs.rgb * spc, cs.a));\n");
+}
+
 static void emit_ff_vs(Sb* b, const GfxVsKey* k)
 {
-    emit_vs_signature(b);
+    emit_vs_signature(b, k);
     for (int r = 0; r < GFX_NREGS; ++r) /* unused registers are constants the compiler drops */
         emit_fetch(b, k, r);
     if (k->rhw)
@@ -185,33 +244,14 @@ static void emit_ff_vs(Sb* b, const GfxVsKey* k)
     {
         sb_printf(b, "  float4 cd = %s, ca = %s, cs = %s, ce = %s;\n", mcs(k, k->src_diffuse, "u.mat_d"),
             mcs(k, k->src_ambient, "u.mat_a"), mcs(k, k->src_specular, "u.mat_s"), mcs(k, k->src_emissive, "u.mat_e"));
-        sb_printf(b, "  float3 amb = u.ambient.rgb, dif = float3(0), spc = float3(0);\n");
-        if (k->specular)
-            sb_printf(b, "  float3 V = %s;\n", k->localviewer ? "normalize(-pe)" : "float3(0, 0, -1)");
-        for (int i = 0; i < k->nlights; ++i)
+        if (pixel_lit(k)) /* the length of N too: without NORMALIZENORMALS a scaled one lights more */
+            sb_printf(b, "  o.n = N;\n  o.pe = float4(pe, length(N));\n  o.md = cd, o.ma = ca, o.ms = cs, o.me = ce;\n"
+                         "  o.d = cd;\n  o.s = cs;\n");
+        else
         {
-            int t = k->light_type[i];
-            sb_printf(b, "  {\n    constant Light& L = u.light[%d];\n", i);
-            if (t == 3)
-                sb_printf(b, "    float3 l = L.dir.xyz;\n    float a = 1.0;\n");
-            else
-            {
-                sb_printf(b,
-                    "    float3 lv = L.pos.xyz - pe;\n    float d = length(lv);\n    float3 l = lv / max(d, 1e-20);\n"
-                    "    float a = d > L.pos.w ? 0.0 : 1.0 / max(L.att.x + L.att.y * d + L.att.z * d * d, 1e-20);\n");
-                if (t == 2)
-                    sb_printf(b,
-                        "    float rho = dot(-l, L.dir.xyz);\n"
-                        "    a *= rho > L.spot.x ? 1.0 : rho <= L.spot.y ? 0.0 : pow(saturate((rho - L.spot.y) / (L.spot.x - L.spot.y)), L.dir.w);\n");
-            }
-            sb_printf(b, "    amb += L.ambient.rgb * a;\n    float ndl = max(dot(N, l), 0.0);\n    dif += L.diffuse.rgb * (ndl * a);\n");
-            if (k->specular)
-                sb_printf(b, "    if (ndl > 0.0) spc += L.specular.rgb * (pow(max(dot(N, normalize(V + l)), 0.0), u.params.x) * a);\n");
-            sb_printf(b, "  }\n");
+            emit_lighting(b, k);
+            sb_printf(b, "  o.d = lit_d;\n  o.s = lit_s;\n");
         }
-        sb_printf(b,
-            "  o.d = saturate(float4(ce.rgb + ca.rgb * amb + cd.rgb * dif, cd.a));\n"
-            "  o.s = saturate(float4(cs.rgb * spc, cs.a));\n");
     }
     else
         sb_printf(b, "  o.d = %s;\n  o.s = %s;\n", dif_in, spe_in);
@@ -262,7 +302,7 @@ static void emit_ff_vs(Sb* b, const GfxVsKey* k)
             sb_printf(b, "  c%d = u.texm[%d] * c%d;\n", i, i, i);
         sb_printf(b, "  o.t%d = c%d;\n", i, i);
     }
-    sb_printf(b, "  return o;\n}\n");
+    gfx_msl_vs_return(b, k);
 }
 
 /* --- fragment: the texture stage cascade ------------------------------------------------------------ */
@@ -322,9 +362,10 @@ static void op_expr(char* out, size_t n, int op, const char* a1, const char* a2,
     }
 }
 
-static void emit_fs_signature(Sb* b, const GfxFsKey* k)
+static void emit_fs_signature(Sb* b, const GfxFsKey* k, const GfxVsKey* vk)
 {
-    sb_printf(b, "fragment float4 fs_main(VOut in [[stage_in]], constant U& u [[buffer(4)]]");
+    int pix = pixel_lit(vk);
+    sb_printf(b, "fragment float4 fs_main(VOut %s [[stage_in]], constant U& u [[buffer(4)]]", pix ? "vin" : "in");
     for (int i = 0; i < 8; ++i)
     {
         int t = k->prog || i < k->nstages ? k->st[i].tex : 0;
@@ -334,6 +375,14 @@ static void emit_fs_signature(Sb* b, const GfxFsKey* k)
             sb_printf(b, ", texturecube<float> tx%d [[texture(%d)]], sampler sp%d [[sampler(%d)]]", i, i, i, i);
     }
     sb_printf(b, ") {\n");
+    if (pix) /* the colors the vertex function would have given, lit here */
+    {
+        sb_printf(b, "  VOut in = vin;\n  {\n  float3 N = in.n * (rsqrt(max(dot(in.n, in.n), 1e-20)) * %s);\n"
+                     "  float3 pe = in.pe.xyz;\n  float4 cd = in.md, ca = in.ma, cs = in.ms, ce = in.me;\n",
+            vk->normalize ? "1.0" : "in.pe.w");
+        emit_lighting(b, vk);
+        sb_printf(b, "  in.d = lit_d, in.s = lit_s;\n  }\n");
+    }
 }
 
 static void emit_fs_tail(Sb* b, const GfxFsKey* k, const char* col)
@@ -360,9 +409,9 @@ static void emit_fs_tail(Sb* b, const GfxFsKey* k, const char* col)
     sb_printf(b, "  return %s;\n}\n", col);
 }
 
-static void emit_ff_fs(Sb* b, const GfxFsKey* k)
+static void emit_ff_fs(Sb* b, const GfxFsKey* k, const GfxVsKey* vk)
 {
-    emit_fs_signature(b, k);
+    emit_fs_signature(b, k, vk);
     sb_printf(b, "  float4 cur = in.d, tmp = float4(0), tex = float4(1);\n");
     for (int i = 0; i < k->nstages; ++i)
     {
@@ -412,7 +461,7 @@ char* gfx_msl_generate(const GfxVsKey* vk, const GfxFsKey* fk, const uint32_t* v
 {
     Sb b = { 0 };
     sb_printf(&b, "%s", PRELUDE);
-    emit_vout(&b, vk->ntex, vk->flat);
+    emit_vout(&b, vk);
     if (vk->prog)
     {
         if (!gfx_msl_vs1(&b, vk, vs_tokens))
@@ -422,13 +471,13 @@ char* gfx_msl_generate(const GfxVsKey* vk, const GfxFsKey* fk, const uint32_t* v
         emit_ff_vs(&b, vk);
     if (fk->prog)
     {
-        emit_fs_signature(&b, fk);
+        emit_fs_signature(&b, fk, vk);
         if (!gfx_msl_ps1(&b, fk, ps_tokens))
             goto fail;
         emit_fs_tail(&b, fk, "r0");
     }
     else
-        emit_ff_fs(&b, fk);
+        emit_ff_fs(&b, fk, vk);
     return b.s;
 fail:
     free(b.s);

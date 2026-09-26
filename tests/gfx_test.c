@@ -264,6 +264,40 @@ static void test_lighting(void)
     CHECK(near(px(16, 16), 0xFFBFBFBFu, 2), "lighting: %08x", px(16, 16));
 }
 
+/* A point light just before the middle of a large quad: lit per pixel (the scene effects' light
+ * setting) its pool shows in the middle; lit per vertex, the corners (almost edge-on to it) are all
+ * there is, and the middle stays dark. */
+static void test_pixel_lighting(void)
+{
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        gfx_fx_set("light", (float)!pass);
+        gfx_clear(0, NULL, 3, 0xFF000000u, 1.0f, 0, VP);
+        GfxDraw d;
+        defaults(&d);
+        float vert[4][6] = { { -1, 1, 0.5f, 0, 0, -1 }, { 1, 1, 0.5f, 0, 0, -1 }, { -1, -1, 0.5f, 0, 0, -1 }, { 1, -1, 0.5f, 0, 0, -1 } };
+        d.vs.el[0] = (GfxElem){ 1, 0, GFX_FLOAT3, 0 };
+        d.vs.el[3] = (GfxElem){ 1, 0, GFX_FLOAT3, 0 };
+        d.u.stride[0] = 24, d.u.offset[3] = 12;
+        d.vs.lighting = 1, d.vs.nlights = 1, d.vs.light_type[0] = 1, d.vs.normalize = 1;
+        d.fs.st[0] = (GfxStage){ 2, 0, 1, 1, 2, 0, 1, 1, 1, 0, 0, 2 };
+        d.u.mat_d[0] = d.u.mat_d[1] = d.u.mat_d[2] = d.u.mat_d[3] = 1;
+        d.u.light[0].diffuse[0] = d.u.light[0].diffuse[1] = d.u.light[0].diffuse[2] = 1;
+        d.u.light[0].pos[2] = 0.4f, d.u.light[0].pos[3] = 10.0f;
+        d.u.light[0].att[0] = 1;
+        d.data[0] = vert, d.size[0] = sizeof vert;
+        d.prim = GFX_TRIANGLESTRIP, d.count = 2;
+        gfx_draw(&d);
+        readback();
+        uint32_t c = px(W / 2, H / 2) & 255;
+        if (pass == 0)
+            CHECK(c >= 230, "per-pixel lighting: middle %u (want the light's pool)", c);
+        else
+            CHECK(c <= 40, "per-vertex lighting: middle %u (want dark, from the corners)", c);
+    }
+    gfx_fx_set("light", 1.0f);
+}
+
 static void test_fog(void)
 {
     gfx_clear(0, NULL, 3, 0xFF000000u, 1.0f, 0, VP);
@@ -421,7 +455,7 @@ static const uint32_t SVP[6] = { 0, 0, SS, SS, 0, 0x3F800000u };
 
 static void fx_only(const char* on, float v)
 {
-    static const char* const all[] = { "ao", "fog", "bloom", "rays", "grade" };
+    static const char* const all[] = { "ao", "fog", "bloom", "rays", "grade", "shadow", "sun" };
     for (size_t i = 0; i < sizeof all / sizeof all[0]; ++i)
         gfx_fx_set(all[i], 0.0f);
     if (on)
@@ -455,6 +489,7 @@ static void scene_quad(float q[4][3], uint32_t color)
     d.u.tfactor[0] = ((color >> 16) & 255) / 255.0f, d.u.tfactor[1] = ((color >> 8) & 255) / 255.0f;
     d.u.tfactor[2] = (color & 255) / 255.0f, d.u.tfactor[3] = 1.0f;
     d.depth.zenable = 1, d.depth.zwrite = 1, d.depth.zfunc = 4;
+    d.caster = 1;
     float v[4][3];
     for (int i = 0; i < 4; ++i)
         v[i][0] = q[i][0], v[i][1] = q[i][1], v[i][2] = q[i][2] * g_sz;
@@ -593,6 +628,100 @@ static void test_scene_rays(void)
     CHECK(lit[1] <= 40, "god rays: sun behind the camera %u (want the wall's 32)", lit[1]);
 }
 
+/* Sun shadows: a post standing on the floor, the sun beyond it and high: the floor before the post
+ * (toward the camera) is in its shadow, the floor beside it is not; with the sun behind the camera,
+ * or no sun, no shadow. */
+static void test_scene_shadow(void)
+{
+    const float beyond[3] = { 0, 0.5f, 1 }, behind[3] = { 0, 0.5f, -1 };
+    const float* suns[3] = { beyond, behind, NULL };
+    for (int k = 0; k < 3; ++k)
+    {
+        fx_only("shadow", 1.0f);
+        gfx_fx_set("shadow_length", 3.0f);
+        scene_begin(1, 0xFF000000u);
+        float floor[4][3] = { { -8, -3, 20 }, { 8, -3, 20 }, { -8, -3, 0.6f }, { 8, -3, 0.6f } };
+        float post[4][3] = { { -1, 0, 6 }, { 1, 0, 6 }, { -1, -3, 6 }, { 1, -3, 6 } };
+        scene_quad(floor, 0xFFFFFFFFu);
+        scene_quad(post, 0xFFFFFFFFu);
+        scene_end(suns[k], 0);
+        /* the floor 5 ahead: row 102; before the post (x 0) and beside it (x 3) */
+        uint32_t before = spx(64, 102, 0), beside = spx(102, 102, 0);
+        CHECK(beside >= 245, "sun shadows (%d): open floor %u (want lit)", k, beside);
+        if (k == 0)
+            CHECK(before <= 160, "sun shadows: floor before the post %u (want shaded)", before);
+        else
+            CHECK(before >= 245, "sun shadows (%d): floor before the post %u (want lit: the sun is %s)", k, before,
+                k == 1 ? "behind the camera" : "absent");
+    }
+    gfx_fx_set("shadow_length", 0.6f);
+}
+
+/* The sun's shadow map: a post 10 ahead, 3 high, the sun beyond it and up at about 27 degrees - its
+ * shadow reaches 6 along the floor toward the camera, far past what contact shadows see; beside it
+ * the floor is lit, and with the sun behind the camera the floor before it is lit too. */
+static void test_scene_sun_map(void)
+{
+    const float beyond[3] = { 0, 0.5f, 1 }, behind[3] = { 0, 0.5f, -1 };
+    for (int k = 0; k < 2; ++k)
+    {
+        fx_only("sun", 1.0f);
+        scene_begin(1, 0xFF000000u);
+        float floor[4][3] = { { -8, -3, 30 }, { 8, -3, 30 }, { -8, -3, 0.6f }, { 8, -3, 0.6f } };
+        float post[4][3] = { { -1, 0, 10 }, { 1, 0, 10 }, { -1, -3, 10 }, { 1, -3, 10 } };
+        scene_quad(floor, 0xFFFFFFFFu);
+        scene_quad(post, 0xFFFFFFFFu);
+        scene_end(k ? behind : beyond, 0);
+        /* the floor 7 ahead: row 91; before the post (x 0) and beside it (x 4) */
+        uint32_t before = spx(64, 91, 0), beside = spx(100, 91, 0);
+        CHECK(beside >= 245, "sun map (%d): open floor %u (want lit)", k, beside);
+        if (k == 0)
+            CHECK(before <= 160, "sun map: floor in the post's shadow %u (want shaded)", before);
+        else
+            CHECK(before >= 245, "sun map: sun behind the camera, floor before the post %u (want lit)", before);
+    }
+}
+
+/* The zone out of view still casts: a post drawn from a buffer the game keeps shades the floor in
+ * the frame it is drawn and in the next one, where the game (out of view) no longer draws it. */
+static void test_scene_sun_cache(void)
+{
+    const float beyond[3] = { 0, 0.5f, 1 };
+    float post[4][3] = { { -1, 0, -10 }, { 1, 0, -10 }, { -1, -3, -10 }, { 1, -3, -10 } }; /* right-handed: z ahead is negative */
+    GfxBuf* b = gfx_buf_create(sizeof post);
+    gfx_buf_upload(b, post, sizeof post);
+    for (int frame = 0; frame < 2; ++frame)
+    {
+        fx_only("sun", 1.0f);
+        scene_begin(1, 0xFF000000u);
+        float floor[4][3] = { { -8, -3, 30 }, { 8, -3, 30 }, { -8, -3, 0.6f }, { 8, -3, 0.6f } };
+        scene_quad(floor, 0xFFFFFFFFu);
+        if (frame == 0)
+        {
+            GfxDraw d;
+            defaults(&d);
+            memcpy(d.u.wvp, g_sproj, 64);
+            d.u.vp[2] = d.u.vp[3] = SS;
+            memcpy(d.vp, SVP, sizeof SVP);
+            d.vs.el[0] = (GfxElem){ 1, 0, GFX_FLOAT3, 0 };
+            d.u.stride[0] = 12;
+            d.fs.st[0] = (GfxStage){ 2, 3, 1, 1, 2, 3, 1, 1, 1, 0, 0, 2 };
+            d.depth.zenable = 1, d.depth.zwrite = 1, d.depth.zfunc = 4;
+            d.caster = 1;
+            d.buf[0] = b, d.size[0] = sizeof post;
+            d.prim = GFX_TRIANGLESTRIP, d.count = 2;
+            gfx_draw(&d);
+        }
+        scene_end(beyond, 0);
+        uint32_t before = spx(64, 91, 0), beside = spx(100, 91, 0);
+        CHECK(beside >= 245, "sun cache (frame %d): open floor %u (want lit)", frame, beside);
+        CHECK(before <= 160, "sun cache (frame %d): floor in the post's shadow %u (want shaded%s)", frame, before,
+            frame ? ", from the post kept after the game stopped drawing it" : "");
+        gfx_present(NULL);
+    }
+    gfx_buf_destroy(b);
+}
+
 /* The scene filter: a 1024x1024 scene of 8-pixel stripes drawn at 32x32 is gray, where one
  * bilinear sample per pixel (every pixel lands on a white row) is white - the shimmer. */
 static void test_scene_filter(void)
@@ -681,6 +810,9 @@ static void test_scene_effects(void)
     test_scene_fog();
     test_scene_bloom();
     test_scene_rays();
+    test_scene_shadow();
+    test_scene_sun_map();
+    test_scene_sun_cache();
     CHECK(gfx_failures() == 0, "scene effects: %u failures", gfx_failures());
     gfx_set_targets(g_rt, 0, 0, g_ds);
     test_scene_filter();
@@ -716,6 +848,7 @@ int main(int argc, char** argv)
     test_alpha();
     test_depth();
     test_lighting();
+    test_pixel_lighting();
     test_fog();
     test_shaders();
     test_sweep();

@@ -138,8 +138,8 @@ static id<MTLTexture> g_scratch_depth;
  * (gfx_scene_done, fx_reload). fx = 0 is the game as it was. */
 static struct
 {
-    float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, bloom,
-        threshold, rays, rays_decay, rays_length, debug;
+    float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
+        fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, debug;
 } g_fxs;
 
 /* --- small hash maps (key bytes -> object) ------------------------------------------------------------- */
@@ -890,6 +890,8 @@ typedef struct LibKey
     GfxFsKey fs;
 } LibKey;
 
+static int alpha_tested(const GfxFsKey* k) { return k->alpha_func && k->alpha_func != 8; }
+
 typedef struct PipeKey
 {
     LibKey lib;
@@ -1005,6 +1007,8 @@ static id<MTLRenderPipelineState> build_pipeline(const PipeKey* k, const uint32_
     {
         MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
         id<MTLFunction> vf = [lib newFunctionWithName:@"vs_main"], ff = [lib newFunctionWithName:@"fs_main"];
+        if (k->lib.vs.shadow && !alpha_tested(&k->lib.fs)) /* depth alone: nothing for the fragments to do */
+            [ff release], ff = nil;
         pd.vertexFunction = vf;
         pd.fragmentFunction = ff;
         pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassUnspecified;
@@ -1142,30 +1146,96 @@ static void prewarm_pipelines(void)
     fprintf(stderr, "[recomp] gfx: building %u pipelines from %s in the background\n", n, g_pipe_cache);
 }
 
+/* the pipeline for a key, queued for building the first time (nil until built) */
+static id<MTLRenderPipelineState> pipeline_for(const PipeKey* k, const uint32_t* vs_tokens, const uint32_t* ps_tokens)
+{
+    PipeEntry* e = (PipeEntry*)map_get(&g_pipes, k, sizeof *k);
+    if (!e)
+    {
+        uint32_t nvs = 0, nps = 0;
+        uint32_t* vs = k->lib.vs.prog ? copy_tok(vs_tokens, &nvs) : NULL;
+        uint32_t* ps = k->lib.fs.prog ? copy_tok(ps_tokens, &nps) : NULL;
+        queue_job(k, vs, nvs, ps, nps, !g_sync_pipelines);
+        free(vs);
+        free(ps);
+        e = (PipeEntry*)map_get(&g_pipes, k, sizeof *k);
+    }
+    void* st = atomic_load(&e->state);
+    return st && st != PIPE_FAILED ? (id)st : nil;
+}
+
 static id<MTLRenderPipelineState> pipeline(const GfxDraw* d)
 {
     PipeKey k;
     memset(&k, 0, sizeof k);
     k.lib.vs = d->vs, k.lib.fs = d->fs, k.pipe = d->pipe;
+    /* the world's lit draws lit per pixel (gfx_msl.c pixel_lit) */
+    if (g_fxs.fx != 0.0f && g_fxs.light != 0.0f && d->vs.lighting && !d->vs.rhw && !d->vs.prog && !d->vs.flat)
+        k.lib.vs.pixel = 1;
     k.color = (uint32_t)g_rt->tex.pixelFormat;
     id<MTLTexture> depth = depth_attachment();
     k.depth = depth ? (uint32_t)depth.pixelFormat : 0;
     k.stencil = depth && g_ds->has_stencil ? k.depth : 0;
     k.x8 = (uint8_t)g_rt->x8;
-    PipeEntry* e = (PipeEntry*)map_get(&g_pipes, &k, sizeof k);
-    if (!e)
-    {
-        uint32_t nvs = 0, nps = 0;
-        uint32_t* vs = d->vs.prog ? copy_tok(d->vs_tokens, &nvs) : NULL;
-        uint32_t* ps = d->fs.prog ? copy_tok(d->ps_tokens, &nps) : NULL;
-        queue_job(&k, vs, nvs, ps, nps, !g_sync_pipelines);
-        free(vs);
-        free(ps);
-        e = (PipeEntry*)map_get(&g_pipes, &k, sizeof k);
-    }
-    void* st = atomic_load(&e->state);
-    return st && st != PIPE_FAILED ? (id)st : nil;
+    return pipeline_for(&k, d->vs_tokens, d->ps_tokens);
 }
+
+/* --- the sun's shadow map: the scene's casters, drawn again from the sun (gfx_scene_done) --------------
+ * Each opaque draw of the scene (GfxDraw.caster) is recorded as it is encoded - its pipeline key and
+ * the buffers, uniforms and textures it was bound with, all alive until the frame ends - and when the
+ * scene is done they are drawn again into a depth map from the sun: the same functions, with the
+ * clip-space position they make taken through the camera's inverse into the sun's view (the shadow
+ * key, gfx_msl_vs_return). The scene effects then look each pixel up in it. */
+typedef struct Caster
+{
+    LibKey lib;
+    const uint32_t *vs, *ps;
+    id<MTLBuffer> vb[GFX_NSTREAMS], ub, ib; /* retained */
+    NSUInteger voff[GFX_NSTREAMS], uoff, ioff;
+    id<MTLTexture> tex[8]; /* retained; only for an alpha test */
+    GfxSampler samp[8];
+    MTLPrimitiveType prim;
+    uint32_t n, vstart;
+    uint8_t itype; /* 0 no indices, 2 or 4 bytes each */
+    uint8_t fixed; /* every vertex and index from buffers the game keeps (the zone's): cached (sun_cache) */
+    int32_t zbias;
+} Caster;
+
+static Caster* g_casters;
+static uint32_t g_ncasters, g_casters_cap;
+
+static void casters_clear(void)
+{
+    for (uint32_t i = 0; i < g_ncasters; ++i)
+    {
+        Caster* c = &g_casters[i];
+        for (int s = 0; s < GFX_NSTREAMS; ++s)
+            [c->vb[s] release];
+        [c->ub release];
+        [c->ib release];
+        for (int t = 0; t < 8; ++t)
+            [c->tex[t] release];
+    }
+    g_ncasters = 0;
+}
+
+static Caster* caster_new(const GfxDraw* d)
+{
+    if (g_ncasters == g_casters_cap)
+    {
+        g_casters_cap = g_casters_cap ? g_casters_cap * 2 : 1024;
+        g_casters = (Caster*)realloc(g_casters, g_casters_cap * sizeof(Caster));
+    }
+    Caster* c = &g_casters[g_ncasters++];
+    memset(c, 0, sizeof *c);
+    c->lib.vs = d->vs, c->lib.fs = d->fs;
+    c->vs = d->vs_tokens, c->ps = d->ps_tokens;
+    c->zbias = d->zbias;
+    c->fixed = d->prim != GFX_TRIANGLEFAN && (!d->indices || d->ibuf);
+    return c;
+}
+
+
 
 static MTLCompareFunction compare(uint32_t f)
 {
@@ -1369,21 +1439,32 @@ static void draw_encode(const GfxDraw* d)
         memcpy(u, &d->u, need);
         [g_enc setVertexBuffer:buf offset:off atIndex:4];
         [g_enc setFragmentBuffer:buf offset:off atIndex:4];
+        Caster* rec = d->caster && g_fxs.fx != 0.0f && g_fxs.sun > 0.0f ? caster_new(d) : NULL;
+        if (rec)
+            rec->ub = [buf retain], rec->uoff = off;
         for (int s = 0; s < GFX_NSTREAMS; ++s)
         {
             if (d->buf[s])
             {
                 [g_enc setVertexBuffer:d->buf[s]->b offset:d->buf_off[s] atIndex:(NSUInteger)s];
                 d->buf[s]->used = g_serial;
+                if (rec)
+                    rec->vb[s] = [d->buf[s]->b retain], rec->voff[s] = d->buf_off[s];
             }
             else if (d->data[s] && d->size[s])
             {
                 void* v = ring(d->size[s], 16, &buf, &off);
                 memcpy(v, d->data[s], d->size[s]);
                 [g_enc setVertexBuffer:buf offset:off atIndex:(NSUInteger)s];
+                if (rec)
+                    rec->vb[s] = [buf retain], rec->voff[s] = off, rec->fixed = 0;
             }
             else
+            {
                 [g_enc setVertexBuffer:g_dummy offset:0 atIndex:(NSUInteger)s];
+                if (rec)
+                    rec->vb[s] = [g_dummy retain];
+            }
         }
         for (int i = 0; i < 8; ++i)
         {
@@ -1408,10 +1489,14 @@ static void draw_encode(const GfxDraw* d)
             [g_enc setFragmentTexture:view atIndex:(NSUInteger)i];
             [g_enc setFragmentSamplerState:sampler(&sk) atIndex:(NSUInteger)i];
             t->used = g_serial;
+            if (rec && alpha_tested(&d->fs))
+                rec->tex[i] = [view retain], rec->samp[i] = sk;
         }
 
         uint32_t n = vertex_count(d->prim, d->count);
         MTLPrimitiveType mp = metal_prim(d->prim);
+        if (rec)
+            rec->prim = mp, rec->n = n, rec->vstart = d->vertex_start;
         if (d->prim == GFX_TRIANGLEFAN)
         {
             /* no fans in Metal: a list with the same vertices */
@@ -1430,10 +1515,14 @@ static void draw_encode(const GfxDraw* d)
                 }
             }
             [g_enc drawIndexedPrimitives:mp indexCount:n indexType:MTLIndexTypeUInt32 indexBuffer:buf indexBufferOffset:off];
+            if (rec)
+                rec->ib = [buf retain], rec->ioff = off, rec->itype = 4;
         }
         else if (d->ibuf)
         {
             d->ibuf->used = g_serial;
+            if (rec)
+                rec->ib = [d->ibuf->b retain], rec->ioff = d->ibuf_off, rec->itype = (uint8_t)(d->index_size == 2 ? 2 : 4);
             [g_enc drawIndexedPrimitives:mp indexCount:n indexType:d->index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
                              indexBuffer:d->ibuf->b indexBufferOffset:d->ibuf_off];
         }
@@ -1443,6 +1532,8 @@ static void draw_encode(const GfxDraw* d)
             memcpy(idx, d->indices, (size_t)n * d->index_size);
             [g_enc drawIndexedPrimitives:mp indexCount:n indexType:d->index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
                              indexBuffer:buf indexBufferOffset:off];
+            if (rec)
+                rec->ib = [buf retain], rec->ioff = off, rec->itype = (uint8_t)(d->index_size == 2 ? 2 : 4);
         }
         else
             [g_enc drawPrimitives:mp vertexStart:d->vertex_start vertexCount:n];
@@ -1601,9 +1692,12 @@ void gfx_clear(uint32_t nrects, const int32_t* rects, uint32_t flags, uint32_t c
  *   - ambient occlusion: view-space positions rebuilt from the scene's depth and projection, a spiral
  *     of samples around each pixel (Scalable Ambient Obscurance, simplified) at about 1000 pixels
  *     across, then a depth-aware blur across and down;
+ *   - sun shadows, in the same pass and blur: each pixel looked up in the sun's shadow map (the
+ *     scene's casters drawn again from the sun, sun_map), and a short ray toward the sun through the
+ *     depth buffer for contact shadows where things meet the ground; by day;
  *   - height fog: the density falls off with world height (up from the view matrix), integrated along
  *     each view ray, so low ground mists over while hills stand clear; lit by the sun when looking
- *     toward it;
+ *     toward it (Henyey-Greenstein scattering);
  *   - bloom: the bright parts, at a quarter and an eighth of the scene, blurred and added back;
  *   - god rays: the sky's bright pixels around the sun, blurred along lines toward the sun's place
  *     on screen (the sun is the scene's directional light);
@@ -1614,7 +1708,8 @@ void gfx_clear(uint32_t nrects, const int32_t* rects, uint32_t flags, uint32_t c
  *
  * Settings: FFXI_FX=1 and FFXI_FX_<KEY> (the table in fx_config), then while the game runs
  * FFXI_FX_FILE (default ~/Library/Caches/FFXI/fx.txt), lines of key=value. debug shows one part
- * alone: 1 occlusion, 2 fog, 3 bloom, 4 god rays. */
+ * alone: 1 occlusion, 2 fog, 3 bloom, 4 god rays, 5 sun shadows (map and contact). light = 1 lights the world's
+ * lit draws per pixel rather than per vertex (gfx_msl.c). */
 static const char FX_MSL[] =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
@@ -1631,9 +1726,13 @@ static const char FX_MSL[] =
     "  float4 suncol; // its color\n"
     "  float4 sunuv;  // its place in the viewport (0..1), z = how much of it shows (0 behind the camera)\n"
     "  float4 fogc;   // fog color, a = density at the camera's height\n"
-    "  float4 fogp;   // falloff with height, most fog, 0, 0\n"
+    "  float4 fogp;   // falloff with height, most fog, sun glow, its forward scattering (g)\n"
     "  float4 bloom;  // threshold, strength, knee\n"
     "  float4 rays;   // strength, decay, length\n"
+    "  float4 shadow; // contact shadows: strength (0: none, or night), ray length, thickness, how far out\n"
+    "  float4x4 lmat; // view space to the sun's map: x, y -1..1 (y up), z 0..1\n"
+    "  float4 smap;   // the map: strength (0: none), a texel in world units, depth bias, penumbra (map width per depth unit)\n"
+    "  float4 smap2;  // depth units per map width\n"
     "};\n"
     "struct FO { float4 pos [[position]]; float2 uv; };\n"
     "vertex FO fx_vs(uint vid [[vertex_id]]) {\n"
@@ -1658,28 +1757,98 @@ static const char FX_MSL[] =
     "  px = floor(px) + 0.5;\n"
     "  return view_pos(u, px, view_z(u, dt.read(uint2(px))));\n"
     "}\n"
-    /* occlusion in x (1 open, 0 closed), distance in y (0: sky) */
-    "fragment float2 fx_ao(FO in [[stage_in]], constant FxU& u [[buffer(0)]], depth2d<float> dt [[texture(0)]]) {\n"
+    /* in the sun (1) or not (0): a ray from P toward the sun, stepped through the depth buffer; a
+     * surface in front of it (by less than the thickness: what is far nearer the camera hides the
+     * ray, it does not block it) shades P. Only on surfaces that face the sun (the rest are dark from
+     * their own lighting), and fading out with distance, where the steps grow coarse. */
+    "static float sun_shadow(constant FxU& u, depth2d<float> dt, float3 P, float3 N, float dist, float k) {\n"
+    "  float nl = dot(N, u.sun.xyz);\n"
+    "  float fade = smoothstep(0.0, 0.15, nl) * (1.0 - smoothstep(0.6 * u.shadow.w, u.shadow.w, dist));\n"
+    "  if (fade <= 0.0) return 1.0;\n"
+    "  const int NS = 16;\n"
+    "  float3 O = P + N * (0.01 * dist);\n"
+    "  for (int i = 0; i < NS; ++i) {\n"
+    "    float a = (float(i) + k) / float(NS);\n"
+    "    float3 R = O + u.sun.xyz * (u.shadow.y * a * a);\n"
+    "    float rd = R.z * u.hand.x;\n"
+    "    if (rd <= 0.05) break;\n"
+    "    float2 ndc = float2(R.x * u.proj.x + R.z * u.proj.z, R.y * u.proj.y + R.z * u.proj.w) / rd;\n"
+    "    float2 q = u.vp.xy + float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * u.vp.zw;\n"
+    "    if (any(q < u.vp.xy) || any(q >= u.vp.xy + u.vp.zw)) break;\n"
+    "    float sd = view_z(u, dt.read(uint2(q))) * u.hand.x;\n"
+    "    float in_front = rd - sd;\n"
+    /* weaker the farther along the hit: no hard edge where the ray ends */
+    "    if (sd > 0.0 && in_front > 0.005 * rd + 0.02 && in_front < u.shadow.z + 0.01 * rd) return 1.0 - fade * (1.0 - a * a);\n"
+    "  }\n"
+    "  return 1.0;\n"
+    "}\n"
+    /* in the sun (1) or not (0) by the shadow map, softer the farther the shadow falls from what casts
+     * it (percentage-closer soft shadows): the casters' average depth around the point sets how wide
+     * the filter is; sixteen samples on a disk turned by the pixel's step of the 4x4 pattern, which
+     * the blur then averages. P is moved off its surface by a texel and more with distance (no acne).
+     * Surfaces turned away from the sun shade gently by their angle alone - the map's own edges on
+     * them are the facets of low-polygon rock. */
+    "constant float2 DISK[16] = { float2(-0.94, -0.40), float2(0.95, -0.77), float2(-0.09, -0.93), float2(0.34, 0.29),\n"
+    "  float2(-0.92, 0.46), float2(-0.82, -0.88), float2(-0.38, 0.28), float2(0.97, 0.76), float2(0.44, -0.98),\n"
+    "  float2(0.54, -0.47), float2(-0.26, -0.42), float2(-0.42, 0.87), float2(0.31, 0.92), float2(0.79, 0.19),\n"
+    "  float2(-0.03, 0.04), float2(0.15, -0.33) };\n"
+    "static float sun_map(constant FxU& u, depth2d<float> sm, sampler cmp, float3 P, float3 N, float dist, float k) {\n"
+    "  float nl = dot(N, u.sun.xyz);\n"
+    "  float face = mix(0.4, 1.0, smoothstep(-0.3, 0.25, nl)), use = smoothstep(-0.05, 0.15, nl);\n"
+    "  if (use <= 0.0) return face;\n"
+    "  float3 Q = P + N * (1.5 * u.smap.y + 0.002 * dist);\n"
+    "  float4 lc = u.lmat * float4(Q, 1.0);\n"
+    "  float2 uv = float2(lc.x * 0.5 + 0.5, 0.5 - lc.y * 0.5);\n"
+    "  float2 e = abs(lc.xy);\n"
+    "  float fade = 1.0 - smoothstep(0.85, 1.0, max(e.x, e.y));\n"
+    "  if (fade <= 0.0 || lc.z >= 1.0) return face;\n"
+    "  float z = lc.z - u.smap.z, sz = float(sm.get_width()), tx = 1.0 / sz;\n"
+    "  float a = k * 6.2831853, ca = cos(a), sa = sin(a);\n"
+    "  float2x2 rot = float2x2(float2(ca, sa), float2(-sa, ca));\n"
+    "  float bs = 0.0, bn = 0.0;\n"
+    "  for (int i = 0; i < 16; ++i) {\n"
+    "    float2 q = clamp((uv + DISK[i] * (32.0 * tx)) * sz, 0.0, sz - 1.0);\n"
+    "    float d = sm.read(uint2(q));\n"
+    "    if (d < z) bs += d, bn += 1.0;\n"
+    "  }\n"
+    "  float s = 1.0;\n"
+    "  if (bn > 0.0) {\n"
+    "    float pen = clamp((z - bs / bn) * u.smap.w, 1.5 * tx, 32.0 * tx);\n"
+    /* a wider filter reaches farther across the surface, to points of it nearer the sun: the bias
+     * grows with it (a slope of one) */
+    "    float zc = z - pen * u.smap2.x;\n"
+    "    s = 0.0;\n"
+    "    for (int i = 0; i < 16; ++i) s += sm.sample_compare(cmp, uv + rot * DISK[i] * pen, zc);\n"
+    "    s /= 16.0;\n"
+    "  }\n"
+    "  return mix(1.0, min(mix(1.0, s, use), face), fade);\n"
+    "}\n"
+    /* occlusion in x (1 open, 0 closed), distance in y (0: sky), the sun by the map in z and by
+     * contact in w (1 lit, 0 shaded) */
+    "fragment float4 fx_ao(FO in [[stage_in]], constant FxU& u [[buffer(0)]], depth2d<float> dt [[texture(0)]],\n"
+    "                      depth2d<float> sm [[texture(1)]], sampler cmp [[sampler(1)]]) {\n"
     "  float2 px = floor(u.vp.xy + in.uv * u.vp.zw) + 0.5;\n"
     "  float3 P = pos_at(u, dt, px);\n"
     "  float dist = P.z * u.hand.x;\n"
-    "  if (dist <= 0.0) return float2(1.0, 0.0);\n"
+    "  if (dist <= 0.0) return float4(1.0, 0.0, 1.0, 1.0);\n"
     /* the surface normal from the neighbors on the side nearer in depth (no smearing across edges) */
     "  float3 r = pos_at(u, dt, px + float2(1, 0)) - P, l = P - pos_at(u, dt, px - float2(1, 0));\n"
     "  float3 d = pos_at(u, dt, px + float2(0, 1)) - P, t = P - pos_at(u, dt, px - float2(0, 1));\n"
     "  float3 dx = abs(r.z) < abs(l.z) ? r : l, dy = abs(d.z) < abs(t.z) ? d : t;\n"
     "  float3 N = normalize(cross(dx, dy));\n"
     "  if (dot(N, P) > 0.0) N = -N;\n"
+    "  const uchar BAYER[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };\n"
+    "  int2 cell = int2(in.pos.xy) & 3;\n"
+    "  float k = (float(BAYER[cell.y * 4 + cell.x]) + 0.5) / 16.0;\n"
+    "  float sh = u.shadow.x > 0.0 && u.sun.w > 0.0 ? sun_shadow(u, dt, P, N, dist, k) : 1.0;\n"
+    "  float mp = u.smap.x > 0.0 && u.sun.w > 0.0 ? sun_map(u, sm, cmp, P, N, dist, k) : 1.0;\n"
     "  float rad = u.ao.x, rpx = min(rad * u.proj.y * 0.5 * u.vp.w / dist, u.ao.w);\n"
-    "  if (rpx < 2.0) return float2(1.0, dist);\n"
+    "  if (u.ao.y <= 0.0 || rpx < 2.0) return float4(1.0, dist, mp, sh);\n"
     /* the spiral turned and scaled by one of 16 steps, a 4x4 ordered pattern over the pixels, the
      * same every frame; the blur averages exactly one 4x4 block (fx_blur), so each pixel ends up with
      * all 16 - even, and with no grain left to crawl as the camera moves. One pattern at every pixel
      * instead copies each occluder at the pattern's offsets: streaks and halos around characters. */
     "  const int NS = 20;\n"
-    "  const uchar BAYER[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };\n"
-    "  int2 cell = int2(in.pos.xy) & 3;\n"
-    "  float k = (float(BAYER[cell.y * 4 + cell.x]) + 0.5) / 16.0;\n"
     "  float sum = 0.0;\n"
     "  for (int i = 0; i < NS; ++i) {\n"
     "    float a = (float(i) + k) / float(NS);\n"
@@ -1697,39 +1866,42 @@ static const char FX_MSL[] =
     /* none on surfaces seen edge-on: there the normal from depth is unreliable, and the surface
      * shades itself in bands along every silhouette */
     "  float facing = smoothstep(0.1, 0.4, dot(N, -P) / dist);\n"
-    "  return float2(saturate(1.0 - 3.0 * facing * sum / float(NS)), dist);\n"
+    "  return float4(saturate(1.0 - 3.0 * facing * sum / float(NS)), dist, mp, sh);\n"
     "}\n"
-    /* the occlusion at a scene pixel from the four nearest occlusion texels, each weighted by how near
-     * its distance is to this pixel's: an edge's occlusion stays on its own side, however the
-     * low-resolution grid falls on it */
-    "static float ao_at(constant FxU& u, texture2d<float> ao, float2 uv, float dist) {\n"
-    "  if (dist <= 0.0) return 1.0;\n"
+    /* the occlusion (x) and sun (y) at a scene pixel from the four nearest occlusion texels, each
+     * weighted by how near its distance is to this pixel's: an edge's occlusion stays on its own
+     * side, however the low-resolution grid falls on it */
+    "static float3 ao_at(constant FxU& u, texture2d<float> ao, float2 uv, float dist) {\n"
+    "  if (dist <= 0.0) return float3(1.0);\n"
     "  float2 g = uv * u.size.zw - 0.5, f = fract(g);\n"
     "  int2 i0 = int2(floor(g)), hi = int2(u.size.zw) - 1;\n"
-    "  float s = 0.0, w = 0.0;\n"
+    "  float3 s = 0.0;\n"
+    "  float w = 0.0;\n"
     "  for (int k = 0; k < 4; ++k) {\n"
     "    int2 o = int2(k & 1, k >> 1);\n"
-    "    float2 t = ao.read(uint2(clamp(i0 + o, int2(0), hi))).xy;\n"
+    "    float4 t = ao.read(uint2(clamp(i0 + o, int2(0), hi)));\n"
     "    float bw = (o.x ? f.x : 1.0 - f.x) * (o.y ? f.y : 1.0 - f.y);\n"
     "    float dw = t.y > 0.0 ? 1.0 / (1e-3 + abs(t.y - dist) / dist) : 1e-3;\n"
-    "    s += t.x * bw * dw, w += bw * dw;\n"
+    "    s += t.xzw * bw * dw, w += bw * dw;\n"
     "  }\n"
-    "  return w > 0.0 ? s / w : 1.0;\n"
+    "  return w > 0.0 ? s / w : float3(1.0);\n"
     "}\n"
-    "fragment float2 fx_blur(FO in [[stage_in]], constant FxU& u [[buffer(0)]], constant int2& dir [[buffer(1)]],\n"
+    "fragment float4 fx_blur(FO in [[stage_in]], constant FxU& u [[buffer(0)]], constant int2& dir [[buffer(1)]],\n"
     "                        texture2d<float> a [[texture(0)]]) {\n"
     "  int2 p = int2(in.pos.xy), hi = int2(u.size.zw) - 1;\n"
-    "  float2 c = a.read(uint2(p)).xy;\n"
+    "  float4 c = a.read(uint2(p));\n"
     "  if (c.y <= 0.0) return c;\n"
     /* four pixels' worth, centered (the ends at half weight): one period of the 4x4 pattern */
-    "  float s = c.x, w = 1.0;\n"
+    "  float3 s = c.xzw;\n"
+    "  float w = 1.0;\n"
     "  for (int i = -2; i <= 2; ++i) {\n"
     "    if (i == 0) continue;\n"
-    "    float2 t = a.read(uint2(clamp(p + dir * i, int2(0), hi))).xy;\n"
+    "    float4 t = a.read(uint2(clamp(p + dir * i, int2(0), hi)));\n"
     "    float k = (abs(i) == 2 ? 0.5 : 1.0) * saturate(1.0 - abs(t.y - c.y) / (0.03 * c.y));\n"
-    "    s += t.x * k, w += k;\n"
+    "    s += t.xzw * k, w += k;\n"
     "  }\n"
-    "  return float2(s / w, c.y);\n"
+    "  s /= w;\n"
+    "  return float4(s.x, c.y, s.y, s.z);\n"
     "}\n"
     /* bloom's source: the scene at a quarter size (four bilinear taps), what is over the threshold,
      * with a soft knee */
@@ -1787,9 +1959,11 @@ static const char FX_MSL[] =
     "  float2 px = in.pos.xy;\n"
     "  float4 c = src.read(uint2(px));\n"
     "  int dbg = int(u.grade.w);\n"
-    "  float o = u.ao.y > 0.0 ? ao_at(u, ao, in.uv, view_z(u, dt.read(uint2(px))) * u.hand.x) : 1.0;\n"
+    "  float3 os = u.ao.y > 0.0 || u.shadow.x > 0.0 || u.smap.x > 0.0 ? ao_at(u, ao, in.uv, view_z(u, dt.read(uint2(px))) * u.hand.x) : float3(1.0);\n"
+    "  float o = os.x, sun = mix(1.0, os.y, u.smap.x) * mix(1.0, os.z, u.shadow.x);\n"
     "  if (dbg == 1) return float4(o, o, o, c.a);\n"
-    "  c.rgb *= mix(1.0, o, u.ao.y);\n"
+    "  if (dbg == 5) return float4(float3(sun), c.a);\n"
+    "  c.rgb *= mix(1.0, o, u.ao.y) * sun;\n"
     "  float f = 0.0;\n"
     "  if (u.fogc.a > 0.0) {\n"
     "    float z = view_z(u, dt.read(uint2(px)));\n"
@@ -1799,8 +1973,10 @@ static const char FX_MSL[] =
     /* density a * exp(-b * height above the camera), integrated from the camera to P */
     "      float k = abs(bd) > 1e-4 ? (1.0 - exp(-bd)) / bd : 1.0;\n"
     "      f = min(1.0 - exp(-u.fogc.a * d * k), u.fogp.y);\n"
-    "      float sunk = u.sun.w * pow(saturate(dot(P / max(d, 1e-5), u.sun.xyz)), 8.0);\n"
-    "      c.rgb = mix(c.rgb, u.fogc.rgb + u.suncol.rgb * (sunk * 0.5), f);\n"
+    /* the sun's light scattered toward the camera (Henyey-Greenstein, 1 looking straight at it) */
+    "      float g = u.fogp.w, cs = dot(P / max(d, 1e-5), u.sun.xyz);\n"
+    "      float sunk = u.sun.w * u.fogp.z * pow((1.0 - g) * (1.0 - g) / max(1.0 + g * g - 2.0 * g * cs, 1e-5), 1.5);\n"
+    "      c.rgb = mix(c.rgb, u.fogc.rgb + u.suncol.rgb * sunk, f);\n"
     "    }\n"
     "  }\n"
     "  if (dbg == 2) return float4(f, f, f, c.a);\n"
@@ -1826,7 +2002,7 @@ static const char FX_MSL[] =
 typedef struct FxU
 {
     float proj[4], zp[4], vp[4], size[4], ao[4], grade[4], hand[4], up[4], sun[4], suncol[4], sunuv[4], fogc[4], fogp[4],
-        bloom[4], rays[4];
+        bloom[4], rays[4], shadow[4], lmat[16], smap[4], smap2[4];
 } FxU;
 
 static struct
@@ -1836,12 +2012,21 @@ static struct
     id<MTLRenderPipelineState> ao_pipe, blur_pipe, bright_pipe, down_pipe, gauss_pipe, raymask_pipe, rays_pipe, comp_pipe;
     MTLPixelFormat comp_fmt;
     id<MTLTexture> src, ao0, ao1, b1a, b1b, b2a, b2b, ra, rb;
-    id<MTLSamplerState> samp;
+    id<MTLSamplerState> samp, cmp;
+    id<MTLTexture> smap, scol, sdummy; /* the sun's shadow map, its (memoryless) color, a stand-in */
+    id<MTLDepthStencilState> sdepth;
     /* what the fog and rays follow, eased from frame to frame (fx_ease): the game's values can
      * change between frames, and the effects should not pop with them */
     int eased;           /* ease (the last scene was the frame before); else take the new values */
     uint64_t eased_serial;
     float fog_on, fogc[3], up[3], sun[3], suncol[3];
+    /* toward the sun in the world, as the last lit draw gave it, and the frame it was seen */
+    float sunw[3];
+    uint64_t sunw_seen;
+    /* the shadows' profile (FFXI_PROFILE): frames, frames with their own sun, with a map, the
+     * fewest and most casters */
+    uint32_t st_frames, st_own, st_map, st_cmin, st_cmax, st_drawn_this, st_cached;
+    float st_across;
 } g_fx;
 
 /* a toward b by k; the first time, b */
@@ -1878,11 +2063,19 @@ static const struct
     { "fog_falloff", offsetof(__typeof__(g_fxs), fog_falloff), 0.08f },
     { "fog_height", offsetof(__typeof__(g_fxs), fog_height), 2.0f },
     { "fog_max", offsetof(__typeof__(g_fxs), fog_max), 0.5f },
+    { "fog_sun", offsetof(__typeof__(g_fxs), fog_sun), 0.5f },
+    { "fog_g", offsetof(__typeof__(g_fxs), fog_g), 0.6f },
     { "bloom", offsetof(__typeof__(g_fxs), bloom), 0.3f },
     { "threshold", offsetof(__typeof__(g_fxs), threshold), 0.75f },
     { "rays", offsetof(__typeof__(g_fxs), rays), 0.6f },
     { "rays_decay", offsetof(__typeof__(g_fxs), rays_decay), 0.965f },
     { "rays_length", offsetof(__typeof__(g_fxs), rays_length), 0.85f },
+    { "light", offsetof(__typeof__(g_fxs), light), 1.0f },
+    { "shadow", offsetof(__typeof__(g_fxs), shadow), 0.3f },
+    { "shadow_length", offsetof(__typeof__(g_fxs), shadow_length), 0.6f },
+    { "sun", offsetof(__typeof__(g_fxs), sun), 0.5f },
+    { "sun_distance", offsetof(__typeof__(g_fxs), sun_distance), 40.0f },
+    { "sun_soft", offsetof(__typeof__(g_fxs), sun_soft), 0.03f },
     { "debug", offsetof(__typeof__(g_fxs), debug), 0.0f },
 };
 
@@ -1943,7 +2136,7 @@ static void fx_config(void)
     const char* dbg = getenv("FFXI_FX_DEBUG"); /* also by name */
     if (dbg)
         g_fxs.debug = !strcmp(dbg, "ao") ? 1.0f : !strcmp(dbg, "fog") ? 2.0f : !strcmp(dbg, "bloom") ? 3.0f
-            : !strcmp(dbg, "rays") ? 4.0f : (float)atof(dbg);
+            : !strcmp(dbg, "rays") ? 4.0f : !strcmp(dbg, "shadow") ? 5.0f : (float)atof(dbg);
     const char* file = getenv("FFXI_FX_FILE");
     if (file && *file)
         snprintf(g_fx_file, sizeof g_fx_file, "%s", file);
@@ -1977,8 +2170,8 @@ static int fx_init(void)
     g_fx.lib = compile(FX_MSL);
     if (!g_fx.lib)
         return 0;
-    g_fx.ao_pipe = fx_pipeline(@"fx_ao", MTLPixelFormatRG16Float);
-    g_fx.blur_pipe = fx_pipeline(@"fx_blur", MTLPixelFormatRG16Float);
+    g_fx.ao_pipe = fx_pipeline(@"fx_ao", MTLPixelFormatRGBA16Float);
+    g_fx.blur_pipe = fx_pipeline(@"fx_blur", MTLPixelFormatRGBA16Float);
     g_fx.bright_pipe = fx_pipeline(@"fx_bright", MTLPixelFormatRGBA16Float);
     g_fx.down_pipe = fx_pipeline(@"fx_down", MTLPixelFormatRGBA16Float);
     g_fx.gauss_pipe = fx_pipeline(@"fx_gauss", MTLPixelFormatRGBA16Float);
@@ -1988,7 +2181,19 @@ static int fx_init(void)
     sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
     sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
     g_fx.samp = [g_dev newSamplerStateWithDescriptor:sd];
+    sd.compareFunction = MTLCompareFunctionLessEqual; /* 1 where the point is no deeper than the map */
+    g_fx.cmp = [g_dev newSamplerStateWithDescriptor:sd];
     [sd release];
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                  width:1 height:1 mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    g_fx.sdummy = [g_dev newTextureWithDescriptor:td];
+    MTLDepthStencilDescriptor* dd = [[MTLDepthStencilDescriptor alloc] init];
+    dd.depthCompareFunction = MTLCompareFunctionLess;
+    dd.depthWriteEnabled = YES;
+    g_fx.sdepth = [g_dev newDepthStencilStateWithDescriptor:dd];
+    [dd release];
     if (!g_fx.ao_pipe || !g_fx.blur_pipe || !g_fx.bright_pipe || !g_fx.down_pipe || !g_fx.gauss_pipe || !g_fx.raymask_pipe ||
         !g_fx.rays_pipe)
     {
@@ -2029,6 +2234,7 @@ static void fx_pass(id<MTLTexture> target, MTLLoadAction load, id<MTLRenderPipel
     for (int i = 0; i < n; ++i)
         [e setFragmentTexture:tex[i] atIndex:(NSUInteger)i];
     [e setFragmentSamplerState:g_fx.samp atIndex:0];
+    [e setFragmentSamplerState:g_fx.cmp atIndex:1];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
 }
@@ -2061,6 +2267,308 @@ static int mat_inverse(float* out, const float* m)
     for (int i = 0; i < 16; ++i)
         out[i] = inv[i] / det;
     return 1;
+}
+
+static void mat_mul(float* o, const float* a, const float* b)
+{
+    float t[16];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            t[i * 4 + j] = a[i * 4] * b[j] + a[i * 4 + 1] * b[4 + j] + a[i * 4 + 2] * b[8 + j] + a[i * 4 + 3] * b[12 + j];
+    memcpy(o, t, sizeof t);
+}
+
+enum { SUN_MAP = 4096, SUN_CACHE_FRAMES = 60 * 30 };
+
+/* The zone's casters, kept after they leave the view: the game draws only what the camera sees, but
+ * a low sun throws the shadows of what is behind and beside the camera into it. Each caster drawn
+ * from buffers the game keeps is kept with a copy of its uniforms and that frame's camera (clip
+ * space back to the world), and drawn into the map from there while it is out of view - for 30
+ * seconds, or until the camera jumps (a new zone). */
+typedef struct CacheKey
+{
+    void* vb[GFX_NSTREAMS];
+    NSUInteger voff[GFX_NSTREAMS];
+    void* ib;
+    NSUInteger ioff;
+    uint32_t n, vstart;
+    LibKey lib;
+} CacheKey;
+
+typedef struct Cached
+{
+    Caster c; /* retains its buffers; c.ub is the cache's own copy of the uniforms */
+    float clip_world[16];
+    uint64_t seen, replayed;
+} Cached;
+
+static Cached* g_cache;
+static uint32_t g_ncache, g_cache_cap;
+static Map g_cache_map; /* CacheKey -> index + 1 */
+static float g_cache_cam[3];
+
+static void cache_key(CacheKey* k, const Caster* c)
+{
+    memset(k, 0, sizeof *k);
+    for (int s = 0; s < GFX_NSTREAMS; ++s)
+        k->vb[s] = (void*)c->vb[s], k->voff[s] = c->voff[s];
+    k->ib = (void*)c->ib, k->ioff = c->ioff, k->n = c->n, k->vstart = c->vstart, k->lib = c->lib;
+}
+
+static void cache_map_free(void)
+{
+    for (uint32_t i = 0; i < g_cache_map.cap; ++i)
+        if (g_cache_map.e[i].hash)
+            free(g_cache_map.e[i].key);
+    free(g_cache_map.e);
+    memset(&g_cache_map, 0, sizeof g_cache_map);
+}
+
+static void cached_release(Cached* ce)
+{
+    Caster* c = &ce->c;
+    for (int s = 0; s < GFX_NSTREAMS; ++s)
+        [c->vb[s] release];
+    [c->ub release];
+    [c->ib release];
+    for (int t = 0; t < 8; ++t)
+        [c->tex[t] release];
+}
+
+/* drops what has not been seen for SUN_CACHE_FRAMES (all of it when all is true) and rebuilds the map */
+static void sun_cache_trim(int all)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g_ncache; ++i)
+    {
+        if (all || g_cache[i].seen + SUN_CACHE_FRAMES < g_serial)
+            cached_release(&g_cache[i]);
+        else
+            g_cache[n++] = g_cache[i];
+    }
+    g_ncache = n;
+    cache_map_free();
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        CacheKey k;
+        cache_key(&k, &g_cache[i].c);
+        map_put(&g_cache_map, &k, sizeof k, (id)(uintptr_t)(i + 1));
+    }
+}
+
+/* this frame's fixed casters into the cache (new ones added, seen ones brought up to date) */
+static void sun_cache_update(const float* clip_world, const float* cam)
+{
+    float dx = cam[0] - g_cache_cam[0], dy = cam[1] - g_cache_cam[1], dz = cam[2] - g_cache_cam[2];
+    if (dx * dx + dy * dy + dz * dz > 50.0f * 50.0f)
+    {
+        if (gfx_profiling)
+            fprintf(stderr, "[recomp] gfx: shadows: the camera jumped %.0f units (frame %llu): cache cleared\n",
+                sqrtf(dx * dx + dy * dy + dz * dz), (unsigned long long)g_serial);
+        sun_cache_trim(1);
+    }
+    memcpy(g_cache_cam, cam, 12);
+    if (!(g_serial & 255))
+        sun_cache_trim(0);
+    for (uint32_t i = 0; i < g_ncasters; ++i)
+    {
+        const Caster* c = &g_casters[i];
+        if (!c->fixed)
+            continue;
+        CacheKey k;
+        cache_key(&k, c);
+        uintptr_t at = (uintptr_t)map_get(&g_cache_map, &k, sizeof k);
+        Cached* ce;
+        if (!at)
+        {
+            if (g_ncache == g_cache_cap)
+            {
+                g_cache_cap = g_cache_cap ? g_cache_cap * 2 : 1024;
+                g_cache = (Cached*)realloc(g_cache, g_cache_cap * sizeof(Cached));
+            }
+            ce = &g_cache[g_ncache++];
+            memset(ce, 0, sizeof *ce);
+            ce->c = *c;
+            for (int s = 0; s < GFX_NSTREAMS; ++s)
+                [ce->c.vb[s] retain];
+            [ce->c.ib retain];
+            for (int t = 0; t < 8; ++t)
+                [ce->c.tex[t] retain];
+            ce->c.ub = nil;
+            map_put(&g_cache_map, &k, sizeof k, (id)(uintptr_t)g_ncache);
+        }
+        else
+            ce = &g_cache[at - 1];
+        /* the uniforms as of this frame: in place, unless a frame the GPU may still be drawing
+         * read them */
+        const void* src = (const uint8_t*)[c->ub contents] + c->uoff;
+        if (ce->c.ub && ce->replayed + FRAMES < g_serial)
+            memcpy([ce->c.ub contents], src, sizeof(GfxU));
+        else
+        {
+            [ce->c.ub release];
+            ce->c.ub = [g_dev newBufferWithBytes:src length:sizeof(GfxU) options:MTLResourceStorageModeShared];
+        }
+        ce->c.uoff = 0;
+        memcpy(ce->clip_world, clip_world, 64);
+        ce->seen = g_serial;
+    }
+}
+
+/* The sun's shadow map for the scene: an orthographic view along the sun over a sphere around the
+ * first sun_distance units the camera sees, its center snapped to whole texels (the shadows' edges
+ * hold still as the camera moves), the casters drawn into it. Gives the matrix from the camera's view
+ * space to the map (lmat) and a texel's size in world units; 0 when there is no map. */
+static int sun_map(const GfxScene* s, const float* L, float* lmat, float* texel, float* bias, float* soft, float* slope)
+{
+    if (!g_ncasters && !g_ncache)
+        return 0;
+    float invP[16], invV[16];
+    if (!mat_inverse(invP, s->proj) || !mat_inverse(invV, s->view))
+        return 0;
+    /* the slice of the view to cover, in the world: its corners, their center, the farthest */
+    float hand = s->proj[11] < 0.0f ? -1.0f : 1.0f, dist = fmaxf(g_fxs.sun_distance, 4.0f), p[8][3], c[3] = { 0, 0, 0 };
+    for (int i = 0; i < 8; ++i)
+    {
+        float t = i < 4 ? 0.5f : dist, z = t * hand, nx = (i & 1) ? 1.0f : -1.0f, ny = (i & 2) ? 1.0f : -1.0f;
+        float v[4] = { (nx * t - s->proj[8] * z) / s->proj[0], (ny * t - s->proj[9] * z) / s->proj[5], z, 1.0f };
+        for (int j = 0; j < 3; ++j)
+            p[i][j] = v[0] * invV[j] + v[1] * invV[4 + j] + v[2] * invV[8 + j] + invV[12 + j], c[j] += p[i][j] / 8.0f;
+    }
+    float R = 0.0f;
+    for (int i = 0; i < 8; ++i)
+    {
+        float dx = p[i][0] - c[0], dy = p[i][1] - c[1], dz = p[i][2] - c[2];
+        R = fmaxf(R, sqrtf(dx * dx + dy * dy + dz * dz));
+    }
+    /* the sun's axes: f the way its light goes, r and u across */
+    float f[3] = { -L[0], -L[1], -L[2] }, up[3] = { 0, 1, 0 };
+    if (fabsf(f[1]) > 0.9f)
+        up[0] = 1, up[1] = 0;
+    float r[3] = { up[1] * f[2] - up[2] * f[1], up[2] * f[0] - up[0] * f[2], up[0] * f[1] - up[1] * f[0] };
+    normalize3(r);
+    float u[3] = { f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0] };
+    float tx = 2.0f * R / SUN_MAP;
+    float cx = floorf((c[0] * r[0] + c[1] * r[1] + c[2] * r[2]) / tx) * tx;
+    float cy = floorf((c[0] * u[0] + c[1] * u[1] + c[2] * u[2]) / tx) * tx;
+    float cz = c[0] * f[0] + c[1] * f[1] + c[2] * f[2];
+    /* casters stand up to 200 units sunward of the sphere (a cliff over the camera) */
+    float back = 200.0f, range = 2.0f * R + back, z0 = cz - R - back;
+    float S[16] = {
+        r[0] / R, u[0] / R, f[0] / range, 0,
+        r[1] / R, u[1] / R, f[1] / range, 0,
+        r[2] / R, u[2] / R, f[2] / range, 0,
+        -cx / R, -cy / R, -z0 / range, 1,
+    };
+    float M[16];
+    mat_mul(lmat, invV, S);   /* view space -> the map */
+    mat_mul(M, invP, lmat);   /* the camera's clip space -> the map */
+    *texel = tx;
+    *bias = 0.05f / range;
+    /* the penumbra's radius grows by sun_soft for each unit from the caster: in the map's width
+     * (2R across) per unit of its depth (range deep) */
+    *soft = g_fxs.sun_soft * range / (2.0f * R);
+    *slope = 2.0f * R / range;
+
+    if (!g_fx.smap)
+    {
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                      width:SUN_MAP height:SUN_MAP mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        g_fx.smap = [g_dev newTextureWithDescriptor:td];
+        td.pixelFormat = MTLPixelFormatR8Unorm;
+        td.usage = MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModeMemoryless;
+        g_fx.scol = [g_dev newTextureWithDescriptor:td];
+        if (!g_fx.smap || !g_fx.scol)
+            return 0;
+    }
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.depthAttachment.texture = g_fx.smap;
+    rp.depthAttachment.loadAction = MTLLoadActionClear;
+    rp.depthAttachment.clearDepth = 1.0;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    rp.colorAttachments[0].texture = g_fx.scol;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+    id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
+    [e setViewport:(MTLViewport){ 0, 0, SUN_MAP, SUN_MAP, 0, 1 }];
+    [e setDepthStencilState:g_fx.sdepth];
+    [e setCullMode:MTLCullModeNone];
+    [e setDepthBias:0 slopeScale:1.5f clamp:0];
+    float clip_world[16];
+    mat_mul(clip_world, invP, invV);
+    sun_cache_update(clip_world, invV + 12);
+    uint32_t drawn = 0, total = g_ncasters + g_ncache;
+    for (uint32_t i = 0; i < total; ++i)
+    {
+        const Caster* cs;
+        if (i < g_ncasters)
+        {
+            cs = &g_casters[i];
+            if (i == 0)
+                [e setVertexBytes:M length:64 atIndex:5];
+        }
+        else
+        {
+            /* the zone out of view: as it was drawn when last seen, through that frame's camera */
+            Cached* ce = &g_cache[i - g_ncasters];
+            if (ce->seen == g_serial || ce->seen + SUN_CACHE_FRAMES < g_serial)
+                continue;
+            float m[16];
+            mat_mul(m, ce->clip_world, S);
+            [e setVertexBytes:m length:64 atIndex:5];
+            ce->replayed = g_serial;
+            cs = &ce->c;
+        }
+        PipeKey k;
+        memset(&k, 0, sizeof k);
+        k.lib = cs->lib;
+        k.lib.vs.shadow = 1, k.lib.vs.pixel = 0;
+        int at = alpha_tested(&cs->lib.fs);
+        if (!at)
+        {
+            /* the position alone: one pipeline serves every draw with the same vertex layout */
+            GfxVsKey* v = &k.lib.vs;
+            v->lighting = v->normalize = v->localviewer = v->specular = 0;
+            v->src_diffuse = v->src_specular = v->src_ambient = v->src_emissive = 0;
+            v->nlights = 0, memset(v->light_type, 0, sizeof v->light_type);
+            v->fog_vertex = v->range_fog = 0, v->ntex = 0, v->flat = 0;
+            memset(v->tci, 0, sizeof v->tci), memset(v->ttf, 0, sizeof v->ttf);
+            memset(&k.lib.fs, 0, sizeof k.lib.fs);
+        }
+        k.color = (uint32_t)MTLPixelFormatR8Unorm, k.depth = (uint32_t)MTLPixelFormatDepth32Float;
+        id<MTLRenderPipelineState> ps = pipeline_for(&k, cs->vs, cs->ps);
+        if (!ps)
+            continue;
+        [e setRenderPipelineState:ps];
+        for (int st = 0; st < GFX_NSTREAMS; ++st)
+            [e setVertexBuffer:cs->vb[st] offset:cs->voff[st] atIndex:(NSUInteger)st];
+        [e setVertexBuffer:cs->ub offset:cs->uoff atIndex:4];
+        if (at)
+        {
+            [e setFragmentBuffer:cs->ub offset:cs->uoff atIndex:4];
+            for (int t = 0; t < 8; ++t)
+                if (cs->tex[t])
+                {
+                    GfxSampler sk = cs->samp[t];
+                    [e setFragmentTexture:cs->tex[t] atIndex:(NSUInteger)t];
+                    [e setFragmentSamplerState:sampler(&sk) atIndex:(NSUInteger)t];
+                }
+        }
+        if (cs->itype)
+            [e drawIndexedPrimitives:cs->prim indexCount:cs->n
+                           indexType:cs->itype == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                         indexBuffer:cs->ib indexBufferOffset:cs->ioff];
+        else
+            [e drawPrimitives:cs->prim vertexStart:cs->vstart vertexCount:cs->n];
+        drawn++;
+    }
+    [e endEncoding];
+    g_fx.st_across = 2.0f * R;
+    g_fx.st_cached = g_ncache;
+    return drawn != 0;
 }
 
 void gfx_scene_done(GfxTex* color, const GfxScene* s)
@@ -2117,16 +2625,45 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                 memcpy(u.up, g_fx.up, 12);
                 memcpy(u.fogc, g_fx.fogc, 12);
                 u.fogc[3] = g_fxs.fog * g_fx.fog_on * expf(-g_fxs.fog_falloff * g_fxs.fog_height);
-                u.fogp[0] = g_fxs.fog_falloff, u.fogp[1] = g_fxs.fog_max;
+                u.fogp[0] = g_fxs.fog_falloff, u.fogp[1] = g_fxs.fog_max, u.fogp[2] = g_fxs.fog_sun;
+                u.fogp[3] = fminf(fmaxf(g_fxs.fog_g, 0.0f), 0.95f);
             }
-            if (s->sun_dir[3] != 0.0f)
+            /* the sun, kept in the world: the zone's shader draws carry no light, so a frame gives one
+             * only when a lit draw (a character) is in view - the shadows hold the last one rather
+             * than come and go with what the camera sees */
+            float vinv[16];
+            int have_v = mat_inverse(vinv, s->view), own = s->sun_dir[3] != 0.0f && have_v;
+            if (own)
             {
-                fx_ease(g_fx.sun, s->sun_dir, 3, 0.2f);
-                normalize3(g_fx.sun);
+                float w[3];
+                for (int j = 0; j < 3; ++j)
+                    w[j] = s->sun_dir[0] * vinv[j] + s->sun_dir[1] * vinv[4 + j] + s->sun_dir[2] * vinv[8 + j];
+                normalize3(w);
+                /* the sun moves on in steps of a quarter degree: the shadows' edges hold still
+                 * between them, rather than crawl a little every frame */
+                float dot = w[0] * g_fx.sunw[0] + w[1] * g_fx.sunw[1] + w[2] * g_fx.sunw[2];
+                if (!g_fx.sunw_seen || dot < 0.99999f)
+                    memcpy(g_fx.sunw, w, 12);
+                g_fx.sunw_seen = g_serial;
                 fx_ease(g_fx.suncol, s->sun_color, 3, 0.1f);
+            }
+            int shadows = g_fxs.sun > 0.0f || g_fxs.shadow > 0.0f;
+            if (have_v && (own || (shadows && g_fx.sunw_seen && g_fx.sunw_seen + 600 > g_serial)))
+            {
+                /* back into this frame's view */
+                for (int j = 0; j < 3; ++j)
+                    g_fx.sun[j] = g_fx.sunw[0] * s->view[j] + g_fx.sunw[1] * s->view[4 + j] + g_fx.sunw[2] * s->view[8 + j];
+                normalize3(g_fx.sun);
                 memcpy(u.sun, g_fx.sun, 12);
                 u.sun[3] = 1.0f;
                 memcpy(u.suncol, g_fx.suncol, 12);
+                /* shadows while the sun (or moon) is up: fading as it nears the horizon */
+                float e = g_fx.sun[0] * g_fx.up[0] + g_fx.sun[1] * g_fx.up[1] + g_fx.sun[2] * g_fx.up[2];
+                float day = fminf(fmaxf((e - 0.05f) / 0.15f, 0.0f), 1.0f);
+                u.shadow[0] = g_fxs.shadow * day;
+                u.shadow[1] = g_fxs.shadow_length, u.shadow[2] = 0.3f, u.shadow[3] = 40.0f;
+                if (g_fxs.sun > 0.0f && day > 0.0f && sun_map(s, g_fx.sunw, u.lmat, &u.smap[1], &u.smap[2], &u.smap[3], &u.smap2[0]))
+                    u.smap[0] = g_fxs.sun * day, g_fx.st_drawn_this = 1;
                 /* the sun's place on screen: far along its direction, through the projection */
                 const float* sd = g_fx.sun;
                 float cw = sd[2] * s->proj[11];
@@ -2141,8 +2678,8 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
             }
             u.bloom[0] = g_fxs.threshold, u.bloom[1] = g_fxs.bloom, u.bloom[2] = 0.25f;
             u.rays[0] = u.sunuv[2] > 0.0f ? g_fxs.rays : 0.0f, u.rays[1] = g_fxs.rays_decay, u.rays[2] = g_fxs.rays_length;
-            if (fx_tex(&g_fx.src, ct.pixelFormat, ct.width, ct.height) && fx_tex(&g_fx.ao0, MTLPixelFormatRG16Float, aw, ah) &&
-                fx_tex(&g_fx.ao1, MTLPixelFormatRG16Float, aw, ah) && fx_tex(&g_fx.b1a, MTLPixelFormatRGBA16Float, bw, bh) &&
+            if (fx_tex(&g_fx.src, ct.pixelFormat, ct.width, ct.height) && fx_tex(&g_fx.ao0, MTLPixelFormatRGBA16Float, aw, ah) &&
+                fx_tex(&g_fx.ao1, MTLPixelFormatRGBA16Float, aw, ah) && fx_tex(&g_fx.b1a, MTLPixelFormatRGBA16Float, bw, bh) &&
                 fx_tex(&g_fx.b1b, MTLPixelFormatRGBA16Float, bw, bh) &&
                 fx_tex(&g_fx.b2a, MTLPixelFormatRGBA16Float, (bw + 1) / 2, (bh + 1) / 2) &&
                 fx_tex(&g_fx.b2b, MTLPixelFormatRGBA16Float, (bw + 1) / 2, (bh + 1) / 2) &&
@@ -2162,9 +2699,10 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                     [b endEncoding];
                     static const int32_t across[2] = { 1, 0 }, down[2] = { 0, 1 }, across2[2] = { 2, 0 }, down2[2] = { 0, 2 };
                     MTLViewport q = fx_full(g_fx.ao0), qb = fx_full(g_fx.b1a), e = fx_full(g_fx.b2a);
-                    if (u.ao[1] > 0.0f)
+                    if (u.ao[1] > 0.0f || u.shadow[0] > 0.0f || u.smap[0] > 0.0f)
                     {
-                        fx_pass(g_fx.ao0, MTLLoadActionDontCare, g_fx.ao_pipe, q, &u, &depth, 1, NULL);
+                        id<MTLTexture> ao_in[2] = { depth, u.smap[0] > 0.0f ? g_fx.smap : g_fx.sdummy };
+                        fx_pass(g_fx.ao0, MTLLoadActionDontCare, g_fx.ao_pipe, q, &u, ao_in, 2, NULL);
                         fx_pass(g_fx.ao1, MTLLoadActionDontCare, g_fx.blur_pipe, q, &u, &g_fx.ao0, 1, across);
                         fx_pass(g_fx.ao0, MTLLoadActionDontCare, g_fx.blur_pipe, q, &u, &g_fx.ao1, 1, down);
                     }
@@ -2201,6 +2739,25 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
         }
         color->used = g_serial;
         if (gfx_profiling)
+        {
+            static double last;
+            g_fx.st_frames++;
+            g_fx.st_own += s->sun_dir[3] != 0.0f;
+            g_fx.st_map += g_fx.st_drawn_this;
+            g_fx.st_cmin = g_fx.st_frames == 1 || g_ncasters < g_fx.st_cmin ? g_ncasters : g_fx.st_cmin;
+            g_fx.st_cmax = g_ncasters > g_fx.st_cmax ? g_ncasters : g_fx.st_cmax;
+            double now = CACurrentMediaTime();
+            if (now - last > 2.0)
+            {
+                fprintf(stderr, "[recomp] gfx: shadows: %u frames, %u with the sun's own light, %u with a map; casters %u..%u; "
+                    "%u cached; map %.0f units across; sun %.2f %.2f %.2f\n", g_fx.st_frames, g_fx.st_own, g_fx.st_map, g_fx.st_cmin,
+                    g_fx.st_cmax, g_fx.st_cached, g_fx.st_across, g_fx.sunw[0], g_fx.sunw[1], g_fx.sunw[2]);
+                last = now, g_fx.st_frames = g_fx.st_own = g_fx.st_map = g_fx.st_cmax = 0;
+            }
+        }
+        g_fx.st_drawn_this = 0;
+        casters_clear();
+        if (gfx_profiling)
             g_prof.draw_ns += gfx_now_ns() - t0;
     }
 }
@@ -2208,6 +2765,7 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
 /* --- frames ---------------------------------------------------------------------------------------------------- */
 static void frame_end(void)
 {
+    casters_clear();
     id<MTLCommandBuffer> c = cmd();
     uint64_t serial = g_serial;
     dispatch_semaphore_t sem = g_frames_sem;

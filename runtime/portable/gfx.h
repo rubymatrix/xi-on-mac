@@ -94,7 +94,11 @@ typedef struct GfxVsKey
     uint8_t tci[8];     /* D3DTSS_TEXCOORDINDEX: index | generation mode << 4 */
     uint8_t ttf[8];     /* D3DTSS_TEXTURETRANSFORMFLAGS: count | 0x80 projected */
     uint8_t flat;
-    uint8_t pad[3];
+    uint8_t pixel;      /* the lighting per pixel rather than per vertex (the back end sets it: the
+                         * scene effects' light setting); the vertex function passes the normal on */
+    uint8_t shadow;     /* drawn again from the sun (the back end's shadow map): the position the
+                         * function makes goes through the matrix in buffer 5 */
+    uint8_t pad[1];
 } GfxVsKey;
 
 typedef struct GfxStage
@@ -184,6 +188,7 @@ typedef struct GfxDraw
     GfxTex* tex[8];
     GfxSampler samp[8];
     uint8_t cull;   /* D3DCULL */
+    uint8_t caster; /* an opaque draw of the frame's 3D scene: it casts the sun's shadow */
     uint8_t fill;   /* D3DFILLMODE */
     int32_t zbias;  /* D3DRS_ZBIAS */
     uint32_t stencil_ref;

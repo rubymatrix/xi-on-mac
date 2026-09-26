@@ -21,4 +21,7 @@ char* gfx_msl_generate(const GfxVsKey* vk, const GfxFsKey* fk, const uint32_t* v
 /* vs.1.0/1.1 and ps.1.0-1.4 token streams: the function bodies (after the signature, before the
  * fragment tail, which reads r0). 0 when the shader cannot be translated. */
 int gfx_msl_vs1(Sb* b, const GfxVsKey* k, const uint32_t* tokens);
+/* The vertex function's parameters after the streams, and its end (the shadow pass's matrix). */
+void gfx_msl_vs_params(Sb* b, const GfxVsKey* k);
+void gfx_msl_vs_return(Sb* b, const GfxVsKey* k);
 int gfx_msl_ps1(Sb* b, const GfxFsKey* k, const uint32_t* tokens);
