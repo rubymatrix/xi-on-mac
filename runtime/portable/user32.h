@@ -20,3 +20,10 @@ void user32_desktop_mode(uint32_t* w, uint32_t* h, uint32_t* hz);
 void user32_set_ui_aspect(float aspect);
 /* The fraction of hwnd's width the interface keeps: 1 when off, or the window is not wider. */
 float user32_ui_squeeze(uint32_t hwnd);
+/* Set by the graphics layer: whether the interface covers this point of the window (0..1 across
+ * and down), as drawn last frame. The mouse is unsqueezed only there. */
+extern int (*user32_ui_hit)(float fx, float fy);
+/* 1 when the game was last given the cursor as it is (over the world), 0 unsqueezed */
+int user32_mouse_raw(void);
+/* where the game was last given the cursor, 0..1 of its window across and down */
+void user32_mouse_given(float* fx, float* fy);

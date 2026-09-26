@@ -95,15 +95,35 @@ static float ui_squeeze(const Wnd* w)
     return s < 1.0f ? s : 1.0f;
 }
 
-/* A client x the cursor is at, as the x the game drew there before its draws were squeezed toward
- * the middle (d3d8.c): the game hit-tests its interface in the coordinates it drew in. */
-static int ui_unsqueeze_x(const Wnd* w, int x)
+/* The game takes one mouse position for its interface and its 3D world alike. Over the interface
+ * (where d3d8.c drew it last frame: user32_ui_hit) the cursor's client x goes to the game as the x
+ * the game drew there before its draws were squeezed toward the middle, so its hit tests line up;
+ * over the world it goes as it is, so picking and the target arrow do. A press keeps its mode until
+ * the buttons are up (dragging a window out over the world). The game's own cursor is drawn to
+ * match (user32_mouse_raw). */
+int (*user32_ui_hit)(float fx, float fy);
+static int g_mouse_raw = 1, g_mouse_held;
+
+static float g_mouse_fx, g_mouse_fy; /* where the game was last told the cursor is: 0..1 of the client */
+
+int user32_mouse_raw(void) { return g_mouse_raw; }
+
+void user32_mouse_given(float* fx, float* fy) { *fx = g_mouse_fx, *fy = g_mouse_fy; }
+
+static int ui_unsqueeze_x(const Wnd* w, int x, int y)
 {
     float s = ui_squeeze(w);
     if (s >= 1.0f)
-        return x;
+        return g_mouse_raw = 1, x;
+    if (!g_mouse_held)
+        g_mouse_raw = !(user32_ui_hit && user32_ui_hit(((float)x + 0.5f) / (float)w->w, ((float)y + 0.5f) / (float)w->h));
+    g_mouse_fy = ((float)y + 0.5f) / (float)w->h;
+    if (g_mouse_raw)
+        return g_mouse_fx = ((float)x + 0.5f) / (float)w->w, x;
     float c = (float)w->w * 0.5f, gx = c + ((float)x - c) / s;
-    return gx < 0 ? 0 : gx > (float)(w->w - 1) ? w->w - 1 : (int)(gx + 0.5f);
+    int r = gx < 0 ? 0 : gx > (float)(w->w - 1) ? w->w - 1 : (int)(gx + 0.5f);
+    g_mouse_fx = ((float)r + 0.5f) / (float)w->w;
+    return r;
 }
 
 static Wnd* wnd_of_sdl(SDL_WindowID id)
@@ -433,7 +453,7 @@ static void pump(void)
             w = wnd_of_sdl(e.motion.windowID);
             if (w)
                 post(w->tid, w->hwnd, WM_MOUSEMOVE, mouse_keys(e.motion.state),
-                    ((uint32_t)(uint16_t)(int)e.motion.y << 16) | (uint16_t)ui_unsqueeze_x(w, (int)e.motion.x));
+                    ((uint32_t)(uint16_t)(int)e.motion.y << 16) | (uint16_t)ui_unsqueeze_x(w, (int)e.motion.x, (int)e.motion.y));
             break;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
         case SDL_EVENT_MOUSE_BUTTON_UP:
@@ -446,9 +466,11 @@ static void pump(void)
                          : e.button.button == SDL_BUTTON_RIGHT   ? (down ? WM_RBUTTONDOWN : WM_RBUTTONUP)
                          : e.button.button == SDL_BUTTON_MIDDLE ? (down ? WM_MBUTTONDOWN : WM_MBUTTONUP)
                                                                  : 0;
-            if (msg)
-                post(w->tid, w->hwnd, msg, mouse_keys(SDL_GetMouseState(NULL, NULL)),
-                    ((uint32_t)(uint16_t)(int)e.button.y << 16) | (uint16_t)ui_unsqueeze_x(w, (int)e.button.x));
+            if (!msg)
+                break;
+            uint32_t lp = ((uint32_t)(uint16_t)(int)e.button.y << 16) | (uint16_t)ui_unsqueeze_x(w, (int)e.button.x, (int)e.button.y);
+            g_mouse_held = SDL_GetMouseState(NULL, NULL) != 0;
+            post(w->tid, w->hwnd, msg, mouse_keys(SDL_GetMouseState(NULL, NULL)), lp);
             break;
         }
         case SDL_EVENT_MOUSE_WHEEL:
@@ -770,7 +792,7 @@ static void sh_GetCursorPos(Guest* g)
         SDL_GetGlobalMouseState(&x, &y);
     Wnd* w = wnd(g_focus);
     if (w && x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h)
-        x = (float)(w->x + ui_unsqueeze_x(w, (int)x - w->x));
+        x = (float)(w->x + ui_unsqueeze_x(w, (int)x - w->x, (int)y - w->y));
     wr32(ARG(0), (uint32_t)(int32_t)x);
     wr32(ARG(0) + 4, (uint32_t)(int32_t)y);
     RET(1, 1);
