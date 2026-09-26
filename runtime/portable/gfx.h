@@ -253,6 +253,8 @@ typedef struct GfxScene
  * effects - ambient occlusion from the depth it was drawn with, color grading - run on it in place
  * (FFXI_FX=1); back ends without them do nothing. */
 void gfx_scene_done(GfxTex* color, const GfxScene* s);
+/* One scene-effect setting by its key in the settings file (fx, ao, fog, bloom, rays, ...). */
+void gfx_fx_set(const char* key, float v);
 
 /* The frame is done: the back buffer goes to the window. */
 void gfx_present(GfxTex* backbuffer);

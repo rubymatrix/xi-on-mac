@@ -409,53 +409,266 @@ static void run_window(SDL_Window* win)
     gfx_tex_destroy(bb);
 }
 
-/* The scene effects (gfx_scene_done, FFXI_FX=1): a wall with a floor meeting it, through a
- * perspective camera, left- or right-handed (FFXI's is right-handed: the scene is at negative z).
- * Occlusion darkens the wall where it meets the floor and leaves the open wall as it was. */
-static void test_scene_effects(int rh)
+/* --- the scene effects (gfx_scene_done, fx on) ---------------------------------------------------------
+ * A 128x128 scene through a 90-degree perspective camera, left- or right-handed (FFXI's is
+ * right-handed: the scene is at negative z), made of flat-colored quads; each test turns on the one
+ * effect it checks. */
+enum { SS = 128 };
+static GfxTex *g_srt, *g_sds;
+static float g_sproj[16], g_sz;
+static uint32_t g_spx[SS * SS];
+static const uint32_t SVP[6] = { 0, 0, SS, SS, 0, 0x3F800000u };
+
+static void fx_only(const char* on, float v)
 {
-    enum { S = 128 };
-    GfxTex* rt = gfx_tex_create(GFX_TEX_2D, 21, S, S, 1, GFX_USE_RT);
-    GfxTex* ds = gfx_tex_create(GFX_TEX_2D, 75, S, S, 1, GFX_USE_DEPTH);
-    const uint32_t vp[6] = { 0, 0, S, S, 0, 0x3F800000u };
-    gfx_set_targets(rt, 0, 0, ds);
-    gfx_clear(0, NULL, 3, 0xFF000000u, 1.0f, 0, vp);
+    static const char* const all[] = { "ao", "fog", "bloom", "rays", "grade" };
+    for (size_t i = 0; i < sizeof all / sizeof all[0]; ++i)
+        gfx_fx_set(all[i], 0.0f);
+    if (on)
+        gfx_fx_set(on, v);
+}
+
+static void scene_begin(int rh, uint32_t clear)
+{
+    if (!g_srt)
+        g_srt = gfx_tex_create(GFX_TEX_2D, 21, SS, SS, 1, GFX_USE_RT), g_sds = gfx_tex_create(GFX_TEX_2D, 75, SS, SS, 1, GFX_USE_DEPTH);
+    gfx_set_targets(g_srt, 0, 0, g_sds);
+    gfx_clear(0, NULL, 3, clear, 1.0f, 0, SVP);
     /* PerspectiveFovLH / RH: 90 degrees, square, near 0.5, far 100 */
-    float zn = 0.5f, zf = 100.0f, proj[16], sz = rh ? -1.0f : 1.0f;
-    memset(proj, 0, sizeof proj);
-    proj[0] = proj[5] = 1.0f, proj[10] = sz * zf / (zf - zn), proj[11] = sz, proj[14] = -zn * zf / (zf - zn);
+    float zn = 0.5f, zf = 100.0f;
+    g_sz = rh ? -1.0f : 1.0f;
+    memset(g_sproj, 0, sizeof g_sproj);
+    g_sproj[0] = g_sproj[5] = 1.0f, g_sproj[10] = g_sz * zf / (zf - zn), g_sproj[11] = g_sz, g_sproj[14] = -zn * zf / (zf - zn);
+}
+
+/* a quad (strip order) in view space, z given as a distance in front of the camera, of one color */
+static void scene_quad(float q[4][3], uint32_t color)
+{
     GfxDraw d;
     defaults(&d);
-    memcpy(d.u.wvp, proj, 64);
-    d.u.vp[2] = d.u.vp[3] = S;
-    memcpy(d.vp, vp, sizeof vp);
+    memcpy(d.u.wvp, g_sproj, 64);
+    d.u.vp[2] = d.u.vp[3] = SS;
+    memcpy(d.vp, SVP, sizeof SVP);
     d.vs.el[0] = (GfxElem){ 1, 0, GFX_FLOAT3, 0 };
     d.u.stride[0] = 12;
-    d.fs.st[0] = (GfxStage){ 2, 0, 1, 1, 2, 0, 1, 1, 1, 0, 0, 2 }; /* white: the vertices have no color */
+    d.fs.st[0] = (GfxStage){ 2, 3, 1, 1, 2, 3, 1, 1, 1, 0, 0, 2 }; /* SELECTARG1(TFACTOR) */
+    d.u.tfactor[0] = ((color >> 16) & 255) / 255.0f, d.u.tfactor[1] = ((color >> 8) & 255) / 255.0f;
+    d.u.tfactor[2] = (color & 255) / 255.0f, d.u.tfactor[3] = 1.0f;
     d.depth.zenable = 1, d.depth.zwrite = 1, d.depth.zfunc = 4;
-    float wall[4][3] = { { -8, 8, 6 * sz }, { 8, 8, 6 * sz }, { -8, -3, 6 * sz }, { 8, -3, 6 * sz } };
-    float floor[4][3] = { { -8, -3, 6 * sz }, { 8, -3, 6 * sz }, { -8, -3, 0.6f * sz }, { 8, -3, 0.6f * sz } };
+    float v[4][3];
+    for (int i = 0; i < 4; ++i)
+        v[i][0] = q[i][0], v[i][1] = q[i][1], v[i][2] = q[i][2] * g_sz;
+    d.data[0] = v, d.size[0] = sizeof v;
     d.prim = GFX_TRIANGLESTRIP, d.count = 2;
-    d.data[0] = wall, d.size[0] = sizeof wall;
     gfx_draw(&d);
-    d.data[0] = floor, d.size[0] = sizeof floor;
-    gfx_draw(&d);
+}
+
+/* the scene done, with a directional light toward sun (view space, left-handed; NULL for none) and
+ * a fog color; its pixels read back */
+static void scene_end(const float* sun, uint32_t fog)
+{
     GfxScene sc;
     memset(&sc, 0, sizeof sc);
-    memcpy(sc.proj, proj, 64);
+    memcpy(sc.proj, g_sproj, 64);
     identity(sc.view);
-    memcpy(sc.vp, vp, sizeof vp);
-    gfx_scene_done(rt, &sc);
-    static uint32_t p[S * S];
-    gfx_tex_read(rt, 0, 0, p, S * 4);
-    /* the floor meets the wall at y = -1/2 in NDC: row 96 */
-    uint32_t open = p[30 * S + 64] & 255, corner = p[94 * S + 64] & 255;
-    CHECK(open >= 245, "scene effects (%s): open wall %u (want about 255)", rh ? "RH" : "LH", open);
-    CHECK(corner <= 225, "scene effects (%s): wall at the floor %u (want darker)", rh ? "RH" : "LH", corner);
-    CHECK(gfx_failures() == 0, "scene effects: %u failures", gfx_failures());
+    memcpy(sc.vp, SVP, sizeof SVP);
+    if (sun)
+    {
+        float l = sqrtf(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+        sc.sun_dir[0] = sun[0] / l, sc.sun_dir[1] = sun[1] / l, sc.sun_dir[2] = sun[2] / l * g_sz, sc.sun_dir[3] = 1;
+        sc.sun_color[0] = sc.sun_color[1] = sc.sun_color[2] = 1;
+    }
+    sc.fog[2] = 1.0f; /* the game fogged its world */
+    sc.fogcolor[0] = ((fog >> 16) & 255) / 255.0f, sc.fogcolor[1] = ((fog >> 8) & 255) / 255.0f, sc.fogcolor[2] = (fog & 255) / 255.0f;
+    gfx_scene_done(g_srt, &sc);
+    gfx_tex_read(g_srt, 0, 0, g_spx, SS * 4);
+}
+
+static uint32_t spx(int x, int y, int shift) { return (g_spx[y * SS + x] >> shift) & 255; }
+
+/* a wall 6 ahead and a floor 3 below meeting it (at row 96) */
+static void wall_and_floor(uint32_t color)
+{
+    float wall[4][3] = { { -8, 8, 6 }, { 8, 8, 6 }, { -8, -3, 6 }, { 8, -3, 6 } };
+    float floor[4][3] = { { -8, -3, 6 }, { 8, -3, 6 }, { -8, -3, 0.6f }, { 8, -3, 0.6f } };
+    scene_quad(wall, color);
+    scene_quad(floor, color);
+}
+
+/* Occlusion darkens the wall where it meets the floor and leaves the open wall as it was. */
+static void test_scene_ao(int rh)
+{
+    fx_only("ao", 0.8f);
+    scene_begin(rh, 0xFF000000u);
+    wall_and_floor(0xFFFFFFFFu);
+    scene_end(NULL, 0);
+    uint32_t open = spx(64, 30, 0), corner = spx(64, 94, 0);
+    CHECK(open >= 245, "occlusion (%s): open wall %u (want about 255)", rh ? "RH" : "LH", open);
+    CHECK(corner <= 225, "occlusion (%s): wall at the floor %u (want darker)", rh ? "RH" : "LH", corner);
+}
+
+/* Height fog: the far wall takes more of the fog's color than the floor just ahead; with height
+ * falloff, the floor (below the camera) more than the wall's top at the same distance. */
+static void test_scene_fog(void)
+{
+    fx_only("fog", 0.08f);
+    gfx_fx_set("fog_falloff", 0.0f), gfx_fx_set("fog_max", 1.0f);
+    scene_begin(1, 0xFF000000u);
+    wall_and_floor(0xFFFFFFFFu);
+    scene_end(NULL, 0xFFFF0000u);
+    uint32_t far_g = spx(64, 40, 8), near_g = spx(64, 126, 8), far_r = spx(64, 40, 16);
+    CHECK(far_r >= 250 && far_g <= 200, "fog: far wall %u/%u (want red)", far_r, far_g);
+    CHECK(near_g >= far_g + 25, "fog: near floor green %u, far wall %u (want less fog near)", near_g, far_g);
+    /* falloff: more fog below the camera than above it, at the wall */
+    gfx_fx_set("fog_falloff", 0.5f), gfx_fx_set("fog_height", 0.0f);
+    scene_begin(1, 0xFF000000u);
+    wall_and_floor(0xFFFFFFFFu);
+    scene_end(NULL, 0xFFFF0000u);
+    uint32_t high = spx(64, 20, 8), low = spx(64, 90, 8);
+    CHECK(low + 20 < high, "fog: below the camera %u, above %u (want more fog below)", low, high);
+    /* from one frame to the next the fog's color eases: red, then blue is still mostly red */
+    gfx_fx_set("fog_falloff", 0.0f);
+    scene_begin(1, 0xFF000000u);
+    wall_and_floor(0xFF000000u);
+    scene_end(NULL, 0xFFFF0000u);
+    gfx_present(NULL);
+    scene_begin(1, 0xFF000000u);
+    wall_and_floor(0xFF000000u);
+    scene_end(NULL, 0xFF0000FFu);
+    uint32_t r = spx(64, 40, 16), b = spx(64, 40, 0);
+    CHECK(r > 2 * b, "fog: a new color the next frame %u red, %u blue (want it eased: mostly red)", r, b);
+    gfx_fx_set("fog_falloff", 0.08f), gfx_fx_set("fog_height", 2.0f), gfx_fx_set("fog_max", 0.5f);
+}
+
+/* Bloom: a bright square glows onto the dark wall around it. */
+static void test_scene_bloom(void)
+{
+    fx_only("bloom", 1.0f);
+    gfx_fx_set("threshold", 0.5f);
+    scene_begin(1, 0xFF000000u);
+    float lamp[4][3] = { { -0.5f, 0.5f, 5 }, { 0.5f, 0.5f, 5 }, { -0.5f, -0.5f, 5 }, { 0.5f, -0.5f, 5 } };
+    float wall[4][3] = { { -8, 8, 6 }, { 8, 8, 6 }, { -8, -8, 6 }, { 8, -8, 6 } };
+    scene_quad(lamp, 0xFFFFFFFFu);
+    scene_quad(wall, 0xFF101010u);
+    scene_end(NULL, 0);
+    /* the lamp spans 64 +- 6.4 pixels; 4 pixels past its edge */
+    uint32_t glow = spx(75, 64, 0), far = spx(120, 120, 0);
+    CHECK(glow >= 28, "bloom: next to the lamp %u (want a glow over 16)", glow);
+    CHECK(far <= 24, "bloom: far corner %u (want the wall's 16)", far);
+    gfx_fx_set("threshold", 0.75f);
+}
+
+/* God rays: with the sun behind the top of a wall (the sky above it bright), light spills down over
+ * the wall below the skyline; with the sun behind the camera, none. */
+static void test_scene_rays(void)
+{
+    float wall[4][3] = { { -8, 0, 6 }, { 8, 0, 6 }, { -8, -8, 6 }, { 8, -8, 6 } };
+    const float sun[3] = { 0, 0.1f, 1 }, behind[3] = { 0, 0.1f, -1 };
+    uint32_t lit[2];
+    for (int k = 0; k < 2; ++k)
+    {
+        fx_only("rays", 1.0f);
+        scene_begin(1, 0xFFFFFFFFu); /* white sky */
+        scene_quad(wall, 0xFF202020u);
+        scene_end(k ? behind : sun, 0);
+        lit[k] = spx(64, 72, 0); /* 8 rows below the skyline */
+    }
+    CHECK(lit[0] >= 60, "god rays: wall below the sun %u (want lit over its 32)", lit[0]);
+    CHECK(lit[1] <= 40, "god rays: sun behind the camera %u (want the wall's 32)", lit[1]);
+}
+
+/* The scene filter: a 1024x1024 scene of 8-pixel stripes drawn at 32x32 is gray, where one
+ * bilinear sample per pixel (every pixel lands on a white row) is white - the shimmer. */
+static void test_scene_filter(void)
+{
+    enum { B = 1024 };
+    GfxTex* rt = gfx_tex_create(GFX_TEX_2D, 21, B, B, 1, GFX_USE_RT);
+    const uint32_t bvp[6] = { 0, 0, B, B, 0, 0x3F800000u };
+    gfx_set_targets(rt, 0, 0, NULL);
+    gfx_clear(0, NULL, 1, 0xFF000000u, 1.0f, 0, bvp);
+    static UiVert rows[B / 16][6];
+    for (int i = 0; i < B / 16; ++i)
+    {
+        UiVert q[4];
+        quad(q, 0, (float)(16 * i), B, (float)(16 * i + 8), 0xFFFFFFFFu, 0.5f);
+        rows[i][0] = q[0], rows[i][1] = q[1], rows[i][2] = q[2], rows[i][3] = q[1], rows[i][4] = q[3], rows[i][5] = q[2];
+    }
+    GfxDraw d;
+    defaults(&d);
+    layout_ui(&d);
+    d.u.vp[2] = d.u.vp[3] = B;
+    memcpy(d.vp, bvp, sizeof bvp);
+    d.fs.st[0] = (GfxStage){ 2, 0, 1, 1, 2, 0, 1, 1, 1, 0, 0, 2 };
+    d.data[0] = rows, d.size[0] = sizeof rows;
+    d.prim = GFX_TRIANGLELIST, d.count = 2 * (B / 16);
+    gfx_draw(&d);
+    GfxScene sc;
+    memset(&sc, 0, sizeof sc); /* no camera: the filter alone */
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        gfx_fx_set("filter", (float)!pass);
+        gfx_scene_done(rt, &sc);
+        gfx_set_targets(g_rt, 0, 0, g_ds);
+        defaults(&d);
+        layout_ui(&d);
+        d.tex[0] = rt;
+        d.samp[0] = (GfxSampler){ 3, 3, 3, 2, 2, 0, 0, 0, 0 }; /* CLAMP, LINEAR, no mips: the game's */
+        d.fs.st[0] = (GfxStage){ 2, 2, 1, 1, 2, 2, 1, 1, 1, 1, 0, 2 };
+        UiVert v[4];
+        quad(v, 0, 0, W, H, 0xFFFFFFFFu, 0);
+        for (int i = 0; i < 4; ++i) /* each screen pixel's center on a texel's center (row 32y + 16) */
+            v[i].u += 0.5f / B, v[i].v += 0.5f / B;
+        draw_ui(&d, v);
+        readback();
+        uint32_t c = px(16, 16) & 255;
+        if (pass == 0)
+            CHECK(c >= 100 && c <= 156, "scene filter: stripes at 1/32 size %u (want gray)", c);
+        else
+            CHECK(c >= 250, "scene filter off: %u (want the white row one sample finds)", c);
+        gfx_set_targets(rt, 0, 0, NULL);
+    }
+    gfx_fx_set("filter", 1.0f);
     gfx_set_targets(g_rt, 0, 0, g_ds);
     gfx_tex_destroy(rt);
-    gfx_tex_destroy(ds);
+}
+
+/* A large render target the game samples itself (FFXI's character shadow, projected around the
+ * player) with a mip filter reads its one level, not the empty chain the scene filter may add. */
+static void test_large_target_mips(void)
+{
+    enum { B = 1024 };
+    GfxTex* rt = gfx_tex_create(GFX_TEX_2D, 21, B, B, 1, GFX_USE_RT);
+    const uint32_t bvp[6] = { 0, 0, B, B, 0, 0x3F800000u };
+    gfx_set_targets(rt, 0, 0, NULL);
+    gfx_clear(0, NULL, 1, 0xFFFF0000u, 1.0f, 0, bvp);
+    gfx_set_targets(g_rt, 0, 0, g_ds);
+    GfxDraw d;
+    defaults(&d);
+    layout_ui(&d);
+    d.tex[0] = rt;
+    d.samp[0] = (GfxSampler){ 3, 3, 3, 2, 2, 2, 0, 0, 0 }; /* LINEAR, mips LINEAR */
+    d.fs.st[0] = (GfxStage){ 2, 2, 1, 1, 2, 2, 1, 1, 1, 1, 0, 2 };
+    UiVert v[4];
+    quad(v, 0, 0, W, H, 0xFFFFFFFFu, 0);
+    draw_ui(&d, v);
+    readback();
+    CHECK(near(px(16, 16), 0xFFFF0000u, 2), "large target through a mip filter: %08x (want its red)", px(16, 16));
+    gfx_tex_destroy(rt);
+}
+
+static void test_scene_effects(void)
+{
+    test_large_target_mips();
+    test_scene_ao(0);
+    test_scene_ao(1);
+    test_scene_fog();
+    test_scene_bloom();
+    test_scene_rays();
+    CHECK(gfx_failures() == 0, "scene effects: %u failures", gfx_failures());
+    gfx_set_targets(g_rt, 0, 0, g_ds);
+    test_scene_filter();
+    gfx_tex_destroy(g_srt);
+    gfx_tex_destroy(g_sds);
 }
 
 int main(int argc, char** argv)
@@ -471,7 +684,7 @@ int main(int argc, char** argv)
     }
     gfx_set_sync_pipelines(1);
     setenv("FFXI_FX", "1", 1); /* the scene effects run only where a test asks (test_scene_effects) */
-    setenv("FFXI_FX_GRADE", "0", 1);
+    setenv("FFXI_FX_FILE", "/nonexistent/fx.txt", 1); /* not the player's settings */
     if (!gfx_init(win, 1))
     {
         printf("no graphics back end\n");
@@ -489,8 +702,7 @@ int main(int argc, char** argv)
     test_fog();
     test_shaders();
     test_sweep();
-    test_scene_effects(0);
-    test_scene_effects(1);
+    test_scene_effects();
     gfx_present(NULL);
     if (win)
     {
