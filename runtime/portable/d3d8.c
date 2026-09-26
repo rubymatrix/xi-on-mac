@@ -2259,8 +2259,13 @@ static struct
 static void scene_finish(const char* why)
 {
     if (g_cap && g_scene.draws && !g_scene.done)
-        fprintf(g_cap, "scene done (%s) after %u 3D draws, camera %d, sun %d\n", why, g_scene.draws, g_scene.cam,
-            g_scene.s.sun_dir[3] != 0.0f);
+    {
+        const float* p = g_scene.s.proj;
+        const uint32_t* vp = g_scene.s.vp;
+        fprintf(g_cap, "scene done (%s) after %u 3D draws, camera %d, sun %d, projection %g %g %g %g / %g %g, viewport %u %u %u %u z %g..%g\n",
+            why, g_scene.draws, g_scene.cam, g_scene.s.sun_dir[3] != 0.0f, p[0], p[5], p[10], p[11], p[14], p[15], vp[0],
+            vp[1], vp[2], vp[3], u2f(vp[4]), u2f(vp[5]));
+    }
     if (g_scene.draws && !g_scene.done && g_scene.cam)
         gfx_scene_done(g_scene.rt, &g_scene.s);
     g_scene.draws = 0;

@@ -1546,7 +1546,9 @@ void gfx_clear(uint32_t nrects, const int32_t* rects, uint32_t flags, uint32_t c
  *   - the composite: the scene multiplied by the occlusion, then a color grade (saturation, a
  *     contrast curve) mixed in by strength.
  * Tuning: FFXI_FX_AO (strength, 0 off), FFXI_FX_AO_RADIUS (world units), FFXI_FX_GRADE (strength),
- * FFXI_FX_SAT, FFXI_FX_CONTRAST; FFXI_FX_DEBUG=ao shows the occlusion alone. */
+ * FFXI_FX_SAT, FFXI_FX_CONTRAST; FFXI_FX_DEBUG=ao shows the occlusion alone. The same settings
+ * reload while the game runs from FFXI_FX_FILE (default ~/Library/Caches/FFXI/fx.txt), lines of
+ * key=value: fx (0/1), ao, radius, grade, sat, contrast, debug (0/1). */
 static const char FX_MSL[] =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
@@ -1557,21 +1559,24 @@ static const char FX_MSL[] =
     "  float4 size;  // target width, height; occlusion width, height\n"
     "  float4 ao;    // radius, strength, bias, largest radius in pixels\n"
     "  float4 grade; // strength, saturation, contrast, debug\n"
+    "  float4 hand;  // P23: 1 for a left-handed projection, -1 for a right-handed one\n"
     "};\n"
     "struct FO { float4 pos [[position]]; float2 uv; };\n"
     "vertex FO fx_vs(uint vid [[vertex_id]]) {\n"
     "  float2 p = float2((vid << 1) & 2, vid & 2);\n"
     "  FO o; o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = p; return o;\n"
     "}\n"
-    /* view-space z of a depth value; 0 for the far plane (the sky, cleared depth) */
+    /* view-space z of a depth value (clip w = z * P23, so z is negative in front of a right-handed
+     * camera); 0 for the far plane (the sky, cleared depth) */
     "static float view_z(constant FxU& u, float d) {\n"
     "  d = (d - u.zp.z) / max(u.zp.w - u.zp.z, 1e-6);\n"
-    "  float z = u.zp.y / (d - u.zp.x);\n"
-    "  return d >= 0.999999 || !(z > 0.0) ? 0.0 : z;\n"
+    "  float z = u.zp.y / (d * u.hand.x - u.zp.x);\n"
+    "  return d >= 0.999999 || !(z * u.hand.x > 0.0) ? 0.0 : z;\n"
     "}\n"
     "static float3 view_pos(constant FxU& u, float2 px, float z) {\n"
     "  float2 ndc = float2((px.x - u.vp.x) / u.vp.z * 2.0 - 1.0, 1.0 - (px.y - u.vp.y) / u.vp.w * 2.0);\n"
-    "  return float3((ndc.x - u.proj.z) * z / u.proj.x, (ndc.y - u.proj.w) * z / u.proj.y, z);\n"
+    "  float w = z * u.hand.x;\n"
+    "  return float3((ndc.x * w - u.proj.z * z) / u.proj.x, (ndc.y * w - u.proj.w * z) / u.proj.y, z);\n"
     "}\n"
     "static float3 pos_at(constant FxU& u, depth2d<float> dt, float2 px) {\n"
     "  px = clamp(px, u.vp.xy, u.vp.xy + u.vp.zw - 1.0);\n"
@@ -1582,15 +1587,16 @@ static const char FX_MSL[] =
     "fragment float2 fx_ao(FO in [[stage_in]], constant FxU& u [[buffer(0)]], depth2d<float> dt [[texture(0)]]) {\n"
     "  float2 px = floor(u.vp.xy + in.uv * u.vp.zw) + 0.5;\n"
     "  float3 P = pos_at(u, dt, px);\n"
-    "  if (P.z <= 0.0) return float2(1.0, 0.0);\n"
+    "  float dist = P.z * u.hand.x;\n"
+    "  if (dist <= 0.0) return float2(1.0, 0.0);\n"
     /* the surface normal from the neighbors on the side nearer in depth (no smearing across edges) */
     "  float3 r = pos_at(u, dt, px + float2(1, 0)) - P, l = P - pos_at(u, dt, px - float2(1, 0));\n"
     "  float3 d = pos_at(u, dt, px + float2(0, 1)) - P, t = P - pos_at(u, dt, px - float2(0, 1));\n"
     "  float3 dx = abs(r.z) < abs(l.z) ? r : l, dy = abs(d.z) < abs(t.z) ? d : t;\n"
     "  float3 N = normalize(cross(dx, dy));\n"
     "  if (dot(N, P) > 0.0) N = -N;\n"
-    "  float rad = u.ao.x, rpx = min(rad * u.proj.y * 0.5 * u.vp.w / P.z, u.ao.w);\n"
-    "  if (rpx < 2.0) return float2(1.0, P.z);\n"
+    "  float rad = u.ao.x, rpx = min(rad * u.proj.y * 0.5 * u.vp.w / dist, u.ao.w);\n"
+    "  if (rpx < 2.0) return float2(1.0, dist);\n"
     "  float phi = 6.2831853 * fract(52.9829189 * fract(dot(in.pos.xy, float2(0.06711056, 0.00583715))));\n"
     "  const int NS = 12;\n"
     "  float sum = 0.0;\n"
@@ -1598,13 +1604,14 @@ static const char FX_MSL[] =
     "    float a = (float(i) + 0.5) / float(NS);\n"
     "    float ang = a * 7.0 * 6.2831853 + phi; /* seven turns of a spiral */\n"
     "    float2 q = px + float2(cos(ang), sin(ang)) * (a * rpx);\n"
-    "    float3 v = pos_at(u, dt, q) - P;\n"
-    "    if (v.z + P.z <= 0.0) continue;\n"
+    "    float3 Q = pos_at(u, dt, q);\n"
+    "    if (Q.z == 0.0) continue;\n"
+    "    float3 v = Q - P;\n"
     "    float vv = dot(v, v), vn = dot(v, N);\n"
     "    float q2 = vv / (rad * rad), fall = saturate(1.0 - q2 * q2);\n"
     "    sum += fall * max(vn * rsqrt(vv + 1e-6) - u.ao.z, 0.0);\n"
     "  }\n"
-    "  return float2(saturate(1.0 - 3.0 * sum / float(NS)), P.z);\n"
+    "  return float2(saturate(1.0 - 3.0 * sum / float(NS)), dist);\n"
     "}\n"
     "fragment float2 fx_blur(FO in [[stage_in]], constant FxU& u [[buffer(0)]], constant int2& dir [[buffer(1)]],\n"
     "                        texture2d<float> a [[texture(0)]]) {\n"
@@ -1636,7 +1643,7 @@ static const char FX_MSL[] =
 
 typedef struct FxU
 {
-    float proj[4], zp[4], vp[4], size[4], ao[4], grade[4];
+    float proj[4], zp[4], vp[4], size[4], ao[4], grade[4], hand[4];
 } FxU;
 
 static struct
@@ -1649,6 +1656,50 @@ static struct
     id<MTLTexture> src, ao0, ao1;
     id<MTLSamplerState> samp;
 } g_fx;
+
+static char g_fx_file[1024];
+static struct timespec g_fx_mtime;
+
+/* the settings file, when it changed since the last look (from Present, twice a second) */
+static void fx_reload(void)
+{
+    static double last;
+    double now = CACurrentMediaTime();
+    if (!g_fx_file[0] || now - last < 0.5)
+        return;
+    last = now;
+    struct stat st;
+    if (stat(g_fx_file, &st) || (st.st_mtimespec.tv_sec == g_fx_mtime.tv_sec && st.st_mtimespec.tv_nsec == g_fx_mtime.tv_nsec))
+        return;
+    g_fx_mtime = st.st_mtimespec;
+    FILE* f = fopen(g_fx_file, "r");
+    if (!f)
+        return;
+    char line[256], key[64];
+    float v;
+    while (fgets(line, sizeof line, f))
+    {
+        if (sscanf(line, " %63[a-z_] = %f", key, &v) != 2)
+            continue;
+        if (!strcmp(key, "fx"))
+            g_fx.on = v != 0.0f;
+        else if (!strcmp(key, "ao"))
+            g_fx.ao = v;
+        else if (!strcmp(key, "radius"))
+            g_fx.radius = v;
+        else if (!strcmp(key, "grade"))
+            g_fx.grade = v;
+        else if (!strcmp(key, "sat"))
+            g_fx.sat = v;
+        else if (!strcmp(key, "contrast"))
+            g_fx.contrast = v;
+        else if (!strcmp(key, "debug"))
+            g_fx.debug = v;
+    }
+    fclose(f);
+    fprintf(stderr, "[recomp] gfx: scene effects %s (occlusion %.2f radius %.2f, grade %.2f saturation %.2f contrast %.2f%s)\n",
+        g_fx.on ? "on" : "off", g_fx.ao, g_fx.radius, g_fx.grade, g_fx.sat, g_fx.contrast, g_fx.debug ? ", occlusion shown" : "");
+}
 
 static float env_float(const char* name, float def)
 {
@@ -1667,6 +1718,11 @@ static void fx_config(void)
     g_fx.contrast = env_float("FFXI_FX_CONTRAST", 0.2f);
     const char* dbg = getenv("FFXI_FX_DEBUG");
     g_fx.debug = dbg && !strcmp(dbg, "ao") ? 1.0f : 0.0f;
+    const char* file = getenv("FFXI_FX_FILE");
+    if (file && *file)
+        snprintf(g_fx_file, sizeof g_fx_file, "%s", file);
+    else if (getenv("HOME"))
+        snprintf(g_fx_file, sizeof g_fx_file, "%s/Library/Caches/FFXI/fx.txt", getenv("HOME"));
 }
 
 static id<MTLRenderPipelineState> fx_pipeline(NSString* frag, MTLPixelFormat fmt)
@@ -1776,6 +1832,7 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
             { (float)ct.width, (float)ct.height, (float)aw, (float)ah },
             { g_fx.radius, g_fx.ao, 0.1f, vh * 0.1f },
             { g_fx.grade, g_fx.sat, g_fx.contrast, g_fx.debug },
+            { s->proj[11] < 0.0f ? -1.0f : 1.0f, 0, 0, 0 },
         };
         if (!fx_tex(&g_fx.src, ct.pixelFormat, ct.width, ct.height) || !fx_tex(&g_fx.ao0, MTLPixelFormatRG16Float, aw, ah) ||
             !fx_tex(&g_fx.ao1, MTLPixelFormatRG16Float, aw, ah))
@@ -1901,6 +1958,7 @@ void gfx_present(GfxTex* bb)
             }
         }
         fps_tick();
+        fx_reload();
         frame_end();
     }
     if (gfx_profiling)
