@@ -83,6 +83,9 @@ fn host_args(cfg: &LauncherConfig, paths: &Paths, account: &Account, session: Op
         a.extend(["--dats".into(), d.clone()]);
     }
     a.extend(["--fps-divisor".into(), cfg.game.fps_divisor.clamp(1, 4).to_string()]);
+    if !cfg.game.ui_aspect.is_empty() {
+        a.extend(["--ui-aspect".into(), cfg.game.ui_aspect.clone()]);
+    }
     match account.kind {
         AccountKind::Pol => a.extend(["--session".into(), session.unwrap_or_default().to_string()]),
         AccountKind::Lsb => {

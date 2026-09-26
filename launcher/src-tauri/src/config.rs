@@ -93,6 +93,9 @@ pub struct GameSettings {
     /// FFXI_PROBE=gpu: answer the game's occlusion probe from the GPU (the sun's lens flare hides
     /// behind walls) at a cost of a few ms a frame; off, it always reads fully visible
     pub gpu_probe: bool,
+    /// host64 --ui-aspect: the interface's shape, centered in a wider window ("16:9"), or "off"
+    /// to stretch it across the window as the game does
+    pub ui_aspect: String,
 }
 
 impl Default for GameSettings {
@@ -120,6 +123,7 @@ impl Default for GameSettings {
             max_sounds: 12,
             fps_divisor: 1,
             gpu_probe: false,
+            ui_aspect: "off".into(),
         }
     }
 }

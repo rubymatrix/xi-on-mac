@@ -35,6 +35,10 @@ unsigned uidraw_load(UiTexSet* set, const DatFile* f, const char* category, cons
 /* Adds a picture from memory (RGBA, top row first) to the set as name, smoothly filtered: 1, or 0
  * if it cannot. */
 int uidraw_load_rgba(UiTexSet* set, const char* name, const uint8_t* rgba, uint32_t w, uint32_t h);
+/* The same for a larger drawing of an image the quads address in lw x lh texels (a texture pack's
+ * 4x font): it replaces the set's image of that name, if there is one. */
+int uidraw_load_rgba_scaled(UiTexSet* set, const char* name, const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t lw,
+    uint32_t lh);
 void uidraw_free(UiTexSet* set);
 
 /* A frame: the window's size in pixels (the back buffer follows it), cleared to argb. */

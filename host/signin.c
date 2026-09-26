@@ -50,6 +50,85 @@ static void config_path(const char* dir, const char* name, char* out, size_t n)
     snprintf(out, n, "%s%s%s", dir, len && (dir[len - 1] == '/' || dir[len - 1] == '\\') ? "" : "/", name);
 }
 
+/* ---- the texture pack's font ----
+ * host64 --textures (default <data dir>/textures) can hold a 4x drawing of the game's font: the
+ * pack's entry for a 1024x2048 texture (the size of font/moji and of no other texture the game
+ * uploads), a DXT5 DDS whose colour is premultiplied (tools/make_texpack.py --additive). This screen
+ * uses it for both its fonts: the outlined one as it is, the dark text's cores from its brightness
+ * (the fill is white and the outline black, so brightness is the fill's coverage). The metrics stay
+ * the DAT's: the glyphs sit in the same cells. */
+static uint8_t* dxt5_decode(const uint8_t* src, uint32_t w, uint32_t h)
+{
+    uint8_t* out = malloc((size_t)w * h * 4);
+    if (!out)
+        return NULL;
+    for (uint32_t by = 0; by < h / 4; ++by)
+        for (uint32_t bx = 0; bx < w / 4; ++bx, src += 16)
+        {
+            uint8_t a[8] = { src[0], src[1] };
+            for (int i = 2; i < 8; ++i)
+                a[i] = a[0] > a[1] ? (uint8_t)(((8 - i) * a[0] + (i - 1) * a[1]) / 7)
+                     : i < 6       ? (uint8_t)(((6 - i) * a[0] + (i - 1) * a[1]) / 5)
+                                   : (uint8_t)(i == 6 ? 0 : 255);
+            uint64_t ab = 0;
+            for (int i = 0; i < 6; ++i)
+                ab |= (uint64_t)src[2 + i] << (8 * i);
+            uint16_t c0 = (uint16_t)(src[8] | src[9] << 8), c1 = (uint16_t)(src[10] | src[11] << 8);
+            uint8_t pal[4][3];
+            for (int k = 0; k < 2; ++k)
+            {
+                uint16_t c = k ? c1 : c0;
+                pal[k][0] = (uint8_t)((c >> 11 & 31) * 255 / 31), pal[k][1] = (uint8_t)((c >> 5 & 63) * 255 / 63),
+                pal[k][2] = (uint8_t)((c & 31) * 255 / 31);
+            }
+            for (int k = 0; k < 3; ++k)
+                pal[2][k] = (uint8_t)((2 * pal[0][k] + pal[1][k]) / 3), pal[3][k] = (uint8_t)((pal[0][k] + 2 * pal[1][k]) / 3);
+            uint32_t bits = (uint32_t)src[12] | src[13] << 8 | src[14] << 16 | (uint32_t)src[15] << 24;
+            for (int i = 0; i < 16; ++i)
+            {
+                uint8_t* d = out + (((size_t)(by * 4 + (uint32_t)i / 4)) * w + bx * 4 + (uint32_t)i % 4) * 4;
+                const uint8_t* c = pal[bits >> (2 * i) & 3];
+                d[0] = c[0], d[1] = c[1], d[2] = c[2], d[3] = a[ab >> (3 * i) & 7];
+            }
+        }
+    return out;
+}
+
+static void hires_font(UiTexSet* set, const char* dir)
+{
+    char folder[1100], path[1400] = "";
+    config_path(dir, "textures", folder, sizeof folder);
+    PlatDir* d = plat_dir_open(folder);
+    for (const char* name; d && (name = plat_dir_next(d));)
+        if (strstr(name, "_1024x2048") && strstr(name, ".dds"))
+            snprintf(path, sizeof path, "%s/%s", folder, name);
+    if (d)
+        plat_dir_close(d);
+    size_t size = 0;
+    unsigned char* f = path[0] ? plat_read_file(path, &size) : NULL;
+    uint32_t w = f && size >= 128 ? (uint32_t)f[16] | f[17] << 8 | f[18] << 16 | (uint32_t)f[19] << 24 : 0;
+    uint32_t h = f && size >= 128 ? (uint32_t)f[12] | f[13] << 8 | f[14] << 16 | (uint32_t)f[15] << 24 : 0;
+    uint8_t* px = w && h && w % 1024 == 0 && h == 2 * w && !memcmp(f + 84, "DXT5", 4) && size >= 128 + (size_t)w * h
+        ? dxt5_decode(f + 128, w, h) : NULL;
+    free(f);
+    if (!px)
+        return;
+    uint8_t* ink = malloc((size_t)w * h * 4);
+    for (size_t i = 0; ink && i < (size_t)w * h; ++i)
+    {
+        uint8_t* p = px + i * 4;
+        unsigned l = (p[0] + p[1] + p[2]) / 3;
+        ink[i * 4 + 0] = ink[i * 4 + 1] = ink[i * 4 + 2] = 255, ink[i * 4 + 3] = (uint8_t)l;
+        for (int k = 0; k < 3; ++k) /* the outlined font: its colour back from premultiplied */
+            p[k] = p[3] ? (uint8_t)(p[k] * 255u / p[3] > 255 ? 255 : p[k] * 255u / p[3]) : 0;
+    }
+    if (ink && uidraw_load_rgba_scaled(set, "moji", px, w, h, 1024, 2048) &&
+        uidraw_load_rgba_scaled(set, "mojiink", ink, w, h, 1024, 2048))
+        fprintf(stderr, "[signin] font from %s (%ux%u)\n", path, w, h);
+    free(ink);
+    free(px);
+}
+
 static void config_load(const char* path, Config* c)
 {
     FILE* f = fopen(path, "r");
@@ -1021,6 +1100,7 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
         u->ink.image = "mojiink";
         uidraw_load_rgba(&u->fonts.tex, "mojiink", moji.rgba, moji.w, moji.h);
         dat_image_free(&moji);
+        hires_font(&u->fonts.tex, dir);
     }
     if (!ok)
     {

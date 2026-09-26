@@ -507,6 +507,22 @@ static void test_scene_ao(int rh)
     CHECK(corner <= 225, "occlusion (%s): wall at the floor %u (want darker)", rh ? "RH" : "LH", corner);
 }
 
+/* A block floating 0.7 before a wall (inside the occlusion's reach, but far nearer the camera than
+ * the wall) leaves no halo on it: it hides the wall, it does not shade it. */
+static void test_scene_ao_halo(void)
+{
+    fx_only("ao", 1.0f);
+    scene_begin(1, 0xFF000000u);
+    float wall[4][3] = { { -8, 8, 6 }, { 8, 8, 6 }, { -8, -8, 6 }, { 8, -8, 6 } };
+    float block[4][3] = { { -0.5f, 0.5f, 5.3f }, { 0.5f, 0.5f, 5.3f }, { -0.5f, -0.5f, 5.3f }, { 0.5f, -0.5f, 5.3f } };
+    scene_quad(wall, 0xFFFFFFFFu);
+    scene_quad(block, 0xFFFFFFFFu);
+    scene_end(NULL, 0);
+    /* the block spans 64 +- 6 pixels; the wall 3 pixels past its edge */
+    uint32_t beside = spx(73, 64, 0), below = spx(64, 73, 0);
+    CHECK(beside >= 245 && below >= 245, "occlusion: wall around a floating block %u %u (want no halo)", beside, below);
+}
+
 /* Height fog: the far wall takes more of the fog's color than the floor just ahead; with height
  * falloff, the floor (below the camera) more than the wall's top at the same distance. */
 static void test_scene_fog(void)
@@ -661,6 +677,7 @@ static void test_scene_effects(void)
     test_large_target_mips();
     test_scene_ao(0);
     test_scene_ao(1);
+    test_scene_ao_halo();
     test_scene_fog();
     test_scene_bloom();
     test_scene_rays();

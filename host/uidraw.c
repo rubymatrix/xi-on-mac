@@ -78,6 +78,19 @@ unsigned uidraw_load(UiTexSet* set, const DatFile* f, const char* category, cons
 
 int uidraw_load_rgba(UiTexSet* set, const char* name, const uint8_t* rgba, uint32_t w, uint32_t h)
 {
+    return uidraw_load_rgba_scaled(set, name, rgba, w, h, w, h);
+}
+
+int uidraw_load_rgba_scaled(UiTexSet* set, const char* name, const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t lw,
+    uint32_t lh)
+{
+    for (unsigned i = 0; i < set->n; ++i)
+        if (!strcmp(set->tex[i].name, name))
+        {
+            gfx_tex_destroy(set->tex[i].gpu);
+            set->tex[i] = set->tex[--set->n];
+            break;
+        }
     if (set->n == sizeof set->tex / sizeof *set->tex)
         return 0;
     uint8_t* bgra = malloc((size_t)w * h * 4);
@@ -96,7 +109,7 @@ int uidraw_load_rgba(UiTexSet* set, const char* name, const uint8_t* rgba, uint3
     {
         gfx_tex_upload(t->gpu, 0, 0, bgra, w * 4);
         SDL_strlcpy(t->name, name, sizeof t->name);
-        t->w = w, t->h = h;
+        t->w = lw, t->h = lh;
         t->smooth = 1;
         set->n++;
     }

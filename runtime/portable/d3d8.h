@@ -12,3 +12,6 @@ void d3d8_set_present_hook(void (*fn)(void));
 /* The size the frame is shown at: the device window's client area, else the back buffer's; 0x0
  * before the device exists. */
 void d3d8_screen_size(uint32_t* w, uint32_t* h);
+/* Adds a texture pack: <dir>/<hash>_<w>x<h>.dds replacements for the game's textures (see d3d8.c,
+ * tools/make_texpack.py). Before the device is created. */
+void d3d8_texture_pack(const char* dir);

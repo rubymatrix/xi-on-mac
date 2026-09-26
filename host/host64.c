@@ -14,6 +14,8 @@
  *               [--user <name> [--pass <password>] [--otp <code>] [--login-token <t>]   LandSandBoat servers
  *                [--authport 54231] [--dataport 54230] [--viewport 54001]]
  *               [--dats <folder>]...   DAT overlays, as XIPivot: the first folder given wins
+ *               [--textures <folder>]...   texture packs: high-resolution replacements for the
+ *                                      game's textures (tools/make_texpack.py); default <data dir>/textures
  *               [--user-dir <folder>]  the game's USER folder (settings, macros) there instead of
  *                                      in the install, for installs that cannot be written (UWP)
  *
@@ -27,7 +29,8 @@
  * shape, so a widescreen window shows more to the sides instead of a 4:3 view stretched across it.
  *
  * --ui-aspect <w:h>: the interface keeps this shape (16:9, say) centered in a wider window, instead
- * of being stretched across it; the mouse is mapped to match. Off by default.
+ * of being stretched across it; the mouse is mapped to match. Off by default; an app bundle's
+ * FFXIUIAspect key is the default.
  *
  * --nameplates fix|off: the names over characters' heads keep the shape they have in a 4:3 window
  * (fix, the default) or widen with the window as the game draws them (off).
@@ -260,6 +263,21 @@ static int parse_scale(const char* s, float* sx, float* sy)
     return 1;
 }
 
+/* w:h or a ratio (16:9, 1.778) as width / height, or off (0); 0 if it is none of these */
+static int parse_aspect(const char* s, float* aspect)
+{
+    if (!strcmp(s, "off"))
+        return *aspect = 0.0f, 1;
+    char* end;
+    double a = strtod(s, &end), b = 1.0;
+    if (*end == ':' || *end == 'x' || *end == '/')
+        b = strtod(end + 1, &end);
+    if (*end || !(a > 0) || !(b > 0) || a / b < 0.5 || a / b > 8)
+        return 0;
+    *aspect = (float)(a / b);
+    return 1;
+}
+
 static int g_profile_shims;
 
 static void present_hook(void)
@@ -363,13 +381,16 @@ int main(int argc, char** argv)
     unsigned nfinals = 0;
     const char* dats[8];
     unsigned ndats = 0;
+    const char* packs[8];
+    unsigned npacks = 0;
     const char* user_dir = NULL;
     uint32_t pol_server = DEFAULT_POL_SERVER;
     LsbLogin lsb = { 0, 54231, 54230, 54001, NULL, NULL, "", NULL };
     int have_session = 0;
     static char base_reg[1100];
     const char* server_name = NULL; /* --server as given, for the sign-in screen */
-    int nameplates_given = 0, nameplate_scale_given = 0;
+    int nameplates_given = 0, nameplate_scale_given = 0, ui_aspect_given = 0;
+    float ui_aspect = 0.0f;
     for (int i = 1; i + 1 < argc; i += 2)
     {
         if (!strcmp(argv[i], "--game"))
@@ -384,6 +405,8 @@ int main(int argc, char** argv)
             data_dir = argv[i + 1];
         else if (!strcmp(argv[i], "--dats") && ndats < 8)
             dats[ndats++] = argv[i + 1];
+        else if (!strcmp(argv[i], "--textures") && npacks < 8)
+            packs[npacks++] = argv[i + 1];
         else if (!strcmp(argv[i], "--user-dir"))
             user_dir = argv[i + 1];
         else if (!strcmp(argv[i], "--session"))
@@ -426,16 +449,12 @@ int main(int argc, char** argv)
         }
         else if (!strcmp(argv[i], "--ui-aspect"))
         {
-            char* end;
-            double a = strtod(argv[i + 1], &end), b = 1.0;
-            if (*end == ':' || *end == 'x' || *end == '/')
-                b = strtod(end + 1, &end);
-            if (*end || !(a > 0) || !(b > 0) || a / b < 0.5 || a / b > 8)
+            if (!parse_aspect(argv[i + 1], &ui_aspect))
             {
-                fprintf(stderr, "--ui-aspect: a shape as w:h (16:9) or a ratio (1.778)\n");
+                fprintf(stderr, "--ui-aspect: a shape as w:h (16:9), a ratio (1.778), or off\n");
                 return 2;
             }
-            user32_set_ui_aspect((float)(a / b));
+            ui_aspect_given = 1;
         }
         else if (!strcmp(argv[i], "--nameplates"))
         {
@@ -469,6 +488,9 @@ int main(int argc, char** argv)
     }
     if (!game && app_default("FFXIGameFolder", app_game, sizeof app_game))
         game = app_game;
+    if (!ui_aspect_given && app_default("FFXIUIAspect", app_val, sizeof app_val) && !parse_aspect(app_val, &ui_aspect))
+        ui_aspect = 0.0f;
+    user32_set_ui_aspect(ui_aspect);
     if (!nameplates_given && app_default("FFXINameplates", app_val, sizeof app_val))
         g_nameplate_fix = strcmp(app_val, "off") != 0;
     if (!nameplate_scale_given && app_default("FFXINameplateScale", app_val, sizeof app_val)
@@ -632,6 +654,19 @@ int main(int argc, char** argv)
         /* DAT overlays: files under their ROM*\ and sound*\ folders replace the install's */
         if (!vfs_add_overlay(dats[i], report_overlay))
             rt_log("[recomp] dats: no ROM or sound files in %s\n", dats[i]);
+    }
+    {
+        /* texture packs: --textures, else <data dir>/textures if there is one */
+        char def[1100];
+        PlatStat st;
+        if (!npacks && data_dir)
+        {
+            snprintf(def, sizeof def, "%s%ctextures", data_dir, plat_path_sep);
+            if (plat_stat(def, &st))
+                packs[npacks++] = def;
+        }
+        for (unsigned i = 0; i < npacks; ++i)
+            d3d8_texture_pack(packs[i]);
     }
     {
         /* The game reads patch.ver from its folder and will not start without it; the lobby sees

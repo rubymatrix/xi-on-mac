@@ -17,6 +17,7 @@
 #include "gfx.h"
 #include "gthread.h"
 #include "gwin.h"
+#include "plat.h"
 #include "runtime.h"
 #include "thunk.h"
 
@@ -292,6 +293,72 @@ static void test_copyrects(void)
     call(tex, D_Release, 0);
 }
 
+/* a solid 4x4 DXT1 block */
+static void dxt1_block(uint8_t* b, uint16_t c565)
+{
+    b[0] = b[2] = (uint8_t)c565, b[1] = b[3] = (uint8_t)(c565 >> 8);
+    b[4] = b[5] = b[6] = b[7] = 0;
+}
+
+static void draw_textured_quad(uint32_t tex)
+{
+    call(g_dev, D_SetTexture, 2, 0, tex);
+    call(g_dev, D_SetVertexShader, 1, 0x144);
+    uint32_t v = galloc(4 * sizeof(UiVert));
+    UiVert q[4] = { { 0, 0, 0.5f, 1, 0xFFFFFFFFu, 0, 0 }, { 16, 0, 0.5f, 1, 0xFFFFFFFFu, 1, 0 }, { 0, 16, 0.5f, 1, 0xFFFFFFFFu, 0, 1 },
+                    { 16, 16, 0.5f, 1, 0xFFFFFFFFu, 1, 1 } };
+    memcpy(GUEST_PTR(v), q, sizeof q);
+    call(g_dev, D_BeginScene, 0);
+    call(g_dev, D_DrawPrimitiveUP, 4, 5, 2, v, (uint32_t)sizeof(UiVert));
+    call(g_dev, D_EndScene, 0);
+}
+
+/* A texture pack entry: a 4x4 DXT1 texture the game fills with red is drawn with an 8x8 green one
+ * (and its 4x4 mipmap) from <hash>_4x4.dds; once the game writes blue into it, its own again. */
+static void test_texture_pack(void)
+{
+    uint8_t red[8], blue[8];
+    dxt1_block(red, 0xF800);
+    dxt1_block(blue, 0x001F);
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (int i = 0; i < 8; ++i)
+        hash = (hash ^ red[i]) * 0x100000001b3ull;
+    const char* dir = "build/d3d8test/textures";
+    plat_mkdir("build/d3d8test");
+    plat_mkdir(dir);
+    char path[256];
+    snprintf(path, sizeof path, "%s/%016llx_4x4.dds", dir, (unsigned long long)hash);
+    uint8_t dds[128 + 32 + 8] = { 'D', 'D', 'S', ' ', 124 };
+    dds[12] = dds[16] = 8;                                     /* height, width */
+    dds[28] = 2;                                               /* mipmaps */
+    dds[76] = 32, dds[80] = 4;                                 /* pixel format: FOURCC */
+    memcpy(dds + 84, "DXT1", 4);
+    for (int i = 0; i < 5; ++i)
+        dxt1_block(dds + 128 + 8 * i, 0x07E0); /* 8x8: four blocks, then 4x4: one */
+    FILE* f = fopen(path, "wb");
+    CHECK(f && fwrite(dds, 1, sizeof dds, f) == sizeof dds, "cannot write %s", path);
+    if (f)
+        fclose(f);
+    d3d8_texture_pack(dir);
+
+    clear(0xFF000000u);
+    call(g_dev, D_CreateTexture, 7, 4, 4, 1, 0, 0x31545844u /* DXT1 */, 1, g_out);
+    uint32_t tex = rd32(g_out), lr = galloc(8);
+    call(tex, T_LockRect, 4, 0, lr, 0, 0);
+    memcpy(GUEST_PTR(rd32(lr + 4)), red, 8);
+    call(tex, T_UnlockRect, 1, 0);
+    draw_textured_quad(tex);
+    CHECK(pixel(8, 8) == 0x00FF00, "texture pack: the replacement drawn: %06x", pixel(8, 8));
+
+    call(tex, T_LockRect, 4, 0, lr, 0, 0);
+    memcpy(GUEST_PTR(rd32(lr + 4)), blue, 8);
+    call(tex, T_UnlockRect, 1, 0);
+    draw_textured_quad(tex);
+    CHECK(pixel(8, 8) == 0x0000FF, "texture pack: other contents, the game's own: %06x", pixel(8, 8));
+    call(g_dev, D_SetTexture, 2, 0, 0);
+    call(tex, D_Release, 0);
+}
+
 int main(void)
 {
     if (!gwin_init())
@@ -326,6 +393,7 @@ int main(void)
     test_buffers();
     test_declaration();
     test_copyrects();
+    test_texture_pack();
     call(g_dev, D_Present, 4, 0, 0, 0, 0);
     printf(g_fails ? "d3d8_test: %d failed\n" : "d3d8_test: ok\n", g_fails);
     return g_fails != 0;

@@ -1670,22 +1670,32 @@ static const char FX_MSL[] =
     "  if (dot(N, P) > 0.0) N = -N;\n"
     "  float rad = u.ao.x, rpx = min(rad * u.proj.y * 0.5 * u.vp.w / dist, u.ao.w);\n"
     "  if (rpx < 2.0) return float2(1.0, dist);\n"
-    /* the same pattern at every pixel, every frame: noise tied to the screen crawls over the world
-     * as the camera moves (the blur hides its grain, not its motion) */
+    /* the spiral turned and scaled by one of 16 steps, a 4x4 ordered pattern over the pixels, the
+     * same every frame; the blur averages exactly one 4x4 block (fx_blur), so each pixel ends up with
+     * all 16 - even, and with no grain left to crawl as the camera moves. One pattern at every pixel
+     * instead copies each occluder at the pattern's offsets: streaks and halos around characters. */
     "  const int NS = 20;\n"
+    "  const uchar BAYER[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };\n"
+    "  int2 cell = int2(in.pos.xy) & 3;\n"
+    "  float k = (float(BAYER[cell.y * 4 + cell.x]) + 0.5) / 16.0;\n"
     "  float sum = 0.0;\n"
     "  for (int i = 0; i < NS; ++i) {\n"
-    "    float a = (float(i) + 0.5) / float(NS);\n"
-    "    float ang = float(i) * 2.3999632; /* the golden angle: an even spiral */\n"
+    "    float a = (float(i) + k) / float(NS);\n"
+    "    float ang = float(i) * 2.3999632 + k * 6.2831853; /* the golden angle: an even spiral */\n"
     "    float2 q = px + float2(cos(ang), sin(ang)) * (a * rpx);\n"
     "    float3 Q = pos_at(u, dt, q);\n"
-    "    if (Q.z == 0.0) continue;\n"
+    /* a surface far nearer the camera floats in front of this one (a leg before the floor or the
+     * other leg): it hides it, it does not shade it */
+    "    if (Q.z == 0.0 || dist - Q.z * u.hand.x > 0.5 * rad) continue;\n"
     "    float3 v = Q - P;\n"
     "    float vv = dot(v, v), vn = dot(v, N);\n"
     "    float q2 = vv / (rad * rad), fall = saturate(1.0 - q2 * q2);\n"
     "    sum += fall * max(vn * rsqrt(vv + 1e-6) - u.ao.z, 0.0);\n"
     "  }\n"
-    "  return float2(saturate(1.0 - 3.0 * sum / float(NS)), dist);\n"
+    /* none on surfaces seen edge-on: there the normal from depth is unreliable, and the surface
+     * shades itself in bands along every silhouette */
+    "  float facing = smoothstep(0.1, 0.4, dot(N, -P) / dist);\n"
+    "  return float2(saturate(1.0 - 3.0 * facing * sum / float(NS)), dist);\n"
     "}\n"
     /* the occlusion at a scene pixel from the four nearest occlusion texels, each weighted by how near
      * its distance is to this pixel's: an edge's occlusion stays on its own side, however the
@@ -1709,11 +1719,12 @@ static const char FX_MSL[] =
     "  int2 p = int2(in.pos.xy), hi = int2(u.size.zw) - 1;\n"
     "  float2 c = a.read(uint2(p)).xy;\n"
     "  if (c.y <= 0.0) return c;\n"
+    /* four pixels' worth, centered (the ends at half weight): one period of the 4x4 pattern */
     "  float s = c.x, w = 1.0;\n"
-    "  for (int i = -4; i <= 4; ++i) {\n"
+    "  for (int i = -2; i <= 2; ++i) {\n"
     "    if (i == 0) continue;\n"
     "    float2 t = a.read(uint2(clamp(p + dir * i, int2(0), hi))).xy;\n"
-    "    float k = exp(-float(i * i) / 8.0) * saturate(1.0 - abs(t.y - c.y) / (0.03 * c.y));\n"
+    "    float k = (abs(i) == 2 ? 0.5 : 1.0) * saturate(1.0 - abs(t.y - c.y) / (0.03 * c.y));\n"
     "    s += t.x * k, w += k;\n"
     "  }\n"
     "  return float2(s / w, c.y);\n"
@@ -2081,7 +2092,7 @@ void gfx_scene_done(GfxTex* color, const GfxScene* s)
                 { s->proj[10], s->proj[14], minz, maxz },
                 { vx, vy, vw, vh },
                 { (float)ct.width, (float)ct.height, (float)aw, (float)ah },
-                { g_fxs.radius, g_fxs.ao, 0.1f, vh * 0.1f },
+                { g_fxs.radius, g_fxs.ao, 0.15f, vh * 0.1f },
                 { g_fxs.grade, g_fxs.sat, g_fxs.contrast, g_fxs.debug },
                 { hand, 0, 0, 0 },
             };

@@ -34,6 +34,7 @@
 #include "gfx.h"
 #include "gthread.h"
 #include "gwin.h"
+#include "plat.h"
 #include "thunk.h"
 #include "user32.h"
 
@@ -169,6 +170,11 @@ typedef struct Obj
     uint8_t face, level; /* surfaces of a texture: where in it */
     uint8_t dirty;       /* surfaces of a texture: guest memory is newer than the GPU's copy */
     uint8_t gpu_locked;  /* a GPU-owned surface is locked: written back at unlock */
+    GfxTex* repl;        /* textures: a texture pack's replacement, drawn with instead of gpu */
+    uint32_t repl_pad;   /* ... whose glyph quads are drawn this many texels wider each side */
+    uint32_t repl_pad_min; /* ... when they are at least this many texels tall */
+    uint32_t pw, ph;     /* render-target textures drawn at the screen's resolution (native_size): gpu's
+                          * size, where the game sees width x height; 0 when they are the same */
 } Obj;
 
 static Obj* g_objs;
@@ -328,6 +334,144 @@ static void mark_dirty(Obj* s)
         t->dirty = 1;
 }
 
+/* --- texture packs -------------------------------------------------------------------------------------
+ * d3d8_texture_pack(folder): high-resolution replacements for the game's own textures (the font, say),
+ * made by tools/make_texpack.py. Each is <folder>/<hash>_<w>x<h>.dds: the FNV-1a hash of the first
+ * level of a w x h texture as the game uploads it, and the replacement, DXT1/3/5 with its mipmaps.
+ * The replacement keeps the original's layout at a larger size, so the game's texture coordinates
+ * (fractions of the texture) still land on the same art; it is drawn with instead of the original,
+ * filtered with its mipmaps, and dropped again if the game writes something else into the texture.
+ * Only textures of a size some entry has are hashed. FFXI_TEXLOG=1 hashes and logs every texture
+ * instead, to find the one to replace; with FFXI_TEXDUMP=<folder> as well, each level hashed is
+ * written there as <hash>.bin, in D3D's layout. */
+typedef struct PackEntry
+{
+    uint64_t hash;
+    uint32_t w, h, pad, pad_min; /* _pad<N>[min<M>] in the name: texels each glyph quad drawn with it is
+                                  * widened by (only quads at least M texels tall) */
+    char* path;
+    GfxTex* tex;
+    uint8_t tried; /* loaded, or failed to */
+} PackEntry;
+
+static PackEntry* g_pack;
+static uint32_t g_npack;
+static int g_texlog = -1;
+
+void d3d8_texture_pack(const char* dir)
+{
+    PlatDir* d = plat_dir_open(dir);
+    if (!d)
+    {
+        rt_log("[recomp] textures: cannot read %s\n", dir);
+        return;
+    }
+    uint32_t added = 0;
+    for (const char* name; (name = plat_dir_next(d));)
+    {
+        unsigned long long hash;
+        uint32_t w, h;
+        char ext[8];
+        uint32_t pad = 0, pad_min = 0;
+        if (sscanf(name, "%16llx_%ux%u_pad%umin%u.%7s", &hash, &w, &h, &pad, &pad_min, ext) != 6 &&
+            (pad_min = 0, sscanf(name, "%16llx_%ux%u_pad%u.%7s", &hash, &w, &h, &pad, ext) != 5) &&
+            (pad = 0, sscanf(name, "%16llx_%ux%u.%7s", &hash, &w, &h, ext) != 4))
+            continue;
+        if (strcmp(ext, "dds") || strlen(name) < 16)
+            continue;
+        g_pack = (PackEntry*)realloc(g_pack, (g_npack + 1) * sizeof *g_pack);
+        size_t n = strlen(dir) + strlen(name) + 2;
+        char* path = (char*)malloc(n);
+        snprintf(path, n, "%s%c%s", dir, plat_path_sep, name);
+        g_pack[g_npack++] = (PackEntry){ hash, w, h, pad, pad_min, path, NULL, 0 };
+        added++;
+    }
+    plat_dir_close(d);
+    rt_log("[recomp] textures: %u replacement%s from %s\n", added, added == 1 ? "" : "s", dir);
+}
+
+/* A DDS file's texture: DXT1/3/5 only, every level in the file. NULL if it is not one. */
+static GfxTex* load_dds(const char* path)
+{
+    size_t size = 0;
+    unsigned char* f = plat_read_file(path, &size);
+    GfxTex* t = NULL;
+    uint32_t fmt = 0, w = 0, h = 0, levels = 0;
+    if (f && size >= 128 && !memcmp(f, "DDS ", 4) && (f[80] & 4))
+    {
+        h = (uint32_t)f[12] | f[13] << 8 | f[14] << 16 | (uint32_t)f[15] << 24;
+        w = (uint32_t)f[16] | f[17] << 8 | f[18] << 16 | (uint32_t)f[19] << 24;
+        levels = (uint32_t)f[28] | f[29] << 8;
+        fmt = FOURCC(f[84], f[85], f[86], f[87]);
+    }
+    uint32_t blk = fmt_block(fmt);
+    if (blk && w && h && w <= 16384 && h <= 16384)
+    {
+        levels = levels ? levels : 1;
+        size_t off = 128, need = 0;
+        for (uint32_t l = 0; l < levels; ++l)
+            need += (size_t)(((w >> l ? w >> l : 1) + 3) / 4) * (((h >> l ? h >> l : 1) + 3) / 4) * blk;
+        if (off + need <= size && (t = gfx_tex_create(GFX_TEX_2D, fmt, w, h, levels, GFX_USE_SAMPLE)))
+            for (uint32_t l = 0; l < levels; ++l)
+            {
+                uint32_t lw = w >> l ? w >> l : 1, lh = h >> l ? h >> l : 1;
+                gfx_tex_upload(t, 0, l, f + off, (lw + 3) / 4 * blk);
+                off += (size_t)((lw + 3) / 4) * ((lh + 3) / 4) * blk;
+            }
+    }
+    if (!t)
+        rt_log("[recomp] textures: %s is not a DXT1/3/5 DDS with its levels; not used\n", path);
+    free(f);
+    return t;
+}
+
+/* The replacement for a texture whose first level was just uploaded, or NULL; *pad its entry's. */
+static GfxTex* texture_replacement(const Obj* t, const Obj* level0, uint32_t* pad, uint32_t* pad_min)
+{
+    if (g_texlog < 0)
+        g_texlog = getenv("FFXI_TEXLOG") && getenv("FFXI_TEXLOG")[0] == '1';
+    if (t->kind != O_TEXTURE || (!g_npack && !g_texlog))
+        return NULL;
+    int sized = g_texlog;
+    for (uint32_t i = 0; i < g_npack && !sized; ++i)
+        sized = g_pack[i].w == t->width && g_pack[i].h == t->height;
+    if (!sized)
+        return NULL;
+    uint32_t pitch = fmt_pitch(level0->format, level0->width), blk = fmt_block(level0->format);
+    size_t n = (size_t)pitch * (blk ? (level0->height + 3) / 4 : level0->height);
+    const uint8_t* p = GUEST_PTR(level0->mem);
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; ++i)
+        hash = (hash ^ p[i]) * 0x100000001b3ull;
+    for (uint32_t i = 0; i < g_npack; ++i)
+    {
+        PackEntry* e = &g_pack[i];
+        if (e->hash != hash || e->w != t->width || e->h != t->height)
+            continue;
+        if (!e->tried)
+        {
+            e->tried = 1;
+            e->tex = load_dds(e->path);
+            if (e->tex)
+                rt_log("[recomp] textures: %ux%u %016llx replaced by %s\n", t->width, t->height, (unsigned long long)hash, e->path);
+        }
+        *pad = e->pad, *pad_min = e->pad_min;
+        return e->tex;
+    }
+    if (g_texlog)
+        rt_log("[recomp] textures: %ux%u format %08x hash %016llx texture %08x (no replacement)\n", t->width, t->height,
+            t->format, (unsigned long long)hash, t->guest);
+    if (g_texlog && getenv("FFXI_TEXDUMP")) /* ... and the level itself, to make a replacement from */
+    {
+        char dp[512];
+        snprintf(dp, sizeof dp, "%s/%016llx.bin", getenv("FFXI_TEXDUMP"), (unsigned long long)hash);
+        FILE* df = fopen(dp, "wb");
+        if (df)
+            fwrite(p, 1, n, df), fclose(df);
+    }
+    return NULL;
+}
+
 /* A texture about to be drawn with: levels written since their last upload go up first. */
 static GfxTex* texture_for_draw(uint32_t p, int* kind)
 {
@@ -340,14 +484,18 @@ static GfxTex* texture_for_draw(uint32_t p, int* kind)
         {
             Obj* s = obj(t->subs[i]);
             if (s && s->dirty && s->mem && !gpu_owned(s))
+            {
                 gfx_tex_upload(t->gpu, s->face, s->level, GUEST_PTR(s->mem), fmt_pitch(s->format, s->width));
+                if (i == 0)
+                    t->repl = texture_replacement(t, s, &t->repl_pad, &t->repl_pad_min);
+            }
             if (s)
                 s->dirty = 0;
         }
         t->dirty = 0;
     }
     *kind = t->kind == O_CUBE ? 2 : 1;
-    return t->gpu;
+    return t->repl ? t->repl : t->gpu;
 }
 
 /* --- device state ------------------------------------------------------------------------------------- */
@@ -892,10 +1040,13 @@ void d3d8_screen_size(uint32_t* w, uint32_t* h)
         user32_client_size(g_dev.hwnd, w, h);
 }
 
+static void ui_present(void);
+
 static void IDirect3DDevice8_Present(Guest* g)
 {
     cap_present();
     scene_present();
+    ui_present();
     if (g_present_hook)
         g_present_hook();
     Obj* bb = obj(g_dev.backbuffer);
@@ -933,6 +1084,71 @@ static uint32_t chain_levels(uint32_t w, uint32_t h, uint32_t levels)
     return !levels || levels > full ? full : levels;
 }
 
+/* FFXI draws its interface into a render-target texture of the menu resolution (the registry's
+ * 0037 x 0038: half the window, say) and stretches that over the back buffer, so its text is drawn at
+ * half the screen's resolution and doubled. A render-target texture smaller than the back buffer and
+ * of its shape is instead given a GPU texture of the back buffer's size: the game still sees its own
+ * size (locks, descriptions, XYZRHW coordinates), and its draws land on the larger texture through a
+ * viewport scaled to match (scale_to_target), so the interface is drawn at the screen's resolution
+ * and the final stretch is one to one. FFXI_UI_NATIVE=0 draws it at the menu resolution again. */
+/* w x h is smaller than the screen and of the --ui-aspect box's shape (1280x720 for 16:9, 1px either way) */
+static int ui_box_shape(uint32_t w, uint32_t h)
+{
+    uint32_t bw = g_dev.pp[0], bh = g_dev.pp[1];
+    float s = user32_ui_squeeze(g_dev.hwnd);
+    if (s >= 1.0f || !h || w >= bw || h >= bh)
+        return 0;
+    double boxw = bw * (double)s;
+    return fabs((double)w * bh - boxw * h) <= (double)bh;
+}
+
+static int native_size(uint32_t w, uint32_t h, uint32_t* pw, uint32_t* ph)
+{
+    static int on = -1;
+    if (on < 0)
+        on = !(getenv("FFXI_UI_NATIVE") && getenv("FFXI_UI_NATIVE")[0] == '0');
+    uint32_t bw = g_dev.pp[0], bh = g_dev.pp[1];
+    if (!on || !bw || !bh || w >= bw || h >= bh)
+        return 0;
+    if ((uint64_t)w * bh == (uint64_t)h * bw)
+    {
+        *pw = bw, *ph = bh;
+        return 1;
+    }
+    /* under --ui-aspect the menu target is of the interface box's shape; it still covers the screen,
+     * its draws squeezed toward the middle (ui_squeeze) */
+    if (!ui_box_shape(w, h))
+        return 0;
+    *pw = bw, *ph = bh;
+    return 1;
+}
+
+/* a surface of a texture native_size enlarged */
+static int surface_scaled(const Obj* s)
+{
+    Obj* t = s->container ? obj(s->container) : NULL;
+    return t && t->pw;
+}
+
+/* A viewport (x, y, w, h first) or D3DRECTs from the game's pixels to the current target's. */
+static void scale_to_target(uint32_t* vp, int32_t* rects, uint32_t nrects)
+{
+    Obj* rt = obj(g_dev.rt);
+    Obj* t = rt && rt->container ? obj(rt->container) : NULL;
+    if (!t || !t->pw)
+        return;
+    double kx = (double)t->pw / t->width, ky = (double)t->ph / t->height;
+    if (vp)
+        vp[0] = (uint32_t)(vp[0] * kx + 0.5), vp[1] = (uint32_t)(vp[1] * ky + 0.5), vp[2] = (uint32_t)(vp[2] * kx + 0.5),
+        vp[3] = (uint32_t)(vp[3] * ky + 0.5);
+    for (uint32_t i = 0; i < nrects; ++i)
+    {
+        int32_t* r = rects + 4 * i;
+        r[0] = (int32_t)(r[0] * kx + 0.5), r[1] = (int32_t)(r[1] * ky + 0.5), r[2] = (int32_t)(r[2] * kx + 0.5),
+        r[3] = (int32_t)(r[3] * ky + 0.5);
+    }
+}
+
 static uint32_t new_texture(int kind, uint32_t w, uint32_t h, uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool)
 {
     uint32_t p = obj_new(kind);
@@ -950,8 +1166,14 @@ static uint32_t new_texture(int kind, uint32_t w, uint32_t h, uint32_t levels, u
             subs[f * nl + l] = sp;
             obj(sp)->face = (uint8_t)f, obj(sp)->level = (uint8_t)l;
         }
+    uint32_t pw = 0, ph = 0;
+    if (kind == O_TEXTURE && (usage & USAGE_RENDERTARGET) && nl == 1 && pool != 2 && native_size(w, h, &pw, &ph))
+    {
+        obj(p)->pw = pw, obj(p)->ph = ph;
+        rt_log("[recomp] d3d8: %ux%u render target drawn at %ux%u\n", w, h, pw, ph);
+    }
     if (pool != 2) /* system memory textures are only ever copied from */
-        obj(p)->gpu = gfx_tex_create(kind == O_CUBE ? GFX_TEX_CUBE : GFX_TEX_2D, fmt, w, h, nl,
+        obj(p)->gpu = gfx_tex_create(kind == O_CUBE ? GFX_TEX_CUBE : GFX_TEX_2D, fmt, pw ? pw : w, ph ? ph : h, nl,
             (usage & USAGE_RENDERTARGET) ? GFX_USE_RT : GFX_USE_SAMPLE);
     return p;
 }
@@ -1060,6 +1282,13 @@ static void IDirect3DDevice8_CopyRects(Guest* g)
     Obj* d = obj(ARG(4));
     if (!s || !d || s->format != d->format)
         RET(D3DERR_INVALIDCALL, 6);
+    if (surface_scaled(s) || surface_scaled(d))
+    {
+        static int said;
+        if (!said)
+            said = 1, rt_log("[recomp] d3d8: CopyRects with a render target drawn larger is skipped\n");
+        RET(D3D_OK, 6);
+    }
     uint32_t sface, slevel, dface, dlevel;
     GfxTex* sg = surface_gpu(s, &sface, &slevel);
     GfxTex* dg = surface_gpu(d, &dface, &dlevel);
@@ -1147,8 +1376,15 @@ static void apply_targets(void);
 static void IDirect3DDevice8_Clear(Guest* g)
 {
     apply_targets();
-    uint32_t n = ARG(2) ? ARG(1) : 0;
-    gfx_clear(n, n ? (const int32_t*)ARGP(2) : NULL, ARG(3), ARG(4), u2f(ARG(5)), ARG(6), g_dev.cur.vp);
+    uint32_t n = ARG(2) ? ARG(1) : 0, vp[6];
+    memcpy(vp, g_dev.cur.vp, sizeof vp);
+    int32_t few[4 * 16], *rects = n <= 16 ? few : (int32_t*)malloc(16u * n);
+    if (n)
+        memcpy(rects, ARGP(2), 16u * n);
+    scale_to_target(vp, rects, n);
+    gfx_clear(n, n ? rects : NULL, ARG(3), ARG(4), u2f(ARG(5)), ARG(6), vp);
+    if (rects != few)
+        free(rects);
     RET(D3D_OK, 7);
 }
 
@@ -1469,12 +1705,47 @@ static void IDirect3DDevice8_DrawIndexedPrimitive(Guest* g)
 
 /* DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride).
  * The ...UP draws leave stream 0 (and the indices) unset, as D3D8 does. */
+/* A glyph quad (a strip of four XYZRHW + diffuse + UV vertices) from a texture whose pack entry
+ * asks for it, drawn repl_pad texels wider on each side, its UVs moved with it: FFXI cuts each
+ * glyph of its italic name font at an upright box, so the lean and the outline at the ends of a
+ * name were lost (the neighbours hide it inside the name). A copy: the game's vertices stay. */
+static uint32_t widen_quad(uint32_t data, const Obj* t)
+{
+    static uint32_t buf;
+    if (!buf)
+        buf = gheap_alloc(4 * 28, 1);
+    float x[4], u[4], ulo = 1e30f, uhi = -1e30f, xlo = 1e30f, xhi = -1e30f, vlo = 1e30f, vhi = -1e30f;
+    for (int i = 0; i < 4; ++i)
+    {
+        float v = u2f(rd32(data + 28u * (uint32_t)i + 24));
+        x[i] = u2f(rd32(data + 28u * (uint32_t)i)), u[i] = u2f(rd32(data + 28u * (uint32_t)i + 20));
+        ulo = u[i] < ulo ? u[i] : ulo, uhi = u[i] > uhi ? u[i] : uhi;
+        xlo = x[i] < xlo ? x[i] : xlo, xhi = x[i] > xhi ? x[i] : xhi;
+        vlo = v < vlo ? v : vlo, vhi = v > vhi ? v : vhi;
+    }
+    if (!(uhi > ulo) || !(xhi > xlo) || (vhi - vlo) * (float)t->height < (float)t->repl_pad_min)
+        return data;
+    float du = (float)t->repl_pad / (float)t->width, dx = du * (xhi - xlo) / (uhi - ulo);
+    memcpy(GUEST_PTR(buf), GUEST_PTR(data), 4 * 28);
+    for (int i = 0; i < 4; ++i)
+    {
+        int lo = u[i] - ulo < uhi - u[i];
+        wr32(buf + 28u * (uint32_t)i, f2u(x[i] + (lo ? -dx : dx)));
+        wr32(buf + 28u * (uint32_t)i + 20, f2u(u[i] + (lo ? -du : du)));
+    }
+    return buf;
+}
+
 static void IDirect3DDevice8_DrawPrimitiveUP(Guest* g)
 {
     g_cap_esp = g->esp;
     if (!(g_dev.cur.vs & 1) && (g_dev.cur.vs & 0xE) == 4 && ARG(3) && rd32(ARG(3) + 8) == 0x3f7ffffeu)
         g_probe_sky = 1; /* transformed vertices at the sky's depth */
-    draw(ARG(1), ARG(2), 0, 0, 0, ARG(3), ARG(4));
+    uint32_t data = ARG(3);
+    Obj* t0 = obj(g_dev.cur.tex[0]);
+    if (t0 && t0->repl && t0->repl_pad && ARG(1) == 5 && ARG(2) == 2 && ARG(4) == 28 && g_dev.cur.vs == 0x144)
+        data = widen_quad(data, t0);
+    draw(ARG(1), ARG(2), 0, 0, 0, data, ARG(4));
     bind(&g_dev.cur.stream[0], 0);
     g_dev.cur.stride[0] = 0;
     RET(D3D_OK, 5);
@@ -1942,6 +2213,7 @@ static int build_draw(GfxDraw* d)
     for (int i = 0; i < 4; ++i)
         d->u.vp[i] = (float)s->vp[i];
     memcpy(d->vp, s->vp, sizeof d->vp);
+    scale_to_target(d->vp, NULL, 0); /* the XYZRHW mapping (u.vp) stays in the game's pixels */
 
     int ff_vertex = !d->vs.prog && !lay->rhw;
     if (ff_vertex && rs[137]) /* LIGHTING */
@@ -2004,7 +2276,7 @@ static int build_draw(GfxDraw* d)
         while (nst < 8 && s->tss[nst][1] != 1)
             nst++;
     d->fs.nstages = (uint8_t)nst;
-    int nused = d->fs.prog ? 4 : nst;
+    int nused = d->fs.prog ? 4 : nst, repl0 = 0;
     d->vs.ntex = (uint8_t)(d->vs.prog || d->fs.prog ? 8 : nst);
     for (int i = 0; i < nused; ++i)
     {
@@ -2020,6 +2292,12 @@ static int build_draw(GfxDraw* d)
             uint32_t maxlevel = t[20] > to->lod ? t[20] : to->lod;
             d->samp[i] = (GfxSampler){ (uint8_t)t[13], (uint8_t)t[14], (uint8_t)t[25], (uint8_t)t[16], (uint8_t)t[17], (uint8_t)t[18],
                 (uint8_t)t[21], (uint8_t)maxlevel, t[15] };
+            if (to->repl && tex == to->repl) /* drawn smaller than it is: linear, between its mipmaps */
+            {
+                d->samp[i].mag = d->samp[i].min = d->samp[i].mip = 2, d->samp[i].max_level = 0;
+                if (i == 0)
+                    repl0 = 1;
+            }
         }
         if (!d->fs.prog)
         {
@@ -2043,6 +2321,12 @@ static int build_draw(GfxDraw* d)
     d->pipe.blend = rs[27] != 0;
     if (d->pipe.blend)
         d->pipe.src = (uint8_t)rs[19], d->pipe.dst = (uint8_t)rs[20], d->pipe.op = (uint8_t)rs[171];
+    /* FFXI draws its text adding (ONE, ONE): its font's outline can only brighten what is behind it.
+     * A replacement drawn that way has its colour premultiplied by alpha (make_texpack --additive), so
+     * over (ONE, INVSRCALPHA) draws the same fill and lets the outline darken, as the game's other
+     * lettering does. */
+    if (repl0 && d->pipe.blend && d->pipe.src == 2 && d->pipe.dst == 2 && d->pipe.op == 1)
+        d->pipe.dst = 6;
     d->pipe.write_mask = (uint8_t)(rs[168] & 0xF);
     if (g_dev.ds)
     {
@@ -2123,7 +2407,52 @@ static void index_range(uint32_t indices, uint32_t size, uint32_t n, uint32_t* l
  * text and cursor are pre-transformed (XYZRHW) draws to the back buffer; each is squeezed toward
  * the middle by mapping the viewport's width onto a centered box of the aspect asked for (the
  * XYZRHW mapping reads d->u.vp). Draws that span the whole width - the 3D scene put on the screen,
- * fades, letterboxing - are left full. The mouse is mapped back in user32.c. */
+ * fades, letterboxing - are left full. With a menu resolution other than the window's, FFXI draws
+ * the interface into a render-target texture of that size (the menu target) and puts it on the
+ * screen as one full-width quad: the draws into it are squeezed the same way, so its full-width ones
+ * (the dimming behind a menu, the lobby's copy of the 3D scene) still cover the screen. The mouse is
+ * mapped back in user32.c. */
+/* Bars across the whole width (the lobby's help bar): a full-width draw no taller than this share of
+ * the height is a bar's body, and the frame drawn over it after (edge lines inset by a corner's
+ * width, corner pieces at the ends) goes out to the screen's edges with it. Reset at Present. */
+#define UI_BAR_MAX_H 0.15f
+#define UI_MAX_BARS 8
+static struct
+{
+    uint32_t rt;
+    float y0, y1;
+} g_ui_bars[UI_MAX_BARS];
+static int g_ui_nbars;
+
+static void ui_present(void) { g_ui_nbars = 0; }
+
+/* The draw's x mapped to a + b x (the game's pixels, across the whole target): its viewport - the
+ * clip rectangle the game gave it, in the target's pixels - moves and narrows to match, while the
+ * XYZRHW mapping (u.vp, the viewport in the game's pixels) stays, so the draw keeps its clip */
+static void ui_map(GfxDraw* d, float a, float b)
+{
+    float x0 = d->u.vp[0], w = d->u.vp[2];
+    if (!(w > 0))
+        return;
+    float k = (float)d->vp[2] / w; /* the target's pixels per game pixel */
+    float l = (a + b * x0) * k, r = (a + b * (x0 + w)) * k;
+    l = l < 0 ? 0 : l;
+    d->vp[0] = (uint32_t)(l + 0.5f);
+    d->vp[2] = r > l ? (uint32_t)(r - l + 0.5f) : 0;
+    /* what rounding the clip took off, given back to the mapping so the draw lands where asked */
+    d->u.vp[0] = x0 + ((float)d->vp[0] / k - (a + b * x0)) / b;
+    d->u.vp[2] = (float)d->vp[2] / k / b;
+}
+
+/* The game's size of the target the draw goes to: the back buffer's, or the menu target's */
+static void ui_target_size(float* w, float* h)
+{
+    Obj* rt = obj(g_dev.rt);
+    Obj* t = rt && rt->container ? obj(rt->container) : NULL;
+    *w = t ? (float)t->width : (float)g_dev.pp[0];
+    *h = t ? (float)t->height : (float)g_dev.pp[1];
+}
+
 static void ui_squeeze(GfxDraw* d, uint32_t first, uint32_t n, uint32_t up_data, uint32_t up_stride)
 {
     float s = user32_ui_squeeze(g_dev.hwnd);
@@ -2140,21 +2469,51 @@ static void ui_squeeze(GfxDraw* d, uint32_t first, uint32_t n, uint32_t up_data,
             return;
         base = b->mem, stride = g_dev.cur.stride[st], size = b->size;
     }
-    float x0 = d->u.vp[0], w = d->u.vp[2], lo = 1e30f, hi = -1e30f;
+    float lo = 1e30f, hi = -1e30f, ylo = 1e30f, yhi = -1e30f;
     for (uint32_t i = 0; i < n; ++i)
     {
         uint32_t at = (first + i) * stride + (uint32_t)d->u.offset[GFX_R_POSITION];
-        if (at > size - 4)
+        if (at > size - 8)
             break;
-        float x = u2f(rd32(base + at));
+        float x = u2f(rd32(base + at)), y = u2f(rd32(base + at + 4));
         lo = x < lo ? x : lo;
         hi = x > hi ? x : hi;
+        ylo = y < ylo ? y : ylo;
+        yhi = y > yhi ? y : yhi;
     }
-    if (lo > hi || (lo <= x0 + 1.0f && hi >= x0 + w - 1.0f))
+    if (lo > hi)
         return;
-    float c = x0 + w * 0.5f;
-    d->u.vp[2] = w / s;
-    d->u.vp[0] = c - d->u.vp[2] * 0.5f;
+    /* everything is squeezed toward the target's middle, whatever viewport the draw has (the chat
+     * log's text and the menus' titles are clipped to their windows); "the whole width" with some
+     * slack: the rules screen's backdrop stops 1.5 pixels short */
+    float W, h;
+    ui_target_size(&W, &h);
+    float slack = 1.0f + W / 256.0f;
+    if (lo <= slack && hi >= W - slack)
+    {
+        if (yhi - ylo <= h * UI_BAR_MAX_H && g_ui_nbars < UI_MAX_BARS)
+            g_ui_bars[g_ui_nbars].rt = g_dev.rt, g_ui_bars[g_ui_nbars].y0 = ylo, g_ui_bars[g_ui_nbars].y1 = yhi,
+            g_ui_nbars++;
+        return;
+    }
+    /* a piece of a bar's frame: within a bar's band and at an edge (a corner's width, 64 pixels) */
+    float edge = 64.0f * W / 1280.0f;
+    for (int i = 0; i < g_ui_nbars; ++i)
+    {
+        if (g_ui_bars[i].rt != g_dev.rt || ylo < g_ui_bars[i].y0 - 2.0f || yhi > g_ui_bars[i].y1 + 2.0f)
+            continue;
+        int left = lo <= edge, right = hi >= W - edge;
+        if (left && right) /* an edge line: its ends keep their insets, squeezed */
+        {
+            float l = lo * s, r = W - (W - hi) * s, b = (r - l) / (hi - lo);
+            return ui_map(d, l - b * lo, b);
+        }
+        if (left && hi < W * 0.5f) /* the left corner, squeezed toward the left edge */
+            return ui_map(d, 0.0f, s);
+        if (right && lo > W * 0.5f) /* the right corner */
+            return ui_map(d, W * (1.0f - s), s);
+    }
+    ui_map(d, W * 0.5f * (1.0f - s), s);
 }
 
 /* FFXI_DRAWLOG=<path>: while <path>.go exists, the next frame's draws are written to <path> (then
@@ -2197,8 +2556,14 @@ static void cap_draw(GfxDraw* d, uint32_t prim, uint32_t count, uint32_t first, 
     uint32_t up_stride)
 {
     FILE* f = g_cap;
-    fprintf(f, "#%u prim %u count %u n %u vs %x rhw %d rt %s", g_cap_n++, prim, count, n, g_dev.cur.vs, d->vs.rhw,
-        g_dev.rt == g_dev.backbuffer ? "bb" : "off");
+    Obj* crt = obj(g_dev.rt);
+    fprintf(f, "#%u prim %u count %u n %u vs %x rhw %d rt %s %ux%u vp %u,%u %ux%u", g_cap_n++, prim, count, n, g_dev.cur.vs,
+        d->vs.rhw, g_dev.rt == g_dev.backbuffer ? "bb" : "off", crt ? crt->width : 0, crt ? crt->height : 0, d->vp[0], d->vp[1],
+        d->vp[2], d->vp[3]);
+    const uint32_t* crs = g_dev.cur.rs;
+    const uint32_t* ct = g_dev.cur.tss[0];
+    fprintf(f, " atest %u func %u ref %u blend %u %u/%u op %u tss0 c%u(%x,%x) a%u(%x,%x) tss1 c%u", crs[15], crs[25], crs[24],
+        crs[27], crs[19], crs[20], crs[171], ct[1], ct[2], ct[3], ct[4], ct[5], ct[6], g_dev.cur.tss[1][1]);
     Obj* t = obj(g_dev.cur.tex[0]);
     if (t)
         fprintf(f, " tex %08x %ux%u fmt %u", g_dev.cur.tex[0], t->width, t->height, t->format);
@@ -2235,7 +2600,10 @@ static void cap_draw(GfxDraw* d, uint32_t prim, uint32_t count, uint32_t first, 
             lo[c] = x < lo[c] ? x : lo[c];
             hi[c] = x > hi[c] ? x : hi[c];
         }
-        if (i < 4)
+        if (i < 4 && g_dev.cur.vs == 0x144 && stride == 28) /* XYZRHW, diffuse, one texture: with its UV */
+            fprintf(f, "  v%u %.2f %.2f %.4f uv %.5f %.5f\n", i, u2f(rd32(base + at)), u2f(rd32(base + at + 4)),
+                u2f(rd32(base + at + 8)), u2f(rd32(base + at + 20)), u2f(rd32(base + at + 24)));
+        else if (i < 4)
             fprintf(f, "  v%u %.2f %.2f %.4f\n", i, u2f(rd32(base + at)), u2f(rd32(base + at + 4)),
                 u2f(rd32(base + at + 8)));
     }
@@ -2353,6 +2721,14 @@ static void draw(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices
         gfx_prof_front(gfx_now_ns() - t0);
 }
 
+/* A surface of FFXI's menu target: a render-target texture smaller than the screen of the interface
+ * box's shape under --ui-aspect (1280x720 for 16:9), which the game stretches over the whole screen */
+static int menu_target(const Obj* o)
+{
+    const Obj* t = o && o->container ? obj(o->container) : NULL;
+    return t && t->kind == O_TEXTURE && (t->usage & USAGE_RENDERTARGET) && ui_box_shape(t->width, t->height);
+}
+
 static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices, uint32_t index_size,
     uint32_t up_data, uint32_t up_stride, uint32_t n)
 {
@@ -2379,8 +2755,13 @@ static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t 
     scene_note(d);
     if (g_cap)
         cap_draw(d, prim, count, first, nverts, up_data, up_stride);
-    if (d->vs.rhw && g_dev.rt == g_dev.backbuffer)
+    if (d->vs.rhw && (g_dev.rt == g_dev.backbuffer || menu_target(obj(g_dev.rt))))
+    {
         ui_squeeze(d, first, nverts, up_data, up_stride);
+        if (g_cap)
+            fprintf(g_cap, "  ui vp %.1f %.1f %.1f %.1f clip %u %u %u %u\n", d->u.vp[0], d->u.vp[1], d->u.vp[2], d->u.vp[3],
+                d->vp[0], d->vp[1], d->vp[2], d->vp[3]);
+    }
     d->prim = prim, d->count = count;
     apply_targets();
     gfx_draw(d);
@@ -2485,7 +2866,14 @@ static void Texture_GetSurfaceLevel(Guest* g)
 static void lock_rect(Obj* s, uint32_t locked, uint32_t rect, uint32_t flags)
 {
     uint32_t pitch = fmt_pitch(s->format, s->width), bits = obj_mem(s);
-    if (gpu_owned(s))
+    if (gpu_owned(s) && surface_scaled(s))
+    {
+        /* its pixels are not the game's size: not read back (FFXI never reads its menu target) */
+        static int said;
+        if (!said)
+            said = 1, rt_log("[recomp] d3d8: a lock of a %ux%u render target drawn larger reads nothing\n", s->width, s->height);
+    }
+    else if (gpu_owned(s))
     {
         uint32_t face, level;
         GfxTex* g = surface_gpu(s, &face, &level);
