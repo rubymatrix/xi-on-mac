@@ -1993,6 +1993,9 @@ static void draw_overlay(uint32_t w, uint32_t h)
     ID3D12GraphicsCommandList_DrawInstanced(g_list, 4, 1, 0, 0);
 }
 
+/* the scene effects are Metal's so far (gfx_metal.m) */
+void gfx_scene_done(GfxTex* color, const GfxScene* s) { (void)color, (void)s; }
+
 void gfx_present(GfxTex* bb)
 {
     if (!g_dev)

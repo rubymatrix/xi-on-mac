@@ -129,6 +129,7 @@ void gfx_present(GfxTex* backbuffer)
     g_present_thread = plat_thread_id();
     prof_frame(gfx_now_ns());
 }
+void gfx_scene_done(GfxTex* color, const GfxScene* s) { (void)color, (void)s; }
 void gfx_finish(void) {}
 uint32_t gfx_failures(void) { return 0; }
 void gfx_set_sync_pipelines(int on) { (void)on; }

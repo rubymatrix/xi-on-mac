@@ -97,6 +97,7 @@ static const char* g_cap_path;
 static FILE* g_cap;
 static uint32_t g_cap_esp, g_cap_frame, g_cap_n;
 static void cap_present(void);
+static void scene_present(void);
 
 /* --- formats ----------------------------------------------------------------------------------------- */
 static uint32_t fmt_block(uint32_t f) /* bytes per 4x4 block, or 0 */
@@ -894,6 +895,7 @@ void d3d8_screen_size(uint32_t* w, uint32_t* h)
 static void IDirect3DDevice8_Present(Guest* g)
 {
     cap_present();
+    scene_present();
     if (g_present_hook)
         g_present_hook();
     Obj* bb = obj(g_dev.backbuffer);
@@ -2240,6 +2242,83 @@ static void cap_draw(GfxDraw* d, uint32_t prim, uint32_t count, uint32_t first, 
     fprintf(f, "  box %.2f..%.2f  %.2f..%.2f  %.4f..%.4f\n", lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
 }
 
+/* --- the scene's end, for the back end's scene effects (gfx_scene_done) ------------------------------
+ * The frame's 3D scene is the target that takes depth-tested draws of untransformed vertices and is
+ * at least half the back buffer (not the 16x16 probes or smaller effect targets). It is finished
+ * when a draw samples it (FFXI draws its background target onto the back buffer as a quad), when
+ * transformed vertices go over it on the back buffer (the interface), or at Present. The camera
+ * comes from its fixed-function draws: the zone's own shader draws carry theirs in constants. */
+static struct
+{
+    GfxTex* rt;     /* the scene's target */
+    uint32_t draws; /* 3D draws to it since the effects last ran */
+    int done, cam;  /* the effects ran this frame; s holds a camera */
+    GfxScene s;
+} g_scene;
+
+static void scene_finish(const char* why)
+{
+    if (g_cap && g_scene.draws && !g_scene.done)
+        fprintf(g_cap, "scene done (%s) after %u 3D draws, camera %d, sun %d\n", why, g_scene.draws, g_scene.cam,
+            g_scene.s.sun_dir[3] != 0.0f);
+    if (g_scene.draws && !g_scene.done && g_scene.cam)
+        gfx_scene_done(g_scene.rt, &g_scene.s);
+    g_scene.draws = 0;
+    g_scene.done = 1;
+}
+
+static void scene_note(const GfxDraw* d)
+{
+    uint32_t face, level;
+    Obj* rt = obj(g_dev.rt);
+    GfxTex* c = rt ? surface_gpu(rt, &face, &level) : NULL;
+    if (!c)
+        return;
+    if (g_scene.draws && !g_scene.done)
+    {
+        int sampled = 0;
+        for (int i = 0; i < 8; ++i)
+            sampled |= d->tex[i] == g_scene.rt;
+        if (sampled)
+            scene_finish("sampled");
+        else if (d->vs.rhw && c == g_scene.rt && g_dev.rt == g_dev.backbuffer)
+            scene_finish("interface");
+    }
+    if (d->vs.rhw || !d->depth.zenable || !obj(g_dev.ds) || face || level ||
+        (uint64_t)rt->width * rt->height * 2 < (uint64_t)g_dev.pp[0] * g_dev.pp[1])
+        return;
+    if (c != g_scene.rt)
+        g_scene.rt = c, g_scene.draws = 0, g_scene.done = 0;
+    if (g_scene.done) /* 3D again after the effects ran: drawn as it is */
+        return;
+    g_scene.draws++;
+    const State* s = &g_dev.cur;
+    GfxScene* sc = &g_scene.s;
+    if (!d->vs.prog && s->xf[3][11] != 0.0f)
+    {
+        memcpy(sc->proj, s->xf[3], 64);
+        memcpy(sc->view, s->xf[2], 64);
+        memcpy(sc->vp, d->vp, sizeof sc->vp);
+        memcpy(sc->ambient, d->u.ambient, 16);
+        memcpy(sc->fogcolor, d->u.fogcolor, 16);
+        sc->fog[0] = d->u.params[2], sc->fog[1] = d->u.params[3], sc->fog[2] = d->fs.fog ? 1.0f : 0.0f;
+        g_scene.cam = 1;
+    }
+    if (d->vs.nlights && d->vs.light_type[0] == 3)
+    {
+        memcpy(sc->sun_dir, d->u.light[0].dir, 12);
+        sc->sun_dir[3] = 1.0f;
+        memcpy(sc->sun_color, d->u.light[0].diffuse, 16);
+    }
+}
+
+/* Present: the scene ends here if nothing ended it before; the next frame starts over */
+static void scene_present(void)
+{
+    scene_finish("present");
+    g_scene.done = 0;
+}
+
 static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t indices, uint32_t index_size,
     uint32_t up_data, uint32_t up_stride, uint32_t n);
 
@@ -2279,6 +2358,7 @@ static void draw_packet(uint32_t prim, uint32_t count, uint32_t start, uint32_t 
     }
     if (!set_streams(d, first, nverts, up_data, up_stride))
         return;
+    scene_note(d);
     if (g_cap)
         cap_draw(d, prim, count, first, nverts, up_data, up_stride);
     if (d->vs.rhw && g_dev.rt == g_dev.backbuffer)

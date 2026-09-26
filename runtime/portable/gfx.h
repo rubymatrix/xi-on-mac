@@ -235,6 +235,25 @@ void gfx_set_targets(GfxTex* color, uint32_t face, uint32_t level, GfxTex* depth
 void gfx_clear(uint32_t nrects, const int32_t* rects, uint32_t flags, uint32_t color, float z, uint32_t stencil,
     const uint32_t vp[6]);
 void gfx_draw(const GfxDraw* d);
+/* The camera and light of a frame's 3D scene, as the scene effects need them. */
+typedef struct GfxScene
+{
+    float proj[16];      /* D3DTS_PROJECTION: a perspective one */
+    float view[16];      /* D3DTS_VIEW */
+    float sun_dir[4];    /* camera space, toward the light; w = 1 when the scene had a directional light */
+    float sun_color[4];  /* its diffuse color */
+    float ambient[4];    /* D3DRS_AMBIENT */
+    float fogcolor[4];
+    float fog[4];        /* fog start, end; z = 1 when fog was on */
+    uint32_t vp[6];      /* the viewport the 3D draws used (D3DVIEWPORT8) */
+} GfxScene;
+
+/* The frame's 3D scene is finished in color (a render target's first level, drawn with depth
+ * testing), before anything samples it or draws the interface over it. The back end's scene
+ * effects - ambient occlusion from the depth it was drawn with, color grading - run on it in place
+ * (FFXI_FX=1); back ends without them do nothing. */
+void gfx_scene_done(GfxTex* color, const GfxScene* s);
+
 /* The frame is done: the back buffer goes to the window. */
 void gfx_present(GfxTex* backbuffer);
 /* Waits for the GPU (tests). */

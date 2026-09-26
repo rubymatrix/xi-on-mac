@@ -409,6 +409,55 @@ static void run_window(SDL_Window* win)
     gfx_tex_destroy(bb);
 }
 
+/* The scene effects (gfx_scene_done, FFXI_FX=1): a wall with a floor meeting it, through a
+ * perspective camera. Occlusion darkens the wall where it meets the floor and leaves the open wall
+ * as it was. */
+static void test_scene_effects(void)
+{
+    enum { S = 128 };
+    GfxTex* rt = gfx_tex_create(GFX_TEX_2D, 21, S, S, 1, GFX_USE_RT);
+    GfxTex* ds = gfx_tex_create(GFX_TEX_2D, 75, S, S, 1, GFX_USE_DEPTH);
+    const uint32_t vp[6] = { 0, 0, S, S, 0, 0x3F800000u };
+    gfx_set_targets(rt, 0, 0, ds);
+    gfx_clear(0, NULL, 3, 0xFF000000u, 1.0f, 0, vp);
+    /* PerspectiveFovLH: 90 degrees, square, near 0.5, far 100 */
+    float zn = 0.5f, zf = 100.0f, proj[16];
+    memset(proj, 0, sizeof proj);
+    proj[0] = proj[5] = 1.0f, proj[10] = zf / (zf - zn), proj[11] = 1.0f, proj[14] = -zn * zf / (zf - zn);
+    GfxDraw d;
+    defaults(&d);
+    memcpy(d.u.wvp, proj, 64);
+    d.u.vp[2] = d.u.vp[3] = S;
+    memcpy(d.vp, vp, sizeof vp);
+    d.vs.el[0] = (GfxElem){ 1, 0, GFX_FLOAT3, 0 };
+    d.u.stride[0] = 12;
+    d.fs.st[0] = (GfxStage){ 2, 0, 1, 1, 2, 0, 1, 1, 1, 0, 0, 2 }; /* white: the vertices have no color */
+    d.depth.zenable = 1, d.depth.zwrite = 1, d.depth.zfunc = 4;
+    float wall[4][3] = { { -8, 8, 6 }, { 8, 8, 6 }, { -8, -3, 6 }, { 8, -3, 6 } };
+    float floor[4][3] = { { -8, -3, 6 }, { 8, -3, 6 }, { -8, -3, 0.6f }, { 8, -3, 0.6f } };
+    d.prim = GFX_TRIANGLESTRIP, d.count = 2;
+    d.data[0] = wall, d.size[0] = sizeof wall;
+    gfx_draw(&d);
+    d.data[0] = floor, d.size[0] = sizeof floor;
+    gfx_draw(&d);
+    GfxScene sc;
+    memset(&sc, 0, sizeof sc);
+    memcpy(sc.proj, proj, 64);
+    identity(sc.view);
+    memcpy(sc.vp, vp, sizeof vp);
+    gfx_scene_done(rt, &sc);
+    static uint32_t p[S * S];
+    gfx_tex_read(rt, 0, 0, p, S * 4);
+    /* the floor meets the wall at y = -1/2 in NDC: row 96 */
+    uint32_t open = p[30 * S + 64] & 255, corner = p[94 * S + 64] & 255;
+    CHECK(open >= 245, "scene effects: open wall %u (want about 255)", open);
+    CHECK(corner <= 225, "scene effects: wall at the floor %u (want darker)", corner);
+    CHECK(gfx_failures() == 0, "scene effects: %u failures", gfx_failures());
+    gfx_set_targets(g_rt, 0, 0, g_ds);
+    gfx_tex_destroy(rt);
+    gfx_tex_destroy(ds);
+}
+
 int main(int argc, char** argv)
 {
     SDL_Window* win = NULL;
@@ -421,6 +470,8 @@ int main(int argc, char** argv)
         }
     }
     gfx_set_sync_pipelines(1);
+    setenv("FFXI_FX", "1", 1); /* the scene effects run only where a test asks (test_scene_effects) */
+    setenv("FFXI_FX_GRADE", "0", 1);
     if (!gfx_init(win, 1))
     {
         printf("no graphics back end\n");
@@ -438,6 +489,7 @@ int main(int argc, char** argv)
     test_fog();
     test_shaders();
     test_sweep();
+    test_scene_effects();
     gfx_present(NULL);
     if (win)
     {

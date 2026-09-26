@@ -77,6 +77,7 @@ struct GfxTex
     uint32_t texel;  /* bytes per texel in Metal's layout */
     uint64_t used;   /* the last frame serial that referenced it */
     int has_stencil, x8;
+    id<MTLTexture> depth_seen; /* the depth its first level was last drawn with (the scene effects read it) */
     /* asynchronous readbacks (gfx_tex_read_async): staging buffers and the frame each was recorded in */
     id<MTLBuffer> rb[GFX_READBACKS];
     uint64_t rb_serial[GFX_READBACKS];
@@ -551,6 +552,7 @@ void gfx_tex_destroy(GfxTex* t)
     if (g_ds == t)
         end_pass(), g_ds = NULL;
     [t->view release];
+    [t->depth_seen release];
     [t->tex release]; /* the command buffers that use it hold their own references */
     for (int i = 0; i < GFX_READBACKS; ++i)
         [t->rb[i] release];
@@ -789,7 +791,7 @@ static id<MTLTexture> depth_attachment(void)
         MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:g_ds->tex.pixelFormat width:w height:h
                                                                                 mipmapped:NO];
         d.storageMode = MTLStorageModePrivate;
-        d.usage = MTLTextureUsageRenderTarget;
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         g_scratch_depth = [g_dev newTextureWithDescriptor:d];
     }
     return g_scratch_depth;
@@ -826,6 +828,11 @@ static int begin_pass(void)
             p.stencilAttachment.storeAction = MTLStoreActionStore;
             p.stencilAttachment.loadAction = (g_pending_clear & 4) ? MTLLoadActionClear : MTLLoadActionLoad;
             p.stencilAttachment.clearStencil = g_clear_stencil;
+        }
+        if (!g_rt_face && !g_rt_level && g_rt->depth_seen != depth)
+        {
+            [g_rt->depth_seen release];
+            g_rt->depth_seen = [depth retain];
         }
     }
     g_pending_clear = 0;
@@ -1531,6 +1538,272 @@ void gfx_clear(uint32_t nrects, const int32_t* rects, uint32_t flags, uint32_t c
     }
 }
 
+/* --- scene effects (gfx_scene_done) -----------------------------------------------------------------------------
+ * On the finished 3D scene, in place, when FFXI_FX=1:
+ *   - ambient occlusion: view-space positions rebuilt from the scene's depth and projection, a spiral
+ *     of samples around each pixel (Scalable Ambient Obscurance, simplified) at a fraction of the
+ *     scene's size, then a depth-aware blur across and down;
+ *   - the composite: the scene multiplied by the occlusion, then a color grade (saturation, a
+ *     contrast curve) mixed in by strength.
+ * Tuning: FFXI_FX_AO (strength, 0 off), FFXI_FX_AO_RADIUS (world units), FFXI_FX_GRADE (strength),
+ * FFXI_FX_SAT, FFXI_FX_CONTRAST; FFXI_FX_DEBUG=ao shows the occlusion alone. */
+static const char FX_MSL[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct FxU {\n"
+    "  float4 proj;  // P00, P11, P20, P21\n"
+    "  float4 zp;    // P22, P32, viewport MinZ, MaxZ\n"
+    "  float4 vp;    // the scene viewport in target pixels: x, y, width, height\n"
+    "  float4 size;  // target width, height; occlusion width, height\n"
+    "  float4 ao;    // radius, strength, bias, largest radius in pixels\n"
+    "  float4 grade; // strength, saturation, contrast, debug\n"
+    "};\n"
+    "struct FO { float4 pos [[position]]; float2 uv; };\n"
+    "vertex FO fx_vs(uint vid [[vertex_id]]) {\n"
+    "  float2 p = float2((vid << 1) & 2, vid & 2);\n"
+    "  FO o; o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = p; return o;\n"
+    "}\n"
+    /* view-space z of a depth value; 0 for the far plane (the sky, cleared depth) */
+    "static float view_z(constant FxU& u, float d) {\n"
+    "  d = (d - u.zp.z) / max(u.zp.w - u.zp.z, 1e-6);\n"
+    "  float z = u.zp.y / (d - u.zp.x);\n"
+    "  return d >= 0.999999 || !(z > 0.0) ? 0.0 : z;\n"
+    "}\n"
+    "static float3 view_pos(constant FxU& u, float2 px, float z) {\n"
+    "  float2 ndc = float2((px.x - u.vp.x) / u.vp.z * 2.0 - 1.0, 1.0 - (px.y - u.vp.y) / u.vp.w * 2.0);\n"
+    "  return float3((ndc.x - u.proj.z) * z / u.proj.x, (ndc.y - u.proj.w) * z / u.proj.y, z);\n"
+    "}\n"
+    "static float3 pos_at(constant FxU& u, depth2d<float> dt, float2 px) {\n"
+    "  px = clamp(px, u.vp.xy, u.vp.xy + u.vp.zw - 1.0);\n"
+    "  px = floor(px) + 0.5;\n"
+    "  return view_pos(u, px, view_z(u, dt.read(uint2(px))));\n"
+    "}\n"
+    /* occlusion in x (1 open, 0 closed), view z in y (0: sky) */
+    "fragment float2 fx_ao(FO in [[stage_in]], constant FxU& u [[buffer(0)]], depth2d<float> dt [[texture(0)]]) {\n"
+    "  float2 px = floor(u.vp.xy + in.uv * u.vp.zw) + 0.5;\n"
+    "  float3 P = pos_at(u, dt, px);\n"
+    "  if (P.z <= 0.0) return float2(1.0, 0.0);\n"
+    /* the surface normal from the neighbors on the side nearer in depth (no smearing across edges) */
+    "  float3 r = pos_at(u, dt, px + float2(1, 0)) - P, l = P - pos_at(u, dt, px - float2(1, 0));\n"
+    "  float3 d = pos_at(u, dt, px + float2(0, 1)) - P, t = P - pos_at(u, dt, px - float2(0, 1));\n"
+    "  float3 dx = abs(r.z) < abs(l.z) ? r : l, dy = abs(d.z) < abs(t.z) ? d : t;\n"
+    "  float3 N = normalize(cross(dx, dy));\n"
+    "  if (dot(N, P) > 0.0) N = -N;\n"
+    "  float rad = u.ao.x, rpx = min(rad * u.proj.y * 0.5 * u.vp.w / P.z, u.ao.w);\n"
+    "  if (rpx < 2.0) return float2(1.0, P.z);\n"
+    "  float phi = 6.2831853 * fract(52.9829189 * fract(dot(in.pos.xy, float2(0.06711056, 0.00583715))));\n"
+    "  const int NS = 12;\n"
+    "  float sum = 0.0;\n"
+    "  for (int i = 0; i < NS; ++i) {\n"
+    "    float a = (float(i) + 0.5) / float(NS);\n"
+    "    float ang = a * 7.0 * 6.2831853 + phi; /* seven turns of a spiral */\n"
+    "    float2 q = px + float2(cos(ang), sin(ang)) * (a * rpx);\n"
+    "    float3 v = pos_at(u, dt, q) - P;\n"
+    "    if (v.z + P.z <= 0.0) continue;\n"
+    "    float vv = dot(v, v), vn = dot(v, N);\n"
+    "    float q2 = vv / (rad * rad), fall = saturate(1.0 - q2 * q2);\n"
+    "    sum += fall * max(vn * rsqrt(vv + 1e-6) - u.ao.z, 0.0);\n"
+    "  }\n"
+    "  return float2(saturate(1.0 - 3.0 * sum / float(NS)), P.z);\n"
+    "}\n"
+    "fragment float2 fx_blur(FO in [[stage_in]], constant FxU& u [[buffer(0)]], constant int2& dir [[buffer(1)]],\n"
+    "                        texture2d<float> a [[texture(0)]]) {\n"
+    "  int2 p = int2(in.pos.xy), hi = int2(u.size.zw) - 1;\n"
+    "  float2 c = a.read(uint2(p)).xy;\n"
+    "  if (c.y <= 0.0) return c;\n"
+    "  float s = c.x, w = 1.0;\n"
+    "  for (int i = -4; i <= 4; ++i) {\n"
+    "    if (i == 0) continue;\n"
+    "    float2 t = a.read(uint2(clamp(p + dir * i, int2(0), hi))).xy;\n"
+    "    float k = exp(-float(i * i) / 8.0) * saturate(1.0 - abs(t.y - c.y) / (0.03 * c.y));\n"
+    "    s += t.x * k, w += k;\n"
+    "  }\n"
+    "  return float2(s / w, c.y);\n"
+    "}\n"
+    "fragment float4 fx_comp(FO in [[stage_in]], constant FxU& u [[buffer(0)]], texture2d<float> src [[texture(0)]],\n"
+    "                        texture2d<float> ao [[texture(1)]], sampler s [[sampler(0)]]) {\n"
+    "  float4 c = src.read(uint2(in.pos.xy));\n"
+    "  float o = ao.sample(s, in.uv).x;\n"
+    "  if (u.grade.w > 0.0) return float4(o, o, o, c.a);\n"
+    "  c.rgb *= mix(1.0, o, u.ao.y);\n"
+    "  float3 x = c.rgb;\n"
+    "  x = mix(float3(dot(x, float3(0.2126, 0.7152, 0.0722))), x, u.grade.y);\n"
+    "  x = saturate(x);\n"
+    "  x = mix(x, x * x * (3.0 - 2.0 * x), u.grade.z);\n"
+    "  c.rgb = mix(c.rgb, x, u.grade.x);\n"
+    "  return c;\n"
+    "}\n";
+
+typedef struct FxU
+{
+    float proj[4], zp[4], vp[4], size[4], ao[4], grade[4];
+} FxU;
+
+static struct
+{
+    int on, tried;
+    float ao, radius, grade, sat, contrast, debug;
+    id<MTLLibrary> lib;
+    id<MTLRenderPipelineState> ao_pipe, blur_pipe, comp_pipe;
+    MTLPixelFormat comp_fmt;
+    id<MTLTexture> src, ao0, ao1;
+    id<MTLSamplerState> samp;
+} g_fx;
+
+static float env_float(const char* name, float def)
+{
+    const char* v = getenv(name);
+    return v && *v ? (float)atof(v) : def;
+}
+
+static void fx_config(void)
+{
+    const char* on = getenv("FFXI_FX");
+    g_fx.on = on && on[0] == '1';
+    g_fx.ao = env_float("FFXI_FX_AO", 0.8f);
+    g_fx.radius = env_float("FFXI_FX_AO_RADIUS", 1.0f);
+    g_fx.grade = env_float("FFXI_FX_GRADE", 1.0f);
+    g_fx.sat = env_float("FFXI_FX_SAT", 1.12f);
+    g_fx.contrast = env_float("FFXI_FX_CONTRAST", 0.2f);
+    const char* dbg = getenv("FFXI_FX_DEBUG");
+    g_fx.debug = dbg && !strcmp(dbg, "ao") ? 1.0f : 0.0f;
+}
+
+static id<MTLRenderPipelineState> fx_pipeline(NSString* frag, MTLPixelFormat fmt)
+{
+    MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+    id<MTLFunction> vf = [g_fx.lib newFunctionWithName:@"fx_vs"], ff = [g_fx.lib newFunctionWithName:frag];
+    pd.vertexFunction = vf;
+    pd.fragmentFunction = ff;
+    pd.colorAttachments[0].pixelFormat = fmt;
+    NSError* err = nil;
+    id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!p)
+        __atomic_fetch_add(&g_failures, 1, __ATOMIC_RELAXED),
+            fprintf(stderr, "[recomp] gfx: scene effect %s failed: %s\n", [frag UTF8String], err ? [[err localizedDescription] UTF8String] : "?");
+    [vf release];
+    [ff release];
+    [pd release];
+    return p;
+}
+
+static int fx_init(void)
+{
+    if (g_fx.tried)
+        return g_fx.ao_pipe != nil;
+    g_fx.tried = 1;
+    g_fx.lib = compile(FX_MSL);
+    if (!g_fx.lib)
+        return 0;
+    g_fx.ao_pipe = fx_pipeline(@"fx_ao", MTLPixelFormatRG16Float);
+    g_fx.blur_pipe = fx_pipeline(@"fx_blur", MTLPixelFormatRG16Float);
+    MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
+    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+    sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    g_fx.samp = [g_dev newSamplerStateWithDescriptor:sd];
+    [sd release];
+    if (!g_fx.ao_pipe || !g_fx.blur_pipe)
+    {
+        [g_fx.ao_pipe release], g_fx.ao_pipe = nil;
+        return 0;
+    }
+    fprintf(stderr, "[recomp] gfx: scene effects on (occlusion %.2f radius %.2f, grade %.2f)\n", g_fx.ao, g_fx.radius, g_fx.grade);
+    return 1;
+}
+
+/* a private texture of this size and format in *t, made again when either changes */
+static id<MTLTexture> fx_tex(id<MTLTexture>* t, MTLPixelFormat fmt, NSUInteger w, NSUInteger h)
+{
+    if (*t && (*t).width == w && (*t).height == h && (*t).pixelFormat == fmt)
+        return *t;
+    [*t release];
+    MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
+    d.storageMode = MTLStorageModePrivate;
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    *t = [g_dev newTextureWithDescriptor:d];
+    return *t;
+}
+
+static void fx_pass(id<MTLTexture> target, MTLLoadAction load, id<MTLRenderPipelineState> p, MTLViewport vp, const FxU* u,
+    id<MTLTexture> t0, id<MTLTexture> t1, const int32_t* dir)
+{
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = target;
+    rp.colorAttachments[0].loadAction = load;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:p];
+    [e setViewport:vp];
+    [e setFragmentBytes:u length:sizeof *u atIndex:0];
+    if (dir)
+        [e setFragmentBytes:dir length:8 atIndex:1];
+    [e setFragmentTexture:t0 atIndex:0];
+    if (t1)
+        [e setFragmentTexture:t1 atIndex:1];
+    [e setFragmentSamplerState:g_fx.samp atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
+void gfx_scene_done(GfxTex* color, const GfxScene* s)
+{
+    if (!g_dev || !g_fx.on || !color || color->type != GFX_TEX_2D || !color->depth_seen || s->proj[11] == 0.0f)
+        return;
+    @autoreleasepool
+    {
+        flush_pass();
+        if (!fx_init())
+            return;
+        id<MTLTexture> ct = color->tex, depth = color->depth_seen;
+        if (depth.width != ct.width || depth.height != ct.height)
+            return;
+        /* the scene's viewport, within the target */
+        float vx = (float)s->vp[0], vy = (float)s->vp[1], vw = (float)s->vp[2], vh = (float)s->vp[3];
+        if (vw < 16 || vh < 16 || vx + vw > ct.width || vy + vh > ct.height)
+            vx = vy = 0, vw = (float)ct.width, vh = (float)ct.height;
+        float minz, maxz;
+        memcpy(&minz, &s->vp[4], 4);
+        memcpy(&maxz, &s->vp[5], 4);
+        if (maxz <= minz)
+            minz = 0, maxz = 1;
+        /* the occlusion at about 1000 pixels across: a quarter of a 4096 background, half of 1920 */
+        uint32_t div = vw > 2048 ? 4 : vw > 1024 ? 2 : 1;
+        NSUInteger aw = (NSUInteger)((vw + div - 1) / div), ah = (NSUInteger)((vh + div - 1) / div);
+        FxU u = {
+            { s->proj[0], s->proj[5], s->proj[8], s->proj[9] },
+            { s->proj[10], s->proj[14], minz, maxz },
+            { vx, vy, vw, vh },
+            { (float)ct.width, (float)ct.height, (float)aw, (float)ah },
+            { g_fx.radius, g_fx.ao, 0.1f, vh * 0.1f },
+            { g_fx.grade, g_fx.sat, g_fx.contrast, g_fx.debug },
+        };
+        if (!fx_tex(&g_fx.src, ct.pixelFormat, ct.width, ct.height) || !fx_tex(&g_fx.ao0, MTLPixelFormatRG16Float, aw, ah) ||
+            !fx_tex(&g_fx.ao1, MTLPixelFormatRG16Float, aw, ah))
+            return;
+        if (!g_fx.comp_pipe || g_fx.comp_fmt != ct.pixelFormat)
+        {
+            [g_fx.comp_pipe release];
+            g_fx.comp_pipe = fx_pipeline(@"fx_comp", ct.pixelFormat);
+            g_fx.comp_fmt = ct.pixelFormat;
+            if (!g_fx.comp_pipe)
+                return;
+        }
+        uint64_t t0 = gfx_profiling ? gfx_now_ns() : 0;
+        id<MTLBlitCommandEncoder> b = [cmd() blitCommandEncoder];
+        [b copyFromTexture:ct sourceSlice:0 sourceLevel:0 toTexture:g_fx.src destinationSlice:0 destinationLevel:0 sliceCount:1 levelCount:1];
+        [b endEncoding];
+        MTLViewport avp = { 0, 0, (double)aw, (double)ah, 0, 1 };
+        static const int32_t across[2] = { 1, 0 }, down[2] = { 0, 1 };
+        fx_pass(g_fx.ao0, MTLLoadActionDontCare, g_fx.ao_pipe, avp, &u, depth, nil, NULL);
+        fx_pass(g_fx.ao1, MTLLoadActionDontCare, g_fx.blur_pipe, avp, &u, g_fx.ao0, nil, across);
+        fx_pass(g_fx.ao0, MTLLoadActionDontCare, g_fx.blur_pipe, avp, &u, g_fx.ao1, nil, down);
+        fx_pass(ct, MTLLoadActionLoad, g_fx.comp_pipe, (MTLViewport){ vx, vy, vw, vh, 0, 1 }, &u, g_fx.src, g_fx.ao0, NULL);
+        color->used = g_serial;
+        if (gfx_profiling)
+            g_prof.draw_ns += gfx_now_ns() - t0;
+    }
+}
+
 /* --- frames ---------------------------------------------------------------------------------------------------- */
 static void frame_end(void)
 {
@@ -1689,6 +1962,7 @@ int gfx_init(void* window, int vsync)
         gfx_profiling = prof && prof[0] && prof[0] != '0';
         const char* show = getenv("FFXI_FPS");
         g_overlay = !(show && show[0] == '0');
+        fx_config();
         pd = [[MTLRenderPipelineDescriptor alloc] init];
         vf = [g_util newFunctionWithName:@"overlay_vs"], ff = [g_util newFunctionWithName:@"overlay_fs"];
         pd.vertexFunction = vf;
